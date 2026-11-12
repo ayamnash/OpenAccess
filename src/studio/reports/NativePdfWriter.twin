@@ -1,0 +1,358 @@
+' File: src/studio/reports/NativePdfWriter.twin
+' 100% In-Process Native Vector PDF-1.4 Exporter for OpenAccess Studio
+Option Explicit
+
+Public Module NativePdfWriter
+
+    Private Const PAGE_WIDTH_A4 As Double = 595.28
+    Private Const PAGE_HEIGHT_A4 As Double = 841.89
+    Private Const MARGIN_LEFT As Double = 40.0
+    Private Const MARGIN_RIGHT As Double = 40.0
+    Private Const MARGIN_TOP As Double = 40.0
+    Private Const MARGIN_BOTTOM As Double = 45.0
+    Private Const PRINTABLE_WIDTH As Double = 515.28
+    Private Const ROW_HEIGHT As Double = 18.0
+    Private Const HEADER_ROW_HEIGHT As Double = 22.0
+    Private Const BANNER_HEIGHT As Double = 50.0
+
+    Public Function ExportTableReportToPdf(ByVal db As Object, ByVal tableName As String, ByVal targetPdfPath As String, Optional ByRef outErrorMsg As String) As Boolean
+        outErrorMsg = vbNullString
+        If db Is Nothing Then
+            outErrorMsg = "Database reference is Nothing."
+            ExportTableReportToPdf = False
+            Exit Function
+        End If
+        If Len(Trim$(tableName)) = 0 Then
+            outErrorMsg = "Table name cannot be empty."
+            ExportTableReportToPdf = False
+            Exit Function
+        End If
+        If Len(Trim$(targetPdfPath)) = 0 Then
+            outErrorMsg = "Target PDF path cannot be empty."
+            ExportTableReportToPdf = False
+            Exit Function
+        End If
+
+        Dim rs As Object
+        On Error Resume Next
+        Set rs = db.OpenRecordset("SELECT * FROM [" & tableName & "]")
+        If Err.Number <> 0 Or rs Is Nothing Then
+            outErrorMsg = "Cannot open recordset for table '" & tableName & "': " & Err.Description
+            ExportTableReportToPdf = False
+            Exit Function
+        End If
+        On Error GoTo 0
+
+        Dim title As String
+        title = "OpenAccess Studio - Table Report: " & tableName
+        Dim srcPath As String
+        srcPath = CStr(db.Name)
+
+        ExportTableReportToPdf = ExportRecordsetToPdf(rs, title, srcPath, targetPdfPath, outErrorMsg)
+        On Error Resume Next
+        rs.Close
+        Set rs = Nothing
+        On Error GoTo 0
+    End Function
+
+    Public Function ExportRecordsetToPdf(ByVal rs As Object, ByVal reportTitle As String, ByVal sourcePath As String, ByVal targetPdfPath As String, Optional ByRef outErrorMsg As String) As Boolean
+        outErrorMsg = vbNullString
+        If rs Is Nothing Then
+            outErrorMsg = "Recordset is Nothing."
+            ExportRecordsetToPdf = False
+            Exit Function
+        End If
+
+        Dim numCols As Long
+        numCols = rs.Fields.Count
+        If numCols = 0 Then
+            outErrorMsg = "Recordset contains 0 columns."
+            ExportRecordsetToPdf = False
+            Exit Function
+        End If
+
+        Dim colNames() As String
+        ReDim colNames(0 To numCols - 1)
+        Dim cIdx As Long
+        For cIdx = 0 To numCols - 1
+            colNames(cIdx) = CStr(rs.Fields(cIdx).Name)
+        Next cIdx
+
+        Dim colWidths() As Double
+        ReDim colWidths(0 To numCols - 1)
+        Dim baseWidth As Double
+        baseWidth = PRINTABLE_WIDTH / CDbl(numCols)
+        For cIdx = 0 To numCols - 1
+            colWidths(cIdx) = baseWidth
+        Next cIdx
+
+        Dim pageStreams As New Collection
+        Dim currentStream As String
+        currentStream = vbNullString
+
+        Dim curPage As Long
+        curPage = 1
+
+        Dim curY As Double
+        curY = PAGE_HEIGHT_A4 - MARGIN_TOP
+
+        currentStream = currentStream & DrawHeaderBanner(reportTitle, sourcePath, curY)
+        curY = curY - BANNER_HEIGHT - 10.0
+
+        currentStream = currentStream & DrawTableHeader(colNames, colWidths, curY)
+        curY = curY - HEADER_ROW_HEIGHT
+
+        Dim rowCount As Long
+        rowCount = 0
+
+        If Not rs.EOF Then
+            rs.MoveFirst
+            Do Until rs.EOF
+                rowCount = rowCount + 1
+
+                If (curY - ROW_HEIGHT) < (MARGIN_BOTTOM + 25.0) Then
+                    currentStream = currentStream & DrawPageFooter(curPage)
+                    pageStreams.Add currentStream
+                    curPage = curPage + 1
+                    currentStream = vbNullString
+
+                    curY = PAGE_HEIGHT_A4 - MARGIN_TOP
+                    currentStream = currentStream & DrawTableHeader(colNames, colWidths, curY)
+                    curY = curY - HEADER_ROW_HEIGHT
+                End If
+
+                currentStream = currentStream & DrawDataRow(rs, colWidths, curY, rowCount)
+                curY = curY - ROW_HEIGHT
+
+                rs.MoveNext
+            Loop
+        End If
+
+        currentStream = currentStream & DrawPageFooter(curPage)
+        pageStreams.Add currentStream
+
+        Dim totalPages As Long
+        totalPages = pageStreams.Count
+
+        ExportRecordsetToPdf = WritePdfFile(pageStreams, totalPages, targetPdfPath, outErrorMsg)
+    End Function
+
+    Private Function DrawHeaderBanner(ByVal reportTitle As String, ByVal sourcePath As String, ByVal topY As Double) As String
+        Dim s As String
+        s = "0.118 0.227 0.541 rg " & FormatNum(MARGIN_LEFT) & " " & FormatNum(topY - BANNER_HEIGHT) & " " & _
+            FormatNum(PRINTABLE_WIDTH) & " " & FormatNum(BANNER_HEIGHT) & " re f" & vbCrLf
+        s = s & "BT /F2 15 Tf 1 1 1 rg " & FormatNum(MARGIN_LEFT + 15.0) & " " & FormatNum(topY - 22.0) & _
+            " Td (" & EscapePdfText(reportTitle) & ") Tj ET" & vbCrLf
+        s = s & "BT /F1 8.5 Tf 0.85 0.90 0.98 rg " & FormatNum(MARGIN_LEFT + 15.0) & " " & FormatNum(topY - 38.0) & _
+            " Td (Generated: " & Format$(Now, "YYYY-MM-DD HH:NN:SS") & " | Source: " & EscapePdfText(sourcePath) & ") Tj ET" & vbCrLf
+        DrawHeaderBanner = s
+    End Function
+
+    Private Function DrawTableHeader(ByRef colNames() As String, ByRef colWidths() As Double, ByVal topY As Double) As String
+        Dim s As String
+        s = "0.953 0.957 0.965 rg " & FormatNum(MARGIN_LEFT) & " " & FormatNum(topY - HEADER_ROW_HEIGHT) & " " & _
+            FormatNum(PRINTABLE_WIDTH) & " " & FormatNum(HEADER_ROW_HEIGHT) & " re f" & vbCrLf
+        s = s & "0.5 w 0.75 0.75 0.75 RG " & FormatNum(MARGIN_LEFT) & " " & FormatNum(topY - HEADER_ROW_HEIGHT) & " " & _
+            FormatNum(PRINTABLE_WIDTH) & " " & FormatNum(HEADER_ROW_HEIGHT) & " re S" & vbCrLf
+        Dim curX As Double
+        curX = MARGIN_LEFT
+        Dim i As Long
+        For i = 0 To UBound(colNames)
+            s = s & "BT /F2 9.5 Tf 0.15 0.15 0.15 rg " & FormatNum(curX + 6.0) & " " & FormatNum(topY - 15.0) & _
+                " Td (" & EscapePdfText(colNames(i)) & ") Tj ET" & vbCrLf
+            curX = curX + colWidths(i)
+        Next i
+        DrawTableHeader = s
+    End Function
+
+    Private Function DrawDataRow(ByVal rs As Object, ByRef colWidths() As Double, ByVal topY As Double, ByVal rowNumber As Long) As String
+        Dim s As String
+        Dim fillCol As String
+        If (rowNumber Mod 2) = 0 Then
+            fillCol = "1 1 1 rg "
+        Else
+            fillCol = "0.976 0.980 0.984 rg "
+        End If
+        s = fillCol & FormatNum(MARGIN_LEFT) & " " & FormatNum(topY - ROW_HEIGHT) & " " & _
+            FormatNum(PRINTABLE_WIDTH) & " " & FormatNum(ROW_HEIGHT) & " re f" & vbCrLf
+        s = s & "0.5 w 0.88 0.88 0.88 RG " & FormatNum(MARGIN_LEFT) & " " & FormatNum(topY - ROW_HEIGHT) & " " & _
+            FormatNum(PRINTABLE_WIDTH) & " " & FormatNum(ROW_HEIGHT) & " re S" & vbCrLf
+        Dim curX As Double
+        curX = MARGIN_LEFT
+        Dim i As Long
+        Dim valStr As String
+        For i = 0 To UBound(colWidths)
+            valStr = CStr(rs.Fields(i).Value & "")
+            s = s & "BT /F1 8.5 Tf 0.1 0.1 0.1 rg " & FormatNum(curX + 6.0) & " " & FormatNum(topY - 13.0) & _
+                " Td (" & EscapePdfText(valStr) & ") Tj ET" & vbCrLf
+            curX = curX + colWidths(i)
+        Next i
+        DrawDataRow = s
+    End Function
+
+    Private Function DrawPageFooter(ByVal pageNum As Long) As String
+        Dim s As String
+        s = "0.5 w 0.8 0.8 0.8 RG " & FormatNum(MARGIN_LEFT) & " 48 m " & FormatNum(MARGIN_LEFT + PRINTABLE_WIDTH) & " 48 l S" & vbCrLf
+        s = s & "BT /F1 8 Tf 0.5 0.5 0.5 rg " & FormatNum(MARGIN_LEFT) & " 36 Td (OpenAccess Studio Native Vector PDF-1.4 Exporter) Tj ET" & vbCrLf
+        s = s & "BT /F1 8 Tf 0.5 0.5 0.5 rg " & FormatNum(MARGIN_LEFT + PRINTABLE_WIDTH - 65.0) & " 36 Td (Page " & CStr(pageNum) & ") Tj ET" & vbCrLf
+        DrawPageFooter = s
+    End Function
+
+    Private Function WritePdfFile(ByVal pageStreams As Collection, ByVal pageCount As Long, ByVal targetPath As String, ByRef outErrorMsg As String) As Boolean
+        On Error GoTo ErrHandler
+        If Len(Dir$(targetPath)) > 0 Then
+            On Error Resume Next
+            Kill targetPath
+            On Error GoTo ErrHandler
+        End If
+
+        Dim totalObjs As Long
+        totalObjs = 3 + (pageCount * 2)
+
+        Dim offsets() As Long
+        ReDim offsets(1 To totalObjs)
+
+        Dim fNum As Integer
+        fNum = FreeFile()
+        Open targetPath For Binary Access Write As #fNum
+
+        Dim currentPos As Long
+        currentPos = 1
+
+        Dim hdr As String
+        hdr = "%PDF-1.4" & vbCrLf & "%" & Chr$(226) & Chr$(227) & Chr$(207) & Chr$(211) & vbCrLf
+        Put #fNum, currentPos, hdr
+        currentPos = currentPos + Len(hdr)
+
+        offsets(1) = currentPos - 1
+        Dim obj1 As String
+        obj1 = "1 0 obj" & vbCrLf & "<< /Type /Catalog /Pages 2 0 R >>" & vbCrLf & "endobj" & vbCrLf
+        Put #fNum, currentPos, obj1
+        currentPos = currentPos + Len(obj1)
+
+        offsets(2) = currentPos - 1
+        Dim kidsStr As String
+        kidsStr = ""
+        Dim p As Long
+        For p = 1 To pageCount
+            Dim pId As Long
+            pId = 2 + (p * 2)
+            kidsStr = kidsStr & CStr(pId) & " 0 R "
+        Next p
+        Dim obj2 As String
+        obj2 = "2 0 obj" & vbCrLf & "<< /Type /Pages /Kids [" & kidsStr & "] /Count " & CStr(pageCount) & _
+               " /MediaBox [0 0 " & FormatNum(PAGE_WIDTH_A4) & " " & FormatNum(PAGE_HEIGHT_A4) & "] >>" & vbCrLf & "endobj" & vbCrLf
+        Put #fNum, currentPos, obj2
+        currentPos = currentPos + Len(obj2)
+
+        offsets(3) = currentPos - 1
+        Dim obj3 As String
+        obj3 = "3 0 obj" & vbCrLf & _
+               "<< /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> " & _
+               "/F2 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >> " & _
+               "/F3 << /Type /Font /Subtype /Type1 /BaseFont /Courier >> >> " & _
+               "/ProcSet [/PDF /Text /ImageB /ImageC /ImageI] >>" & vbCrLf & "endobj" & vbCrLf
+        Put #fNum, currentPos, obj3
+        currentPos = currentPos + Len(obj3)
+
+        For p = 1 To pageCount
+            Dim pageObjId As Long
+            Dim contentObjId As Long
+            pageObjId = 2 + (p * 2)
+            contentObjId = 3 + (p * 2)
+
+            offsets(pageObjId) = currentPos - 1
+            Dim pObjStr As String
+            pObjStr = CStr(pageObjId) & " 0 obj" & vbCrLf & _
+                      "<< /Type /Page /Parent 2 0 R /Resources 3 0 R /Contents " & CStr(contentObjId) & " 0 R >>" & vbCrLf & "endobj" & vbCrLf
+            Put #fNum, currentPos, pObjStr
+            currentPos = currentPos + Len(pObjStr)
+
+            offsets(contentObjId) = currentPos - 1
+            Dim streamContent As String
+            streamContent = CStr(pageStreams(p))
+            Dim cObjHdr As String
+            cObjHdr = CStr(contentObjId) & " 0 obj" & vbCrLf & "<< /Length " & CStr(Len(streamContent)) & " >>" & vbCrLf & "stream" & vbCrLf
+            Put #fNum, currentPos, cObjHdr
+            currentPos = currentPos + Len(cObjHdr)
+
+            Put #fNum, currentPos, streamContent
+            currentPos = currentPos + Len(streamContent)
+
+            Dim cObjEnd As String
+            cObjEnd = vbCrLf & "endstream" & vbCrLf & "endobj" & vbCrLf
+            Put #fNum, currentPos, cObjEnd
+            currentPos = currentPos + Len(cObjEnd)
+        Next p
+
+        Dim xrefOffset As Long
+        xrefOffset = currentPos - 1
+        Dim xrefHeader As String
+        xrefHeader = "xref" & vbCrLf & "0 " & CStr(totalObjs + 1) & vbCrLf & "0000000000 65535 f " & vbCrLf
+        Put #fNum, currentPos, xrefHeader
+        currentPos = currentPos + Len(xrefHeader)
+
+        Dim objIdx As Long
+        For objIdx = 1 To totalObjs
+            Dim offLine As String
+            offLine = FormatOff(offsets(objIdx)) & " 00000 n " & vbCrLf
+            Put #fNum, currentPos, offLine
+            currentPos = currentPos + Len(offLine)
+        Next objIdx
+
+        Dim trailerStr As String
+        trailerStr = "trailer" & vbCrLf & "<< /Size " & CStr(totalObjs + 1) & " /Root 1 0 R >>" & vbCrLf & _
+                     "startxref" & vbCrLf & CStr(xrefOffset) & vbCrLf & "%%EOF" & vbCrLf
+        Put #fNum, currentPos, trailerStr
+        currentPos = currentPos + Len(trailerStr)
+
+        Close #fNum
+        WritePdfFile = True
+        Exit Function
+
+ErrHandler:
+        outErrorMsg = "PDF write error: " & Err.Description
+        If fNum > 0 Then
+            On Error Resume Next
+            Close #fNum
+            On Error GoTo 0
+        End If
+        WritePdfFile = False
+    End Function
+
+    Private Function EscapePdfText(ByVal text As String) As String
+        Dim res As String
+        res = Replace$(text, "\", "\\")
+        res = Replace$(res, "(", "\(")
+        res = Replace$(res, ")", "\)")
+        Dim i As Long
+        Dim ch As Long
+        Dim sb As String
+        sb = ""
+        For i = 1 To Len(res)
+            ch = AscW(Mid$(res, i, 1))
+            If ch >= 32 And ch <= 126 Then
+                sb = sb & Chr$(ch)
+            ElseIf ch = 10 Or ch = 13 Or ch = 9 Then
+                sb = sb & " "
+            Else
+                sb = sb & "?"
+            End If
+        Next i
+        EscapePdfText = sb
+    End Function
+
+    Private Function FormatNum(ByVal d As Double) As String
+        FormatNum = Trim$(Str$(d))
+    End Function
+
+    Private Function FormatOff(ByVal offset As Long) As String
+        Dim s As String
+        s = Trim$(Str$(offset))
+        Do While Len(s) < 10
+            s = "0" & s
+        Loop
+        FormatOff = s
+    End Function
+
+End Module

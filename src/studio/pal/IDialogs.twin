@@ -1,0 +1,10 @@
+' File: src/studio/pal/IDialogs.twin
+' Plan 7 WS7: Platform Abstraction Layer - Dialogs Interface
+Option Explicit
+
+Public Interface IDialogs
+    Function ShowOpenFile(ByVal ownerHwnd As LongPtr, ByVal title As String, ByVal filter As String, Optional ByVal defaultExt As String = "") As String
+    Function ShowSaveFile(ByVal ownerHwnd As LongPtr, ByVal title As String, ByVal filter As String, Optional ByVal defaultExt As String = "") As String
+    Function ShowMessage(ByVal prompt As String, Optional ByVal buttons As Long = 0, Optional ByVal title As String = "") As Long
+    Function ShowInput(ByVal prompt As String, Optional ByVal title As String = "", Optional ByVal defaultVal As String = "") As String
+End Interface

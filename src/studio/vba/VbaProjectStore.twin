@@ -1,0 +1,1396 @@
+[ Description ("Microsoft Access Storage (MSysAccessStorage) and MS-OVBA Module Store") ]
+Module VbaProjectStore
+    Option Explicit
+    ' =========================================================================
+    ' Plan 7 WS8: Native MSysAccessStorage & MS-OVBA Engine
+    ' Decompresses MS-OVBA streams, reads native VBA modules, and extracts
+    ' string tokens from form layout binary blobs.
+    ' =========================================================================
+
+    Public Function CollectionContainsText(ByVal col As Collection, ByVal itemText As String) As Boolean
+        Dim v As Variant
+        Dim targetUpper As String
+        CollectionContainsText = False
+        If col Is Nothing Then Exit Function
+        targetUpper = UCase$(Trim$(itemText))
+        For Each v In col
+            If UCase$(Trim$(CStr(v))) = targetUpper Then
+                CollectionContainsText = True
+                Exit Function
+            End If
+        Next v
+    End Function
+
+    Public Function Pow2(ByVal expVal As Long) As Long
+        Select Case expVal
+            Case 0: Pow2 = 1&
+            Case 1: Pow2 = 2&
+            Case 2: Pow2 = 4&
+            Case 3: Pow2 = 8&
+            Case 4: Pow2 = 16&
+            Case 5: Pow2 = 32&
+            Case 6: Pow2 = 64&
+            Case 7: Pow2 = 128&
+            Case 8: Pow2 = 256&
+            Case 9: Pow2 = 512&
+            Case 10: Pow2 = 1024&
+            Case 11: Pow2 = 2048&
+            Case 12: Pow2 = 4096&
+            Case 13: Pow2 = 8192&
+            Case 14: Pow2 = 16384&
+            Case 15: Pow2 = 32768&
+            Case 16: Pow2 = 65536&
+            Case Else: Pow2 = 1&
+        End Select
+    End Function
+
+    Public Function DecompressOvbaStream(ByRef buf() As Byte, Optional ByVal startOffset As Long = 0) As String
+        Dim decBytes() As Byte
+        Dim resText As String
+        Dim i As Long
+
+        DecompressOvbaStream = vbNullString
+        decBytes = DecompressRawOvba(buf, startOffset)
+        If UBound(decBytes) < 0 Then Exit Function
+
+        On Error Resume Next
+        resText = StrConv(decBytes, vbUnicode)
+        If Err.Number <> 0 Or Len(resText) = 0 Then
+            Err.Clear
+            resText = vbNullString
+            For i = 0 To UBound(decBytes)
+                resText = resText & Chr$(decBytes(i))
+            Next i
+        End If
+        On Error GoTo 0
+
+        resText = Replace$(resText, vbCrLf, vbLf)
+        resText = Replace$(resText, vbCr, vbLf)
+        resText = Replace$(resText, vbLf, vbCrLf)
+        DecompressOvbaStream = Trim$(resText)
+    End Function
+
+    Public Function GetNativeVbaModuleCode(ByVal db As Object, ByVal moduleName As String) As String
+        Dim rsDir As Object
+        Dim rsFolder As Object
+        Dim rsStreams As Object
+        Dim vbaParentId As Long
+        Dim rawBytes() As Byte
+        Dim rawDir() As Byte
+        Dim decompDir() As Byte
+        Dim streamName As String
+        Dim decompressed As String
+        Dim vLv As Variant
+        Dim targetUpper As String
+        Dim attrPattern As String
+        Dim modOffset As Long
+        Dim okFind As Boolean
+
+        GetNativeVbaModuleCode = vbNullString
+        If db Is Nothing Or Len(Trim$(moduleName)) = 0 Then Exit Function
+
+        targetUpper = UCase$(Trim$(moduleName))
+        attrPattern = UCase$("Attribute VB_Name = """ & Trim$(moduleName) & """")
+        vbaParentId = -1
+
+        On Error Resume Next
+        ' 1. Primary path: Read dir stream to get exact stream name and module offset (MS-OVBA standard)
+        Set rsDir = db.OpenRecordset("SELECT [ParentId], [Lv] FROM [MSysAccessStorage] WHERE [Name] = 'dir';")
+        If Err.Number = 0 And Not rsDir Is Nothing Then
+            Do Until rsDir.EOF
+                vbaParentId = CLng(rsDir.Fields(0).Value)
+                vLv = rsDir.Fields(1).Value
+
+                If Not IsNull(vLv) Then
+                    rawDir = vLv
+                    decompDir = DecompressRawOvba(rawDir)
+                    If UBound(decompDir) >= 20 Then
+                        okFind = FindDirModule(decompDir, moduleName, streamName, modOffset)
+                        If Not okFind And Left$(targetUpper, 5) <> "FORM_" Then
+                            okFind = FindDirModule(decompDir, "Form_" & moduleName, streamName, modOffset)
+                        End If
+                        If Not okFind And Left$(targetUpper, 5) = "FORM_" Then
+                            okFind = FindDirModule(decompDir, Mid$(moduleName, 6), streamName, modOffset)
+                        End If
+                        If Not okFind And Left$(targetUpper, 7) <> "REPORT_" Then
+                            okFind = FindDirModule(decompDir, "Report_" & moduleName, streamName, modOffset)
+                        End If
+                        If Not okFind And Left$(targetUpper, 7) = "REPORT_" Then
+                            okFind = FindDirModule(decompDir, Mid$(moduleName, 8), streamName, modOffset)
+                        End If
+
+                        If okFind And Len(streamName) > 0 Then
+                            Set rsStreams = db.OpenRecordset("SELECT [Lv] FROM [MSysAccessStorage] WHERE [ParentId] = " & CStr(vbaParentId) & " AND [Name] = '" & streamName & "';")
+                            If Err.Number = 0 And Not rsStreams Is Nothing Then
+                                If Not rsStreams.EOF Then
+                                    vLv = rsStreams.Fields(0).Value
+                                    rsStreams.Close
+                                    Set rsStreams = Nothing
+                                    If Not IsNull(vLv) Then
+                                        rawBytes = vLv
+                                        decompressed = DecompressOvbaStream(rawBytes, modOffset)
+                                        If Len(decompressed) = 0 And modOffset > 0 Then
+                                            decompressed = DecompressOvbaStream(rawBytes, 0)
+                                        End If
+                                        If Len(decompressed) > 0 Then
+                                            rsDir.Close
+                                            Set rsDir = Nothing
+                                            GetNativeVbaModuleCode = decompressed
+                                            On Error GoTo 0
+                                            Exit Function
+                                        End If
+                                    End If
+                                Else
+                                    rsStreams.Close
+                                    Set rsStreams = Nothing
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+                rsDir.MoveNext
+            Loop
+            rsDir.Close
+            Set rsDir = Nothing
+        End If
+
+        ' 2. Fallback path: Scan MSysAccessStorage directly for named streams or attributes
+        If vbaParentId <= 0 Then
+            Set rsFolder = db.OpenRecordset("SELECT [Id] FROM [MSysAccessStorage] WHERE [Name] = 'VBA' AND [ParentId] <> 1;")
+            If Err.Number = 0 And Not rsFolder Is Nothing Then
+                If Not rsFolder.EOF Then
+                    vbaParentId = CLng(rsFolder.Fields(0).Value)
+                End If
+                rsFolder.Close
+            End If
+        End If
+        If vbaParentId <= 0 Then
+            Set rsFolder = db.OpenRecordset("SELECT [Id] FROM [MSysAccessStorage] WHERE [Name] = 'VBA';")
+            If Err.Number = 0 And Not rsFolder Is Nothing Then
+                If Not rsFolder.EOF Then
+                    vbaParentId = CLng(rsFolder.Fields(0).Value)
+                End If
+                rsFolder.Close
+            End If
+        End If
+
+        If vbaParentId > 0 Then
+            Set rsStreams = db.OpenRecordset("SELECT [Name], [Lv] FROM [MSysAccessStorage] WHERE [ParentId] = " & CStr(vbaParentId) & ";")
+            If Err.Number = 0 And Not rsStreams Is Nothing Then
+                Do Until rsStreams.EOF
+                    If Err.Number <> 0 Then Exit Do
+                    streamName = CStr(rsStreams.Fields(0).Value)
+                    vLv = rsStreams.Fields(1).Value
+                    If Not IsNull(vLv) Then
+                        rawBytes = vLv
+                        If UCase$(Trim$(streamName)) = targetUpper Then
+                            decompressed = DecompressOvbaStream(rawBytes, 0)
+                            If Len(decompressed) > 0 Then
+                                rsStreams.Close
+                                On Error GoTo 0
+                                GetNativeVbaModuleCode = decompressed
+                                Exit Function
+                            End If
+                        Else
+                            decompressed = DecompressOvbaStream(rawBytes, 0)
+                            If InStr(1, UCase$(decompressed), attrPattern, vbTextCompare) > 0 Then
+                                rsStreams.Close
+                                On Error GoTo 0
+                                GetNativeVbaModuleCode = decompressed
+                                Exit Function
+                            End If
+                        End If
+                    End If
+                    rsStreams.MoveNext
+                Loop
+                rsStreams.Close
+            End If
+        End If
+        On Error GoTo 0
+    End Function
+
+    Public Function GetModuleCode(ByVal moduleName As String, Optional ByVal procName As String = "") As String
+        Dim modText As String
+        modText = vbNullString
+        Dim activeDb As Object
+        Set activeDb = StudioController.ActiveDatabase
+        If Not activeDb Is Nothing Then
+            modText = GetNativeVbaModuleCode(activeDb, moduleName)
+        End If
+        If Len(modText) = 0 Then
+            GetModuleCode = vbNullString
+            Exit Function
+        End If
+
+        ' Register any API declares present in the module (WS5.7)
+        Dim decLines() As String
+        decLines = Split(modText, vbCrLf)
+        Dim dIdx As Long
+        For dIdx = 0 To UBound(decLines)
+            If InStr(1, decLines(dIdx), "Declare ", vbTextCompare) > 0 Then
+                DeclareBridge.ParseAndRegisterDeclare decLines(dIdx)
+            End If
+        Next dIdx
+
+        If Len(Trim$(procName)) = 0 Then
+            GetModuleCode = modText
+            Exit Function
+        End If
+
+        ' Extract procedure text
+        Dim lines() As String
+        lines = Split(modText, vbCrLf)
+        Dim pUpper As String
+        pUpper = UCase$(Trim$(procName))
+        Dim startIdx As Long
+        startIdx = -1
+        Dim endIdx As Long
+        endIdx = -1
+
+        Dim i As Long
+        For i = 0 To UBound(lines)
+            Dim lText As String
+            lText = UCase$(Trim$(lines(i)))
+            If startIdx = -1 Then
+                If InStr(1, lText, "SUB " & pUpper) > 0 Or InStr(1, lText, "FUNCTION " & pUpper) > 0 Then
+                    startIdx = i
+                End If
+            Else
+                If lText = "END SUB" Or lText = "END FUNCTION" Then
+                    endIdx = i
+                    Exit For
+                End If
+            End If
+        Next i
+
+        If startIdx >= 0 And endIdx >= startIdx Then
+            Dim procLines() As String
+            ReDim procLines(0 To endIdx - startIdx)
+            Dim k As Long
+            For k = startIdx To endIdx
+                procLines(k - startIdx) = lines(k)
+            Next k
+            GetModuleCode = Join(procLines, vbCrLf)
+        Else
+            GetModuleCode = vbNullString
+        End If
+    End Function
+
+    Public Function ExtractUtf16StringsFromBlob(ByRef buf() As Byte) As Collection
+        Dim list As New Collection
+        Dim maxIdx As Long
+        Dim i As Long
+        Dim curStr As String
+        Dim lo As Long
+        Dim hi As Long
+
+        On Error Resume Next
+        maxIdx = -1
+        maxIdx = UBound(buf)
+        If Err.Number <> 0 Or maxIdx < 4 Then
+            On Error GoTo 0
+            Set ExtractUtf16StringsFromBlob = list
+            Exit Function
+        End If
+        On Error GoTo 0
+
+        i = 0
+        Do While (i + 1) <= maxIdx
+            lo = CLng(buf(i))
+            hi = CLng(buf(i + 1))
+            If hi = 0 And lo >= 32 And lo <= 126 Then
+                curStr = vbNullString
+                Do While (i + 1) <= maxIdx
+                    lo = CLng(buf(i))
+                    hi = CLng(buf(i + 1))
+                    If hi = 0 And lo >= 32 And lo <= 126 Then
+                        curStr = curStr & Chr$(lo)
+                        i = i + 2
+                    Else
+                        Exit Do
+                    End If
+                Loop
+                If Len(curStr) >= 2 Then
+                    list.Add curStr
+                End If
+            Else
+                i = i + 1
+            End If
+        Loop
+
+        Set ExtractUtf16StringsFromBlob = list
+    End Function
+
+
+    Public Function ListVbaModuleNames(ByVal db As Object) As Collection
+        Dim names As New Collection
+        Dim rsFolder As Object
+        Dim rsStreams As Object
+        Dim vbaParentId As Long
+        Dim streamName As String
+
+        If db Is Nothing Then
+            Set ListVbaModuleNames = names
+            Exit Function
+        End If
+
+        vbaParentId = -1
+        On Error Resume Next
+        Set rsFolder = db.OpenRecordset("SELECT [Id] FROM [MSysAccessStorage] WHERE [Name] = 'VBA';")
+        If Err.Number = 0 And Not rsFolder Is Nothing Then
+            If Not rsFolder.EOF Then
+                vbaParentId = CLng(rsFolder.Fields(0).Value)
+            End If
+            rsFolder.Close
+        End If
+
+        If vbaParentId > 0 Then
+            Set rsStreams = db.OpenRecordset("SELECT [Name] FROM [MSysAccessStorage] WHERE [ParentId] = " & CStr(vbaParentId) & ";")
+            If Err.Number = 0 And Not rsStreams Is Nothing Then
+                Do Until rsStreams.EOF
+                    streamName = CStr(rsStreams.Fields(0).Value)
+                    If Left$(streamName, 1) <> "_" And Left$(streamName, 3) <> "dir" Then
+                        names.Add streamName
+                    End If
+                    rsStreams.MoveNext
+                Loop
+                rsStreams.Close
+            End If
+        End If
+        Err.Clear
+        On Error GoTo 0
+        Set ListVbaModuleNames = names
+    End Function
+
+
+    Public Function DecompressRawOvba(ByRef buf() As Byte, Optional ByVal startOffset As Long = 0) As Byte()
+        Dim maxIdx As Long
+        Dim pos As Long
+        Dim outBuf() As Byte
+        Dim outLen As Long
+        Dim outCap As Long
+        Dim header As Long
+        Dim chunkSize As Long
+        Dim chunkCompressed As Boolean
+        Dim chunkSig As Long
+        Dim chunkEnd As Long
+        Dim chunkStartOut As Long
+        Dim flags As Long
+        Dim bitIdx As Long
+        Dim token As Long
+        Dim decompCurrent As Long
+        Dim bitCount As Long
+        Dim lengthMask As Long
+        Dim offsetMask As Long
+        Dim copyLen As Long
+        Dim copyOffset As Long
+        Dim k As Long
+        Dim res() As Byte
+
+        On Error Resume Next
+        maxIdx = -1
+        maxIdx = UBound(buf)
+        If Err.Number <> 0 Or maxIdx < 2 Then
+            On Error GoTo 0
+            ReDim res(0 To -1)
+            DecompressRawOvba = res
+            Exit Function
+        End If
+        On Error GoTo 0
+
+        outCap = 65536
+        ReDim outBuf(0 To outCap - 1)
+        outLen = 0
+
+        pos = startOffset
+        If pos <= maxIdx Then
+            If buf(pos) = 1 Then pos = pos + 1
+        End If
+
+        Do While (pos + 1) <= maxIdx
+            header = CLng(buf(pos)) Or (CLng(buf(pos + 1)) * 256&)
+            pos = pos + 2
+            chunkSize = (header And &HFFF&) + 3&
+            chunkCompressed = ((header And &H8000&) <> 0)
+            chunkSig = (header And &H7000&) \ &H1000&
+            If chunkSig <> 3 Then Exit Do
+
+            chunkEnd = pos + chunkSize - 2&
+            If chunkEnd > (maxIdx + 1) Then chunkEnd = maxIdx + 1
+            chunkStartOut = outLen
+
+            If Not chunkCompressed Then
+                Do While pos < chunkEnd
+                    If outLen >= outCap Then
+                        outCap = outCap * 2
+                        ReDim Preserve outBuf(0 To outCap - 1)
+                    End If
+                    outBuf(outLen) = buf(pos)
+                    outLen = outLen + 1
+                    pos = pos + 1
+                Loop
+            Else
+                Do While pos < chunkEnd
+                    flags = CLng(buf(pos))
+                    pos = pos + 1
+                    For bitIdx = 0 To 7
+                        If pos >= chunkEnd Then Exit For
+                        If (flags And Pow2(bitIdx)) = 0 Then
+                            If outLen >= outCap Then
+                                outCap = outCap * 2
+                                ReDim Preserve outBuf(0 To outCap - 1)
+                            End If
+                            outBuf(outLen) = buf(pos)
+                            outLen = outLen + 1
+                            pos = pos + 1
+                        Else
+                            If (pos + 1) >= chunkEnd Then
+                                pos = chunkEnd
+                                Exit For
+                            End If
+                            token = CLng(buf(pos)) Or (CLng(buf(pos + 1)) * 256&)
+                            pos = pos + 2
+                            decompCurrent = outLen - chunkStartOut
+                            If decompCurrent <= 16 Then
+                                bitCount = 4
+                            ElseIf decompCurrent <= 32 Then
+                                bitCount = 5
+                            ElseIf decompCurrent <= 64 Then
+                                bitCount = 6
+                            ElseIf decompCurrent <= 128 Then
+                                bitCount = 7
+                            ElseIf decompCurrent <= 256 Then
+                                bitCount = 8
+                            ElseIf decompCurrent <= 512 Then
+                                bitCount = 9
+                            ElseIf decompCurrent <= 1024 Then
+                                bitCount = 10
+                            ElseIf decompCurrent <= 2048 Then
+                                bitCount = 11
+                            Else
+                                bitCount = 12
+                            End If
+
+                            lengthMask = (&HFFFF& \ Pow2(bitCount))
+                            offsetMask = (&HFFFF& Xor lengthMask)
+                            copyLen = (token And lengthMask) + 3&
+                            copyOffset = ((token And offsetMask) \ Pow2(16 - bitCount)) + 1&
+
+                            For k = 1 To copyLen
+                                If (outLen - copyOffset) >= 0 Then
+                                    If outLen >= outCap Then
+                                        outCap = outCap * 2
+                                        ReDim Preserve outBuf(0 To outCap - 1)
+                                    End If
+                                    outBuf(outLen) = outBuf(outLen - copyOffset)
+                                    outLen = outLen + 1
+                                End If
+                            Next k
+                        End If
+                    Next bitIdx
+                Loop
+            End If
+        Loop
+
+        If outLen > 0 Then
+            ReDim res(0 To outLen - 1)
+            For k = 0 To outLen - 1
+                res(k) = outBuf(k)
+            Next k
+            DecompressRawOvba = res
+        Else
+            ReDim res(0 To -1)
+            DecompressRawOvba = res
+        End If
+    End Function
+
+    Public Function CompressOvbaRaw(ByRef dataBytes() As Byte) As Byte()
+        Dim totalLen As Long
+        Dim maxIdx As Long
+        Dim outBuf() As Byte
+        Dim outCap As Long
+        Dim outLen As Long
+        Dim srcPos As Long
+        Dim chunkLen As Long
+        Dim chunkStart As Long
+        Dim chunkPos As Long
+        Dim chunkBuf() As Byte
+        Dim chunkOutLen As Long
+        Dim flagByteIdx As Long
+        Dim flags As Long
+        Dim bitIdx As Long
+        Dim bestLen As Long
+        Dim bestOffset As Long
+        Dim decompCurrent As Long
+        Dim bitCount As Long
+        Dim maxLen As Long
+        Dim maxOffset As Long
+        Dim startWin As Long
+        Dim w As Long
+        Dim matchLen As Long
+        Dim lenMask As Long
+        Dim lenBits As Long
+        Dim offsetBits As Long
+        Dim token As Long
+        Dim chunkSize As Long
+        Dim headerVal As Long
+        Dim k As Long
+        Dim res() As Byte
+        Dim rawChunkSize As Long
+        Dim rawHeaderVal As Long
+
+        On Error Resume Next
+        maxIdx = -1
+        maxIdx = UBound(dataBytes)
+        If Err.Number <> 0 Or maxIdx < 0 Then
+            On Error GoTo 0
+            ReDim res(0 To -1)
+            CompressOvbaRaw = res
+            Exit Function
+        End If
+        On Error GoTo 0
+
+        totalLen = maxIdx + 1
+        outCap = totalLen + 1024
+        If outCap < 4096 Then outCap = 4096
+        ReDim outBuf(0 To outCap - 1)
+        outLen = 0
+
+        ' Signature byte 0x01
+        outBuf(0) = 1
+        outLen = 1
+
+        ReDim chunkBuf(0 To 8191)
+        srcPos = 0
+
+        Do While srcPos < totalLen
+            chunkLen = 4096
+            If (totalLen - srcPos) < chunkLen Then chunkLen = totalLen - srcPos
+            chunkStart = srcPos
+            chunkPos = 0
+            chunkOutLen = 0
+
+            Do While chunkPos < chunkLen
+                flagByteIdx = chunkOutLen
+                chunkBuf(chunkOutLen) = 0
+                chunkOutLen = chunkOutLen + 1
+                flags = 0
+
+                For bitIdx = 0 To 7
+                    If chunkPos >= chunkLen Then Exit For
+
+                    bestLen = 0
+                    bestOffset = 0
+                    decompCurrent = chunkPos
+
+                    If decompCurrent <= 16 Then
+                        bitCount = 4
+                    ElseIf decompCurrent <= 32 Then
+                        bitCount = 5
+                    ElseIf decompCurrent <= 64 Then
+                        bitCount = 6
+                    ElseIf decompCurrent <= 128 Then
+                        bitCount = 7
+                    ElseIf decompCurrent <= 256 Then
+                        bitCount = 8
+                    ElseIf decompCurrent <= 512 Then
+                        bitCount = 9
+                    ElseIf decompCurrent <= 1024 Then
+                        bitCount = 10
+                    ElseIf decompCurrent <= 2048 Then
+                        bitCount = 11
+                    Else
+                        bitCount = 12
+                    End If
+
+                    maxLen = Pow2(16 - bitCount) + 2&
+                    maxOffset = Pow2(bitCount)
+                    startWin = chunkPos - maxOffset
+                    If startWin < 0 Then startWin = 0
+
+                    For w = startWin To chunkPos - 1
+                        matchLen = 0
+                        Do While (chunkPos + matchLen) < chunkLen And matchLen < maxLen
+                            If dataBytes(chunkStart + w + matchLen) <> dataBytes(chunkStart + chunkPos + matchLen) Then Exit Do
+                            matchLen = matchLen + 1
+                        Loop
+                        If matchLen >= 3 And matchLen > bestLen Then
+                            bestLen = matchLen
+                            bestOffset = chunkPos - w
+                            If bestLen = maxLen Then Exit For
+                        End If
+                    Next w
+
+                    If bestLen >= 3 Then
+                        flags = flags Or Pow2(bitIdx)
+                        lenMask = (&HFFFF& \ Pow2(bitCount))
+                        lenBits = (bestLen - 3&) And lenMask
+                        offsetBits = (bestOffset - 1&) * Pow2(16 - bitCount)
+                        token = offsetBits Or lenBits
+                        chunkBuf(chunkOutLen) = CByte(token And &HFF&)
+                        chunkBuf(chunkOutLen + 1) = CByte((token \ 256&) And &HFF&)
+                        chunkOutLen = chunkOutLen + 2
+                        chunkPos = chunkPos + bestLen
+                    Else
+                        chunkBuf(chunkOutLen) = dataBytes(chunkStart + chunkPos)
+                        chunkOutLen = chunkOutLen + 1
+                        chunkPos = chunkPos + 1
+                    End If
+                Next bitIdx
+
+                chunkBuf(flagByteIdx) = CByte(flags And &HFF&)
+            Loop
+
+            chunkSize = chunkOutLen + 2&
+
+            ' Plan 7 WS6.1 [MS-OVBA 2.4.1.1.5]: CompressedChunkSize is (chunkSize - 3) up to 4095 (chunkSize <= 4098).
+            ' Uncompressed chunks (flag = 0) in MS-OVBA MUST always be padded to 4096 data bytes (header 0x3FFF).
+            If chunkSize <= 4098& Then
+                headerVal = &H8000& Or &H3000& Or (chunkSize - 3&)
+
+                If (outLen + chunkOutLen + 2) >= outCap Then
+                    outCap = outCap + chunkOutLen + 4096
+                    ReDim Preserve outBuf(0 To outCap - 1)
+                End If
+
+                outBuf(outLen) = CByte(headerVal And &HFF&)
+                outBuf(outLen + 1) = CByte((headerVal \ 256&) And &HFF&)
+                outLen = outLen + 2
+
+                For k = 0 To chunkOutLen - 1
+                    outBuf(outLen) = chunkBuf(k)
+                    outLen = outLen + 1
+                Next k
+            Else
+                rawHeaderVal = &H3000& Or 4095&
+
+                If (outLen + 4098) >= outCap Then
+                    outCap = outCap + 8192
+                    ReDim Preserve outBuf(0 To outCap - 1)
+                End If
+
+                outBuf(outLen) = CByte(rawHeaderVal And &HFF&)
+                outBuf(outLen + 1) = CByte((rawHeaderVal \ 256&) And &HFF&)
+                outLen = outLen + 2
+
+                For k = 0 To 4095
+                    If k < chunkLen Then
+                        outBuf(outLen) = dataBytes(chunkStart + k)
+                    Else
+                        outBuf(outLen) = 0
+                    End If
+                    outLen = outLen + 1
+                Next k
+            End If
+
+            srcPos = srcPos + chunkLen
+        Loop
+
+        ReDim res(0 To outLen - 1)
+        For k = 0 To outLen - 1
+            res(k) = outBuf(k)
+        Next k
+        CompressOvbaRaw = res
+    End Function
+
+    Public Function CompressOvbaStream(ByVal sourceText As String, Optional ByRef existingStreamBytes As Variant, Optional ByVal moduleOffset As Long = 0) As Byte()
+        Dim normText As String
+        Dim srcBytes() As Byte
+        Dim rawComp() As Byte
+        Dim i As Long
+        Dim compLen As Long
+        Dim prefixLen As Long
+        Dim oldBytes() As Byte
+        Dim oldMax As Long
+        Dim res() As Byte
+
+        normText = Replace$(sourceText, vbCrLf, vbLf)
+        normText = Replace$(normText, vbCr, vbLf)
+        normText = Replace$(normText, vbLf, vbCrLf)
+        If Right$(normText, 2) <> vbCrLf Then normText = normText & vbCrLf
+
+        If Len(normText) = 0 Then
+            ReDim res(0 To -1)
+            CompressOvbaStream = res
+            Exit Function
+        End If
+
+        ReDim srcBytes(0 To Len(normText) - 1)
+        For i = 1 To Len(normText)
+            srcBytes(i - 1) = CByte(Asc(Mid$(normText, i, 1)) And &HFF&)
+        Next i
+
+        rawComp = CompressOvbaRaw(srcBytes)
+        compLen = UBound(rawComp) - LBound(rawComp) + 1
+
+        prefixLen = 0
+        If Not IsMissing(existingStreamBytes) Then
+            If Not IsNull(existingStreamBytes) And Not IsEmpty(existingStreamBytes) Then
+                On Error Resume Next
+                oldBytes = existingStreamBytes
+                oldMax = -1
+                oldMax = UBound(oldBytes)
+                On Error GoTo 0
+                If moduleOffset > 0 And oldMax >= (moduleOffset - 1) Then
+                    prefixLen = moduleOffset
+                End If
+            End If
+        End If
+
+        ReDim res(0 To prefixLen + compLen - 1)
+        For i = 0 To prefixLen - 1
+            res(i) = oldBytes(i)
+        Next i
+        For i = 0 To compLen - 1
+            res(prefixLen + i) = rawComp(i)
+        Next i
+
+        CompressOvbaStream = res
+    End Function
+
+    Public Function FindBytesPattern(ByRef source() As Byte, ByRef pattern() As Byte, Optional ByVal startIdx As Long = 0) As Long
+        Dim sMax As Long
+        Dim pMax As Long
+        Dim pLen As Long
+        Dim i As Long
+        Dim j As Long
+        Dim matched As Boolean
+
+        FindBytesPattern = -1
+        On Error Resume Next
+        sMax = UBound(source)
+        pMax = UBound(pattern)
+        If Err.Number <> 0 Or sMax < 0 Or pMax < 0 Then
+            On Error GoTo 0
+            Exit Function
+        End If
+        On Error GoTo 0
+
+        pLen = pMax + 1
+        If startIdx < 0 Then startIdx = 0
+
+        For i = startIdx To (sMax - pLen + 1)
+            matched = True
+            For j = 0 To pMax
+                If source(i + j) <> pattern(j) Then
+                    matched = False
+                    Exit For
+                End If
+            Next j
+            If matched Then
+                FindBytesPattern = i
+                Exit Function
+            End If
+        Next i
+    End Function
+
+    Public Function FindDirModule(ByRef decompDir() As Byte, ByVal moduleName As String, ByRef outStreamName As String, ByRef outOffset As Long) As Boolean
+        Dim maxIdx As Long
+        Dim targetUpper As String
+        Dim targetLen As Long
+        Dim namePat(0 To 5) As Byte
+        Dim i As Long
+        Dim pos As Long
+        Dim foundPos As Long
+        Dim foundName As String
+
+        FindDirModule = False
+        outStreamName = vbNullString
+        outOffset = 0
+        targetUpper = UCase$(Trim$(moduleName))
+        targetLen = Len(targetUpper)
+        If targetLen = 0 Then Exit Function
+
+        On Error Resume Next
+        maxIdx = UBound(decompDir)
+        If Err.Number <> 0 Or maxIdx < 20 Then
+            On Error GoTo 0
+            Exit Function
+        End If
+        On Error GoTo 0
+
+        namePat(0) = &H19&
+        namePat(1) = 0
+        namePat(2) = CByte(targetLen And &HFF&)
+        namePat(3) = CByte((targetLen \ 256&) And &HFF&)
+        namePat(4) = CByte((targetLen \ 65536) And &HFF&)
+        namePat(5) = CByte((targetLen \ 16777216) And &HFF&)
+
+        pos = 0
+        foundPos = -1
+        Do While pos <= (maxIdx - (targetLen + 5))
+            pos = FindBytesPattern(decompDir, namePat, pos)
+            If pos < 0 Then Exit Do
+
+            foundName = vbNullString
+            For i = 1 To targetLen
+                foundName = foundName & Chr$(decompDir(pos + 5 + i))
+            Next i
+
+            If UCase$(foundName) = targetUpper Then
+                foundPos = pos
+                Exit Do
+            End If
+            pos = pos + 1
+        Loop
+
+        If foundPos < 0 Then Exit Function
+
+        ' Step through MS-OVBA MODULE TLV records starting after MODULENAME payload
+        Dim cTag As Long
+        Dim cSize As Long
+        Dim vStart As Long
+        pos = foundPos + 6 + targetLen
+        outStreamName = vbNullString
+        outOffset = 0
+
+        Do While (pos + 6) <= (maxIdx + 1)
+            cTag = CLng(decompDir(pos)) Or (CLng(decompDir(pos + 1)) * 256&)
+            cSize = CLng(decompDir(pos + 2)) Or (CLng(decompDir(pos + 3)) * 256&) Or (CLng(decompDir(pos + 4)) * 65536) Or (CLng(decompDir(pos + 5)) * 16777216)
+            vStart = pos + 6
+
+            If cTag = &H1A& Then ' MODULESTREAMNAME
+                If cSize > 0 And (vStart + cSize) <= (maxIdx + 1) Then
+                    outStreamName = vbNullString
+                    For i = 0 To cSize - 1
+                        outStreamName = outStreamName & Chr$(decompDir(vStart + i))
+                    Next i
+                End If
+                pos = vStart + cSize
+            ElseIf cTag = &H32& Then ' MODULESTREAMNAMEUNICODE
+                pos = vStart + cSize
+            ElseIf cTag = &H31& Then ' MODULEOFFSET
+                If cSize >= 4 And (vStart + 4) <= (maxIdx + 1) Then
+                    outOffset = CLng(decompDir(vStart)) Or (CLng(decompDir(vStart + 1)) * 256&) Or (CLng(decompDir(vStart + 2)) * 65536) Or (CLng(decompDir(vStart + 3)) * 16777216)
+                End If
+                pos = vStart + cSize
+            ElseIf cTag = &H2B& Then ' MODULETERMINATOR
+                Exit Do
+            Else
+                If cSize >= 0 And cSize < 100000 And (vStart + cSize) <= (maxIdx + 1) Then
+                    pos = vStart + cSize
+                Else
+                    pos = pos + 1
+                End If
+            End If
+        Loop
+
+        If Len(outStreamName) = 0 Then
+            outStreamName = Trim$(moduleName)
+        End If
+
+        FindDirModule = True
+    End Function
+
+    Public Function UpdateDirModuleOffset(ByRef decompDir() As Byte, ByVal moduleName As String, ByVal newOffset As Long, ByRef outStreamName As String) As Boolean
+        Dim maxIdx As Long
+        Dim targetUpper As String
+        Dim targetLen As Long
+        Dim i As Long
+        Dim pos As Long
+        Dim foundPos As Long
+        Dim offPos As Long
+        Dim foundName As String
+
+        UpdateDirModuleOffset = False
+        outStreamName = vbNullString
+        targetUpper = UCase$(Trim$(moduleName))
+        targetLen = Len(targetUpper)
+        If targetLen = 0 Then Exit Function
+
+        On Error Resume Next
+        maxIdx = UBound(decompDir)
+        If Err.Number <> 0 Or maxIdx < 20 Then
+            On Error GoTo 0
+            Exit Function
+        End If
+        On Error GoTo 0
+
+        ' Exact MODULENAME record header matching to eliminate substring collisions
+        ' RecordId = 0x0019 (2 bytes), RecordLength = targetLen (4 bytes), then targetName
+        Dim namePat(0 To 5) As Byte
+        namePat(0) = &H19&
+        namePat(1) = 0
+        namePat(2) = CByte(targetLen And &HFF&)
+        namePat(3) = CByte((targetLen \ 256&) And &HFF&)
+        namePat(4) = CByte((targetLen \ 65536) And &HFF&)
+        namePat(5) = CByte((targetLen \ 16777216) And &HFF&)
+
+        pos = 0
+        foundPos = -1
+        Do While pos <= (maxIdx - (targetLen + 5))
+            pos = FindBytesPattern(decompDir, namePat, pos)
+            If pos < 0 Then Exit Do
+
+            foundName = vbNullString
+            For i = 1 To targetLen
+                foundName = foundName & Chr$(decompDir(pos + 5 + i))
+            Next i
+
+            If UCase$(foundName) = targetUpper Then
+                foundPos = pos
+                Exit Do
+            End If
+            pos = pos + 1
+        Loop
+
+        If foundPos < 0 Then Exit Function
+
+        ' Step through MS-OVBA MODULE TLV records starting after MODULENAME payload
+        Dim cTag As Long
+        Dim cSize As Long
+        Dim vStart As Long
+        pos = foundPos + 6 + targetLen
+        outStreamName = vbNullString
+        offPos = -1
+
+        Do While (pos + 6) <= (maxIdx + 1)
+            cTag = CLng(decompDir(pos)) Or (CLng(decompDir(pos + 1)) * 256&)
+            cSize = CLng(decompDir(pos + 2)) Or (CLng(decompDir(pos + 3)) * 256&) Or (CLng(decompDir(pos + 4)) * 65536) Or (CLng(decompDir(pos + 5)) * 16777216)
+            vStart = pos + 6
+
+            If cTag = &H1A& Then ' MODULESTREAMNAME
+                If cSize > 0 And (vStart + cSize) <= (maxIdx + 1) Then
+                    outStreamName = vbNullString
+                    For i = 0 To cSize - 1
+                        outStreamName = outStreamName & Chr$(decompDir(vStart + i))
+                    Next i
+                End If
+                pos = vStart + cSize
+            ElseIf cTag = &H32& Then ' MODULESTREAMNAMEUNICODE
+                pos = vStart + cSize
+            ElseIf cTag = &H31& Then ' MODULEOFFSET
+                If cSize >= 4 And (vStart + 4) <= (maxIdx + 1) Then
+                    offPos = pos
+                End If
+                pos = vStart + cSize
+            ElseIf cTag = &H2B& Then ' MODULETERMINATOR
+                Exit Do
+            Else
+                If cSize >= 0 And cSize < 100000 And (vStart + cSize) <= (maxIdx + 1) Then
+                    pos = vStart + cSize
+                Else
+                    pos = pos + 1
+                End If
+            End If
+        Loop
+
+        If Len(outStreamName) = 0 Then
+            outStreamName = Trim$(moduleName)
+        End If
+
+        If offPos < 0 Then Exit Function
+
+        ' Write new 4-byte little-endian offset at offPos + 6
+        decompDir(offPos + 6) = CByte(newOffset And &HFF&)
+        decompDir(offPos + 7) = CByte((newOffset \ 256&) And &HFF&)
+        decompDir(offPos + 8) = CByte((newOffset \ 65536) And &HFF&)
+        decompDir(offPos + 9) = CByte((newOffset \ 16777216) And &HFF&)
+
+        UpdateDirModuleOffset = True
+    End Function
+
+    Public Function WriteModuleCode(ByVal db As Object, ByVal dbe As Object, ByVal dbPath As String, ByVal moduleName As String, ByVal newSource As String, ByRef outErrorMsg As String) As Boolean
+        Dim rsDir As Object
+        Dim rsMod As Object
+        Dim rsProj As Object
+        Dim rsW As Object
+        Dim vbaParentId As Long
+        Dim dirId As Long
+        Dim modId As Long
+        Dim projId As Long
+        Dim rawDir() As Byte
+        Dim vLv As Variant
+        Dim decompDir() As Byte
+        Dim recompDir() As Byte
+        Dim compSource() As Byte
+        Dim streamName As String
+        Dim targetBackup As String
+        Dim basePrefix As String
+        Dim dotPos As Long
+        Dim invalHeader(0 To 6) As Byte
+        Dim inTrans As Boolean
+        Dim ok As Boolean
+        Dim verifyCode As String
+
+        WriteModuleCode = False
+        outErrorMsg = vbNullString
+
+        If db Is Nothing Then
+            outErrorMsg = "Database object is not initialized."
+            Exit Function
+        End If
+
+        If Len(Trim$(moduleName)) = 0 Then
+            outErrorMsg = "Module name cannot be empty."
+            Exit Function
+        End If
+
+        If Len(Trim$(newSource)) = 0 Then
+            outErrorMsg = "Module source code cannot be empty."
+            Exit Function
+        End If
+
+        ' Plan 7 WS6.1 [CRITICAL FIX]: Do not block save on .laccdb when database is open by Studio in DAO.
+        ' Create safe timestamped backup before modifying database
+        If Len(Trim$(dbPath)) > 0 Then
+            dotPos = InStrRev(dbPath, ".")
+            If dotPos > 0 Then
+                basePrefix = Left$(dbPath, dotPos - 1)
+            Else
+                basePrefix = dbPath
+            End If
+
+            On Error Resume Next
+            targetBackup = basePrefix & "_bak_" & Format$(Now, "YYYYMMDD_HHNNSS") & ".bak"
+            FileCopy dbPath, targetBackup
+            On Error GoTo 0
+        End If
+
+        On Error Resume Next
+        Set rsDir = db.OpenRecordset("SELECT * FROM [MSysAccessStorage] WHERE [Name] = 'dir';")
+        If Err.Number <> 0 Or rsDir Is Nothing Then
+            outErrorMsg = "Failed to query MSysAccessStorage for dir: " & Err.Description
+            On Error GoTo 0
+            Exit Function
+        End If
+
+        If rsDir.EOF Then
+            rsDir.Close
+            outErrorMsg = "VBA dir stream not found in MSysAccessStorage."
+            On Error GoTo 0
+            Exit Function
+        End If
+
+        vbaParentId = CLng(rsDir.Fields("ParentId").Value)
+        dirId = CLng(rsDir.Fields("Id").Value)
+        vLv = rsDir.Fields("Lv").Value
+        rsDir.Close
+
+        If IsNull(vLv) Then
+            outErrorMsg = "dir stream Lv is null."
+            On Error GoTo 0
+            Exit Function
+        End If
+        rawDir = vLv
+
+        decompDir = DecompressRawOvba(rawDir)
+        If UBound(decompDir) < 0 Then
+            outErrorMsg = "Failed to decompress dir stream."
+            On Error GoTo 0
+            Exit Function
+        End If
+
+        Dim resolvedModName As String
+        Dim origModOffset As Long
+        resolvedModName = Trim$(moduleName)
+        origModOffset = 0
+        ok = FindDirModule(decompDir, resolvedModName, streamName, origModOffset)
+        If Not ok And Left$(UCase$(resolvedModName), 4) = "MOD_" Then
+            If FindDirModule(decompDir, Mid$(resolvedModName, 5), streamName, origModOffset) Then
+                resolvedModName = Mid$(resolvedModName, 5)
+                ok = True
+            ElseIf FindDirModule(decompDir, "Form_" & Mid$(resolvedModName, 5), streamName, origModOffset) Then
+                resolvedModName = "Form_" & Mid$(resolvedModName, 5)
+                ok = True
+            End If
+        End If
+        If Not ok And Left$(UCase$(resolvedModName), 5) <> "FORM_" Then
+            If FindDirModule(decompDir, "Form_" & resolvedModName, streamName, origModOffset) Then
+                resolvedModName = "Form_" & resolvedModName
+                ok = True
+            End If
+        End If
+        If Not ok And Left$(UCase$(resolvedModName), 5) = "FORM_" Then
+            If FindDirModule(decompDir, Mid$(resolvedModName, 6), streamName, origModOffset) Then
+                resolvedModName = Mid$(resolvedModName, 6)
+                ok = True
+            End If
+        End If
+        If Not ok Then
+            outErrorMsg = "Module [" & moduleName & "] not found in VBA dir stream."
+            On Error GoTo 0
+            Exit Function
+        End If
+
+        Set rsMod = db.OpenRecordset("SELECT * FROM [MSysAccessStorage] WHERE [ParentId] = " & CStr(vbaParentId) & " AND [Name] = '" & streamName & "';")
+        If Err.Number <> 0 Or rsMod Is Nothing Then
+            outErrorMsg = "Failed to query module stream [" & streamName & "]: " & Err.Description
+            On Error GoTo 0
+            Exit Function
+        End If
+
+        If rsMod.EOF Then
+            rsMod.Close
+            outErrorMsg = "Module stream [" & streamName & "] not found in MSysAccessStorage."
+            On Error GoTo 0
+            Exit Function
+        End If
+        modId = CLng(rsMod.Fields("Id").Value)
+        Dim existingLv As Variant
+        existingLv = rsMod.Fields("Lv").Value
+        rsMod.Close
+
+        ' Preserve exact original Attribute VB_... header block from existing module stream at origModOffset
+        If InStr(1, newSource, "Attribute VB_Name", vbTextCompare) = 0 Then
+            Dim attrHeader As String
+            attrHeader = vbNullString
+            If Not IsNull(existingLv) And Not IsEmpty(existingLv) Then
+                Dim oldModBytes() As Byte
+                Dim oldModText As String
+                oldModBytes = existingLv
+                oldModText = DecompressOvbaStream(oldModBytes, origModOffset)
+                If Len(oldModText) = 0 Then
+                    oldModText = DecompressOvbaStreamEx(oldModBytes, origModOffset)
+                End If
+                If Len(oldModText) > 0 Then
+                    Dim oldLines() As String
+                    Dim olIdx As Long
+                    Dim olTrim As String
+                    oldLines = Split(oldModText, vbCrLf)
+                    For olIdx = 0 To UBound(oldLines)
+                        olTrim = Trim$(oldLines(olIdx))
+                        If UCase$(Left$(olTrim, 10)) = "ATTRIBUTE " Then
+                            If Len(attrHeader) > 0 Then attrHeader = attrHeader & vbCrLf
+                            attrHeader = attrHeader & olTrim
+                        ElseIf Len(attrHeader) > 0 And Len(olTrim) > 0 Then
+                            Exit For
+                        End If
+                    Next olIdx
+                End If
+            End If
+            If Len(attrHeader) = 0 Then
+                If Left$(UCase$(resolvedModName), 5) = "FORM_" Or Left$(UCase$(resolvedModName), 7) = "REPORT_" Then
+                    attrHeader = "Attribute VB_Name = " & Chr$(34) & resolvedModName & Chr$(34) & vbCrLf & "Attribute VB_GlobalNameSpace = False" & vbCrLf & "Attribute VB_Creatable = True" & vbCrLf & "Attribute VB_PredeclaredId = True" & vbCrLf & "Attribute VB_Exposed = False"
+                Else
+                    attrHeader = "Attribute VB_Name = " & Chr$(34) & resolvedModName & Chr$(34)
+                End If
+            End If
+            newSource = attrHeader & vbCrLf & newSource
+        End If
+
+        ' Preserve the exact PerformanceCache prefix (0 .. origModOffset - 1) and keep dir and _VBA_PROJECT untouched!
+        compSource = CompressOvbaStream(newSource, existingLv, origModOffset)
+
+        inTrans = False
+        On Error Resume Next
+        If Not dbe Is Nothing Then
+            dbe.BeginTrans
+            inTrans = True
+        End If
+
+        Set rsW = db.OpenRecordset("SELECT * FROM [MSysAccessStorage] WHERE [Id] = " & CStr(modId) & ";")
+        rsW.Edit
+        rsW.Fields("Lv").Value = compSource
+        rsW.Update
+        rsW.Close
+
+        If Err.Number <> 0 Then
+            outErrorMsg = "Transaction failed while writing module stream: " & Err.Description
+            If inTrans Then dbe.Rollback
+            On Error GoTo 0
+            Exit Function
+        End If
+
+        verifyCode = vbNullString
+        Set rsW = db.OpenRecordset("SELECT * FROM [MSysAccessStorage] WHERE [Id] = " & CStr(modId) & ";")
+        If Not rsW Is Nothing Then
+            If Not rsW.EOF Then
+                vLv = rsW.Fields("Lv").Value
+                If Not IsNull(vLv) Then
+                    rawDir = vLv
+                    verifyCode = DecompressOvbaStream(rawDir, origModOffset)
+                    If Len(verifyCode) = 0 Then
+                        verifyCode = DecompressOvbaStreamEx(rawDir, origModOffset)
+                    End If
+                End If
+            End If
+            rsW.Close
+        End If
+
+        If Len(verifyCode) = 0 Or InStr(1, verifyCode, "Attribute VB_Name", vbTextCompare) = 0 Then
+            If inTrans Then dbe.Rollback
+            outErrorMsg = "Verification failed: re-read module could not be decompressed or verified."
+            On Error GoTo 0
+            Exit Function
+        End If
+
+        If inTrans Then dbe.CommitTrans
+        On Error GoTo 0
+
+        WriteModuleCode = True
+    End Function
+
+
+    Public Function DecompressOvbaStreamEx(ByRef buf() As Byte, Optional ByVal startOffset As Long = -1) As String
+        Dim maxIdx As Long
+        Dim pos As Long
+        Dim outBuf() As Byte
+        Dim outLen As Long
+        Dim outCap As Long
+        Dim header As Long
+        Dim chunkSize As Long
+        Dim chunkCompressed As Boolean
+        Dim chunkSig As Long
+        Dim chunkEnd As Long
+        Dim chunkStartOut As Long
+        Dim flags As Long
+        Dim bitIdx As Long
+        Dim token As Long
+        Dim decompCurrent As Long
+        Dim bitCount As Long
+        Dim lengthMask As Long
+        Dim offsetMask As Long
+        Dim copyLen As Long
+        Dim copyOffset As Long
+        Dim k As Long
+        Dim resText As String
+        Dim i As Long
+
+        DecompressOvbaStreamEx = vbNullString
+        On Error Resume Next
+        maxIdx = -1
+        maxIdx = UBound(buf)
+        If Err.Number <> 0 Or maxIdx < 2 Then
+            On Error GoTo 0
+            Exit Function
+        End If
+        On Error GoTo 0
+
+        pos = -1
+        If startOffset >= 0 And startOffset <= maxIdx Then
+            If buf(startOffset) = 1 Then pos = startOffset + 1
+        End If
+
+        If pos < 0 Then
+            If maxIdx >= 4 Then
+                If buf(4) = 1 Then pos = 5
+            End If
+        End If
+
+        If pos < 0 Then
+            If buf(0) = 1 Then pos = 1
+        End If
+
+        If pos < 0 Then
+            For i = 4 To maxIdx - 7
+                If buf(i) = 65 And buf(i + 1) = 116 And buf(i + 2) = 116 And buf(i + 3) = 114 Then
+                    If buf(i + 4) = 105 And buf(i + 5) = 98 And buf(i + 6) = 117 And buf(i + 7) = 116 Then
+                        If (i - 4) >= 0 Then
+                            If buf(i - 4) = 1 Then pos = i - 3
+                        End If
+                        Exit For
+                    End If
+                End If
+            Next i
+        End If
+
+        If pos < 0 Then Exit Function
+
+        outCap = 65536
+        ReDim outBuf(0 To outCap - 1)
+        outLen = 0
+
+        Do While (pos + 1) <= maxIdx
+            header = CLng(buf(pos)) Or (CLng(buf(pos + 1)) * 256&)
+            pos = pos + 2
+            chunkSize = (header And &HFFF&) + 3&
+            chunkCompressed = ((header And &H8000&) <> 0)
+            chunkSig = (header And &H7000&) \ &H1000&
+            If chunkSig <> 3 Then Exit Do
+
+            chunkEnd = pos + chunkSize - 2&
+            If chunkEnd > (maxIdx + 1) Then chunkEnd = maxIdx + 1
+            chunkStartOut = outLen
+
+            If Not chunkCompressed Then
+                Do While pos < chunkEnd
+                    If outLen >= outCap Then
+                        outCap = outCap * 2
+                        ReDim Preserve outBuf(0 To outCap - 1)
+                    End If
+                    outBuf(outLen) = buf(pos)
+                    outLen = outLen + 1
+                    pos = pos + 1
+                Loop
+            Else
+                Do While pos < chunkEnd
+                    flags = CLng(buf(pos))
+                    pos = pos + 1
+                    For bitIdx = 0 To 7
+                        If pos >= chunkEnd Then Exit For
+                        If (flags And Pow2(bitIdx)) = 0 Then
+                            If outLen >= outCap Then
+                                outCap = outCap * 2
+                                ReDim Preserve outBuf(0 To outCap - 1)
+                            End If
+                            outBuf(outLen) = buf(pos)
+                            outLen = outLen + 1
+                            pos = pos + 1
+                        Else
+                            If (pos + 1) >= chunkEnd Then
+                                pos = chunkEnd
+                                Exit For
+                            End If
+                            token = CLng(buf(pos)) Or (CLng(buf(pos + 1)) * 256&)
+                            pos = pos + 2
+                            decompCurrent = outLen - chunkStartOut
+                            If decompCurrent <= 16 Then
+                                bitCount = 4
+                            ElseIf decompCurrent <= 32 Then
+                                bitCount = 5
+                            ElseIf decompCurrent <= 64 Then
+                                bitCount = 6
+                            ElseIf decompCurrent <= 128 Then
+                                bitCount = 7
+                            ElseIf decompCurrent <= 256 Then
+                                bitCount = 8
+                            ElseIf decompCurrent <= 512 Then
+                                bitCount = 9
+                            ElseIf decompCurrent <= 1024 Then
+                                bitCount = 10
+                            ElseIf decompCurrent <= 2048 Then
+                                bitCount = 11
+                            Else
+                                bitCount = 12
+                            End If
+
+                            lengthMask = (&HFFFF& \ Pow2(bitCount))
+                            offsetMask = (&HFFFF& Xor lengthMask)
+                            copyLen = (token And lengthMask) + 3&
+                            copyOffset = ((token And offsetMask) \ Pow2(16 - bitCount)) + 1&
+
+                            For k = 1 To copyLen
+                                If (outLen - copyOffset) >= 0 Then
+                                    If outLen >= outCap Then
+                                        outCap = outCap * 2
+                                        ReDim Preserve outBuf(0 To outCap - 1)
+                                    End If
+                                    outBuf(outLen) = outBuf(outLen - copyOffset)
+                                    outLen = outLen + 1
+                                End If
+                            Next k
+                        End If
+                    Next bitIdx
+                Loop
+            End If
+        Loop
+
+        resText = vbNullString
+        If outLen > 0 Then
+            ' Fast bulk decode to Latin1 string
+            resText = StrConv(LeftB$(CStr(outBuf), outLen), vbUnicode)
+            If Len(resText) = 0 Then
+                For i = 0 To outLen - 1
+                    resText = resText & Chr$(outBuf(i))
+                Next i
+            End If
+        End If
+
+        resText = Replace$(resText, vbCrLf, vbLf)
+        resText = Replace$(resText, vbCr, vbLf)
+        resText = Replace$(resText, vbLf, vbCrLf)
+        DecompressOvbaStreamEx = Trim$(resText)
+    End Function
+
+End Module

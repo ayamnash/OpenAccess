@@ -1,0 +1,9 @@
+' File: src/studio/pal/ISettings.twin
+' Plan 7 WS7: Platform Abstraction Layer - Settings Store Interface
+Option Explicit
+
+Public Interface ISettings
+    Function GetValue(ByVal appName As String, ByVal section As String, ByVal key As String, Optional ByVal defaultValue As String = "") As String
+    Function SetValue(ByVal appName As String, ByVal section As String, ByVal key As String, ByVal value As String) As Boolean
+    Function DeleteValue(ByVal appName As String, ByVal section As String, Optional ByVal key As String = "") As Boolean
+End Interface

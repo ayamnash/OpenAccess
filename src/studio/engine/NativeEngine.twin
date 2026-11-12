@@ -1,0 +1,227 @@
+' File: src/studio/engine/NativeEngine.twin
+' Native OpenAccess Database Engine Implementation with Page-Level Rollback Journal Transactions
+Option Explicit
+
+[ Description ("Native OpenAccess Database Engine Implementation") ]
+[ ClassId ("F5A3B120-8C4D-4E91-A012-000000000003") ]
+[ InterfaceId ("F5A3B120-8C4D-4E91-A012-000000000004") ]
+[ ComCreatable (False) ]
+Public Class NativeEngine
+    Implements IDataEngine
+    Private m_dbe As Object
+    Private m_database As Object
+    Private m_dbPath As String
+    Private m_version As String
+    Private m_inTrans As Boolean
+
+    Public Sub New()
+        On Error Resume Next
+        Set m_dbe = New DBEngine
+        If Not m_dbe Is Nothing Then
+            m_version = "OpenAccess Native " & m_dbe.Version & " (In-Process)"
+        Else
+            m_version = "OpenAccess Native 1.0 (In-Process)"
+        End If
+        m_inTrans = False
+        On Error GoTo 0
+    End Sub
+
+    Public Function OpenDatabase(ByVal filePath As String, Optional ByVal isExclusive As Boolean = False, Optional ByVal isReadOnly As Boolean = False) As Object Implements IDataEngine.OpenDatabase
+        CloseDatabase
+        On Error Resume Next
+        If Not m_dbe Is Nothing Then
+            Set m_database = m_dbe.OpenDatabase(filePath, isExclusive, isReadOnly)
+        End If
+        If Not m_database Is Nothing Then
+            m_dbPath = filePath
+            Set OpenDatabase = m_database
+        Else
+            Set m_database = Nothing
+            m_dbPath = vbNullString
+            Set OpenDatabase = Nothing
+        End If
+        On Error GoTo 0
+    End Function
+
+    Public Function CreateDatabase(ByVal filePath As String) As Object Implements IDataEngine.CreateDatabase
+        CloseDatabase
+        On Error Resume Next
+        If Not m_dbe Is Nothing Then
+            Set m_database = m_dbe.CreateDatabase(filePath)
+        End If
+        If Not m_database Is Nothing Then
+            m_dbPath = filePath
+            Set CreateDatabase = m_database
+        Else
+            Set m_database = Nothing
+            m_dbPath = vbNullString
+            Set CreateDatabase = Nothing
+        End If
+        On Error GoTo 0
+    End Function
+
+    Public Sub CloseDatabase() Implements IDataEngine.CloseDatabase
+        If Not m_database Is Nothing Then
+            On Error Resume Next
+            If m_inTrans Then
+                RollbackTrans
+            End If
+            m_database.Close
+            On Error GoTo 0
+            Set m_database = Nothing
+        End If
+        m_dbPath = vbNullString
+        m_inTrans = False
+    End Sub
+
+    Public Property Get IsOpen() As Boolean Implements IDataEngine.IsOpen
+        IsOpen = (Not m_database Is Nothing)
+    End Property
+
+    Public Property Get DatabasePath() As String Implements IDataEngine.DatabasePath
+        DatabasePath = m_dbPath
+    End Property
+
+    Public Property Get EngineName() As String Implements IDataEngine.EngineName
+        EngineName = "OpenAccess Native Engine"
+    End Property
+
+    Public Property Get EngineVersion() As String Implements IDataEngine.EngineVersion
+        EngineVersion = m_version
+    End Property
+
+    Public Property Get RawDatabase() As Object Implements IDataEngine.RawDatabase
+        Set RawDatabase = m_database
+    End Property
+
+    Public Property Get RawDBEngine() As Object Implements IDataEngine.RawDBEngine
+        Set RawDBEngine = m_dbe
+    End Property
+
+    Public Function OpenRecordset(ByVal sourceOrSql As String, Optional ByVal rsType As Long = 2) As Object Implements IDataEngine.OpenRecordset
+        If m_database Is Nothing Then Exit Function
+        On Error Resume Next
+        Set OpenRecordset = m_database.OpenRecordset(sourceOrSql)
+        On Error GoTo 0
+    End Function
+
+    Public Function ExecuteCommandSql(ByVal sql As String) As Boolean Implements IDataEngine.ExecuteCommandSql
+        ExecuteCommandSql = False
+        If m_database Is Nothing Then Exit Function
+        On Error Resume Next
+        m_database.Execute sql
+        If Err.Number = 0 Then
+            ExecuteCommandSql = True
+        End If
+        On Error GoTo 0
+    End Function
+
+    Public Function TableExists(ByVal tableName As String) As Boolean Implements IDataEngine.TableExists
+        Dim td As Object
+        TableExists = False
+        If m_database Is Nothing Then Exit Function
+        On Error Resume Next
+        Set td = m_database.TableDefs(tableName)
+        If Err.Number = 0 And Not td Is Nothing Then
+            TableExists = True
+        End If
+        On Error GoTo 0
+    End Function
+
+    Public Function QueryExists(ByVal queryName As String) As Boolean Implements IDataEngine.QueryExists
+        Dim qd As Object
+        QueryExists = False
+        If m_database Is Nothing Then Exit Function
+        On Error Resume Next
+        Set qd = m_database.QueryDefs(queryName)
+        If Err.Number = 0 And Not qd Is Nothing Then
+            QueryExists = True
+        End If
+        On Error GoTo 0
+    End Function
+
+    Public Function ListTableNames() As Collection Implements IDataEngine.ListTableNames
+        Dim col As New Collection
+        Dim i As Long
+        Dim tName As String
+        If Not m_database Is Nothing Then
+            On Error Resume Next
+            For i = 0 To m_database.TableDefs.Count - 1
+                tName = vbNullString
+                tName = m_database.TableDefs(i).Name
+                If Len(tName) > 0 Then
+                    If Left$(tName, 4) <> "MSys" And Left$(tName, 1) <> "~" Then
+                        col.Add tName
+                    End If
+                End If
+            Next i
+            On Error GoTo 0
+        End If
+        Set ListTableNames = col
+    End Function
+
+    Public Function ListQueryNames() As Collection Implements IDataEngine.ListQueryNames
+        Dim col As New Collection
+        Dim i As Long
+        Dim qName As String
+        If Not m_database Is Nothing Then
+            On Error Resume Next
+            For i = 0 To m_database.QueryDefs.Count - 1
+                qName = vbNullString
+                qName = m_database.QueryDefs(i).Name
+                If Len(qName) > 0 Then
+                    If Left$(qName, 4) <> "MSys" And Left$(qName, 1) <> "~" Then
+                        col.Add qName
+                    End If
+                End If
+            Next i
+            On Error GoTo 0
+        End If
+        Set ListQueryNames = col
+    End Function
+
+    Public Sub BeginTrans() Implements IDataEngine.BeginTrans
+        If m_inTrans Then Exit Sub
+        If Not m_database Is Nothing Then
+            On Error Resume Next
+            m_database.BeginTrans
+            On Error GoTo 0
+            m_inTrans = True
+        End If
+    End Sub
+
+    Public Sub CommitTrans() Implements IDataEngine.CommitTrans
+        If Not m_inTrans Then Exit Sub
+        If Not m_database Is Nothing Then
+            On Error Resume Next
+            m_database.CommitTrans
+            On Error GoTo 0
+        End If
+        m_inTrans = False
+    End Sub
+
+    Public Sub RollbackTrans() Implements IDataEngine.RollbackTrans
+        If Not m_inTrans Then Exit Sub
+        If Not m_database Is Nothing Then
+            On Error Resume Next
+            m_database.Rollback
+            On Error GoTo 0
+        End If
+        m_inTrans = False
+    End Sub
+
+    Public Function CompactDatabase(ByVal srcPath As String, ByVal dstPath As String) As Boolean Implements IDataEngine.CompactDatabase
+        CompactDatabase = False
+        If Not m_dbe Is Nothing Then
+            Err.Clear
+            On Error Resume Next
+            CompactDatabase = m_dbe.CompactDatabase(srcPath, dstPath)
+            On Error GoTo 0
+        End If
+    End Function
+
+    Private Sub Class_Terminate()
+        CloseDatabase
+        Set m_dbe = Nothing
+    End Sub
+End Class

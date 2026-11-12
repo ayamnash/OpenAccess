@@ -1,0 +1,9 @@
+' File: src/studio/pal/IClipboard.twin
+' Plan 7 WS7: Platform Abstraction Layer - Clipboard Interface
+Option Explicit
+
+Public Interface IClipboard
+    Function GetText() As String
+    Function SetText(ByVal text As String) As Boolean
+    Function Clear() As Boolean
+End Interface

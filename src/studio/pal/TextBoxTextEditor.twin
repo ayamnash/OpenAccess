@@ -1,0 +1,78 @@
+' File: src/studio/pal/TextBoxTextEditor.twin
+' Plan 7 WS7: Platform Abstraction Layer - TextBox Text Editor Adapter
+Option Explicit
+
+[ Description ("Platform Abstraction Layer - TextBox Text Editor Adapter") ]
+[ ClassId ("C5D1E810-7F2A-4C91-B831-000000000012") ]
+[ InterfaceId ("C5D1E810-7F2A-4C91-B831-000000000013") ]
+[ ComCreatable (False) ]
+Public Class TextBoxTextEditor
+    Implements ITextEditor
+    Private m_control As Object
+
+    Public Sub New(Optional ByVal targetControl As Object = Nothing)
+        Set m_control = targetControl
+    End Sub
+
+    Public Sub SetContent(ByVal text As String) Implements ITextEditor.SetContent
+        If m_control Is Nothing Then Exit Sub
+        On Error Resume Next
+        m_control.Text = text
+        On Error GoTo 0
+    End Sub
+
+    Public Function GetContent() As String Implements ITextEditor.GetContent
+        If m_control Is Nothing Then Exit Function
+        On Error Resume Next
+        GetContent = m_control.Text
+        On Error GoTo 0
+    End Function
+
+    Public Function GetCaretLine() As Long Implements ITextEditor.GetCaretLine
+        If m_control Is Nothing Then Exit Function
+        On Error Resume Next
+        Dim selStart As Long
+        selStart = m_control.SelStart
+        Dim txt As String
+        txt = Left$(m_control.Text, selStart)
+        Dim lines() As String
+        lines = Split(txt, vbCrLf)
+        GetCaretLine = UBound(lines) + 1
+        On Error GoTo 0
+    End Function
+
+    Public Function GetCaretColumn() As Long Implements ITextEditor.GetCaretColumn
+        If m_control Is Nothing Then Exit Function
+        On Error Resume Next
+        Dim selStart As Long
+        selStart = m_control.SelStart
+        Dim txt As String
+        txt = Left$(m_control.Text, selStart)
+        Dim lastNl As Long
+        lastNl = InStrRev(txt, vbLf)
+        If lastNl > 0 Then
+            GetCaretColumn = selStart - lastNl + 1
+        Else
+            GetCaretColumn = selStart + 1
+        End If
+        On Error GoTo 0
+    End Function
+
+    Public Sub SetSelection(ByVal startPos As Long, ByVal length As Long) Implements ITextEditor.SetSelection
+        If m_control Is Nothing Then Exit Sub
+        On Error Resume Next
+        m_control.SelStart = startPos
+        m_control.SelLength = length
+        On Error GoTo 0
+    End Sub
+
+    Public Sub HighlightRange(ByVal startPos As Long, ByVal length As Long, ByVal colorRgb As Long) Implements ITextEditor.HighlightRange
+        ' For plain TextBox, selection is positioned; RichTextBox can set SelColor
+        If m_control Is Nothing Then Exit Sub
+        On Error Resume Next
+        m_control.SelStart = startPos
+        m_control.SelLength = length
+        m_control.SelColor = colorRgb
+        On Error GoTo 0
+    End Sub
+End Class

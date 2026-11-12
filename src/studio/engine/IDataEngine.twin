@@ -1,0 +1,26 @@
+' File: src/studio/engine/IDataEngine.twin
+' Plan 7 WS0-B: Data Engine Abstraction Interface
+Option Explicit
+
+[ InterfaceId ("F5A3B120-8C4D-4E91-A012-000000000000") ]
+Public Interface IDataEngine
+    Function OpenDatabase(ByVal filePath As String, Optional ByVal isExclusive As Boolean = False, Optional ByVal isReadOnly As Boolean = False) As Object
+    Function CreateDatabase(ByVal filePath As String) As Object
+    Sub CloseDatabase()
+    Property Get IsOpen() As Boolean
+    Property Get DatabasePath() As String
+    Property Get EngineName() As String
+    Property Get EngineVersion() As String
+    Property Get RawDatabase() As Object
+    Property Get RawDBEngine() As Object
+    Function OpenRecordset(ByVal sourceOrSql As String, Optional ByVal rsType As Long = 2) As Object
+    Function ExecuteCommandSql(ByVal sql As String) As Boolean
+    Function TableExists(ByVal tableName As String) As Boolean
+    Function QueryExists(ByVal queryName As String) As Boolean
+    Function ListTableNames() As Collection
+    Function ListQueryNames() As Collection
+    Sub BeginTrans()
+    Sub CommitTrans()
+    Sub RollbackTrans()
+    Function CompactDatabase(ByVal srcPath As String, ByVal dstPath As String) As Boolean
+End Interface

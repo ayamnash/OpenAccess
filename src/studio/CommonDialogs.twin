@@ -1,0 +1,21 @@
+' File: src/studio/CommonDialogs.twin
+' Plan 7 WS7: Native File Dialog Helper - Delegating to Platform Abstraction Layer (PAL)
+Option Explicit
+
+Public Module CommonDialogs
+    Public Function ShowOpenDatabaseDialog(ByVal ownerHwnd As LongPtr) As String
+        ShowOpenDatabaseDialog = PalManager.Dialogs.ShowOpenFile(ownerHwnd, _
+            "Open Microsoft Access Database - OpenAccess Studio", _
+            "Access Databases (*.accdb;*.mdb)" & vbNullChar & "*.accdb;*.mdb" & vbNullChar & _
+            "ACE 2007-2021 (*.accdb)" & vbNullChar & "*.accdb" & vbNullChar & _
+            "Jet 4.0 Legacy (*.mdb)" & vbNullChar & "*.mdb" & vbNullChar & _
+            "All Files (*.*)" & vbNullChar & "*.*")
+    End Function
+
+    Public Function ShowSaveDatabaseDialog(ByVal ownerHwnd As LongPtr) As String
+        ShowSaveDatabaseDialog = PalManager.Dialogs.ShowSaveFile(ownerHwnd, _
+            "Create New Access Database - OpenAccess Studio", _
+            "Access 2007-2021 Database (*.accdb)" & vbNullChar & "*.accdb" & vbNullChar & _
+            "Jet 4.0 Database (*.mdb)" & vbNullChar & "*.mdb", "accdb")
+    End Function
+End Module

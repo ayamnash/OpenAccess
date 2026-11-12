@@ -1,0 +1,2209 @@
+' File: src/studio/vba/VbaInterpreter.twin
+' Plan 7 WS5.3: Visual Basic for Applications (VBA) Execution Engine & AST Interpreter
+Option Explicit
+
+Public Module VbaInterpreter
+
+    Private Const WATCHDOG_MAX_STEPS As Long = 50000&
+
+    Public Type VbaActivationFrame
+        LocalVars As Object            ' Scripting.Dictionary of local variables
+        CurrentProcName As String      ' Name of executing procedure
+        ReturnValue As Variant
+        HasReturned As Boolean
+        ExitRequested As Boolean
+        OnErrorResumeNext As Boolean
+        ErrorGotoLabel As String
+        LastErrorNum As Long
+        LastErrorDesc As String
+        WithPrefix As String           ' Current With ... End With prefix
+        ProcSource As String
+    End Type
+
+    Private m_callStack(0 To 63) As VbaActivationFrame
+    Private m_callDepth As Long
+
+    Private m_moduleVars As Object      ' Scripting.Dictionary of module variables
+    Private m_activeForm As AccessForm  ' Current Me context
+    Private m_activeDb As Object        ' Active DAO Database context (CurrentDb)
+
+    Private Sub PushFrame(ByVal pName As String, ByVal pSource As String)
+        If m_callDepth < 0 Then
+            m_callDepth = 0
+        Else
+            m_callDepth = m_callDepth + 1
+        End If
+        If m_callDepth > UBound(m_callStack) Then
+            Err.Raise 1002, "VbaInterpreter", "Out of stack space in VBA interpreter"
+            Exit Sub
+        End If
+        Set m_callStack(m_callDepth).LocalVars = PalManager.CreateDictionary()
+        m_callStack(m_callDepth).CurrentProcName = LCase$(Trim$(pName))
+        m_callStack(m_callDepth).ReturnValue = Empty
+        m_callStack(m_callDepth).HasReturned = False
+        m_callStack(m_callDepth).ExitRequested = False
+        m_callStack(m_callDepth).OnErrorResumeNext = False
+        m_callStack(m_callDepth).ErrorGotoLabel = vbNullString
+        m_callStack(m_callDepth).LastErrorNum = 0
+        m_callStack(m_callDepth).LastErrorDesc = vbNullString
+        m_callStack(m_callDepth).WithPrefix = vbNullString
+        m_callStack(m_callDepth).ProcSource = pSource
+    End Sub
+
+    Private Sub PopFrame()
+        If m_callDepth >= 0 Then
+            Set m_callStack(m_callDepth).LocalVars = Nothing
+            m_callStack(m_callDepth).ReturnValue = Empty
+            m_callStack(m_callDepth).ProcSource = vbNullString
+            m_callDepth = m_callDepth - 1
+        End If
+    End Sub
+
+    Public Sub InitializeInterpreter()
+        m_callDepth = 0
+        Set m_callStack(0).LocalVars = PalManager.CreateDictionary()
+        m_callStack(0).CurrentProcName = vbNullString
+        m_callStack(0).ReturnValue = Empty
+        m_callStack(0).HasReturned = False
+        m_callStack(0).ExitRequested = False
+        m_callStack(0).OnErrorResumeNext = False
+        m_callStack(0).ErrorGotoLabel = vbNullString
+        m_callStack(0).LastErrorNum = 0
+        m_callStack(0).LastErrorDesc = vbNullString
+        m_callStack(0).WithPrefix = vbNullString
+        m_callStack(0).ProcSource = vbNullString
+
+        If m_moduleVars Is Nothing Then Set m_moduleVars = PalManager.CreateDictionary()
+    End Sub
+
+    Public Sub SetActiveDatabase(ByVal dbObj As Object)
+        Set m_activeDb = dbObj
+    End Sub
+
+    Public Function GetActiveDatabase() As Object
+        If Not m_activeDb Is Nothing Then
+            Set GetActiveDatabase = m_activeDb
+        Else
+            Set GetActiveDatabase = StudioController.ActiveDatabase
+        End If
+    End Function
+
+    Public Sub SetActiveForm(ByVal frm As AccessForm)
+        Set m_activeForm = frm
+    End Sub
+
+    Public Function GetActiveForm() As AccessForm
+        Set GetActiveForm = m_activeForm
+    End Function
+
+    Public Sub SetVariable(ByVal varName As String, ByVal vVal As Variant)
+        If m_callDepth < 0 Then m_callDepth = 0
+        If m_callStack(m_callDepth).LocalVars Is Nothing Then
+            Set m_callStack(m_callDepth).LocalVars = PalManager.CreateDictionary()
+        End If
+        Dim k As String
+        k = LCase$(Trim$(varName))
+        If IsObject(vVal) Then
+            Set m_callStack(m_callDepth).LocalVars.Item(k) = vVal
+            If Len(m_callStack(m_callDepth).CurrentProcName) > 0 And k = m_callStack(m_callDepth).CurrentProcName Then
+                Set m_callStack(m_callDepth).ReturnValue = vVal
+                m_callStack(m_callDepth).HasReturned = True
+            End If
+        Else
+            m_callStack(m_callDepth).LocalVars.Item(k) = vVal
+            If Len(m_callStack(m_callDepth).CurrentProcName) > 0 And k = m_callStack(m_callDepth).CurrentProcName Then
+                m_callStack(m_callDepth).ReturnValue = vVal
+                m_callStack(m_callDepth).HasReturned = True
+            End If
+        End If
+    End Sub
+
+    Public Function GetVariable(ByVal varName As String) As Variant
+        Dim k As String
+        k = LCase$(Trim$(varName))
+        If m_callDepth >= 0 Then
+            If Not m_callStack(m_callDepth).LocalVars Is Nothing Then
+                If m_callStack(m_callDepth).LocalVars.Exists(k) Then
+                    If IsObject(m_callStack(m_callDepth).LocalVars.Item(k)) Then
+                        Set GetVariable = m_callStack(m_callDepth).LocalVars.Item(k)
+                    Else
+                        GetVariable = m_callStack(m_callDepth).LocalVars.Item(k)
+                    End If
+                    Exit Function
+                End If
+            End If
+        End If
+        If Not m_moduleVars Is Nothing Then
+            If m_moduleVars.Exists(k) Then
+                If IsObject(m_moduleVars.Item(k)) Then
+                    Set GetVariable = m_moduleVars.Item(k)
+                Else
+                    GetVariable = m_moduleVars.Item(k)
+                End If
+                Exit Function
+            End If
+        End If
+        GetVariable = Empty
+    End Function
+
+    Private Function CleanParamName(ByVal rawParam As String) As String
+        Dim s As String
+        s = Trim$(rawParam)
+        Dim changed As Boolean
+        changed = True
+        Do While changed
+            changed = False
+            If Left$(LCase$(s), 9) = "optional " Then
+                s = Trim$(Mid$(s, 10))
+                changed = True
+            ElseIf Left$(LCase$(s), 6) = "byval " Then
+                s = Trim$(Mid$(s, 7))
+                changed = True
+            ElseIf Left$(LCase$(s), 6) = "byref " Then
+                s = Trim$(Mid$(s, 7))
+                changed = True
+            End If
+        Loop
+        Dim eqPos As Long
+        eqPos = InStr(1, s, "=")
+        If eqPos > 0 Then s = Trim$(Left$(s, eqPos - 1))
+        Dim asPos As Long
+        asPos = InStr(1, s, " As ", vbTextCompare)
+        If asPos > 0 Then s = Trim$(Left$(s, asPos - 1))
+        If Left$(s, 1) = "[" And Right$(s, 1) = "]" Then
+            s = Trim$(Mid$(s, 2, Len(s) - 2))
+        End If
+        CleanParamName = LCase$(Trim$(s))
+    End Function
+
+    Private Function ExpandWithPrefix(ByVal expr As String) As String
+        Dim s As String
+        s = Trim$(expr)
+        If m_callDepth >= 0 Then
+            If Len(m_callStack(m_callDepth).WithPrefix) > 0 Then
+                If Left$(s, 1) = "." Or Left$(s, 1) = "!" Then
+                    ExpandWithPrefix = m_callStack(m_callDepth).WithPrefix & s
+                    Exit Function
+                End If
+            End If
+        End If
+        ExpandWithPrefix = s
+    End Function
+
+    Public Function SplitArguments(ByVal argsText As String) As String()
+        Dim s As String
+        s = Trim$(argsText)
+        If Len(s) = 0 Then
+            Dim emptyArr() As String
+            ReDim emptyArr(0 To -1)
+            SplitArguments = emptyArr
+            Exit Function
+        End If
+
+        Dim result() As String
+        Dim resCount As Long
+        resCount = 0
+        ReDim result(0 To 7)
+
+        Dim inQuote As Boolean
+        Dim parenDepth As Long
+        Dim startPos As Long
+        Dim i As Long
+        Dim ch As String
+
+        inQuote = False
+        parenDepth = 0
+        startPos = 1
+
+        For i = 1 To Len(s)
+            ch = Mid$(s, i, 1)
+            If ch = """" Then
+                inQuote = Not inQuote
+            ElseIf Not inQuote Then
+                If ch = "(" Then
+                    parenDepth = parenDepth + 1
+                ElseIf ch = ")" Then
+                    If parenDepth > 0 Then parenDepth = parenDepth - 1
+                ElseIf ch = "," And parenDepth = 0 Then
+                    If resCount > UBound(result) Then
+                        ReDim Preserve result(0 To resCount + 7)
+                    End If
+                    result(resCount) = Trim$(Mid$(s, startPos, i - startPos))
+                    resCount = resCount + 1
+                    startPos = i + 1
+                End If
+            End If
+        Next i
+
+        If resCount > UBound(result) Then
+            ReDim Preserve result(0 To resCount)
+        End If
+        result(resCount) = Trim$(Mid$(s, startPos))
+        resCount = resCount + 1
+
+        ReDim Preserve result(0 To resCount - 1)
+        SplitArguments = result
+    End Function
+
+    ' Executes a single statement
+    Public Function ExecuteStatement(ByVal rawStatement As String) As Boolean
+        Dim stmt As String
+        stmt = ExpandWithPrefix(rawStatement)
+        If Len(stmt) = 0 Or Left$(stmt, 1) = "'" Or UCase$(Left$(stmt, 4)) = "REM " Then
+            ExecuteStatement = True
+            Exit Function
+        End If
+
+        On Error Resume Next
+        Err.Clear
+
+        ' 1. On Error handling
+        If UCase$(Left$(stmt, 8)) = "ON ERROR" Then
+            Dim errPart As String
+            errPart = UCase$(Trim$(Mid$(stmt, 9)))
+            If errPart = "RESUME NEXT" Then
+                If m_callDepth >= 0 Then
+                    m_callStack(m_callDepth).OnErrorResumeNext = True
+                    m_callStack(m_callDepth).ErrorGotoLabel = vbNullString
+                End If
+            ElseIf errPart = "GOTO 0" Then
+                If m_callDepth >= 0 Then
+                    m_callStack(m_callDepth).OnErrorResumeNext = False
+                    m_callStack(m_callDepth).ErrorGotoLabel = vbNullString
+                End If
+            ElseIf Left$(errPart, 5) = "GOTO " Then
+                If m_callDepth >= 0 Then
+                    m_callStack(m_callDepth).ErrorGotoLabel = Trim$(Mid$(errPart, 6))
+                    m_callStack(m_callDepth).OnErrorResumeNext = False
+                End If
+            End If
+            ExecuteStatement = True
+            Exit Function
+        End If
+
+        ' 2. Exit Sub / Exit Function
+        If UCase$(stmt) = "EXIT SUB" Or UCase$(stmt) = "EXIT FUNCTION" Then
+            If m_callDepth >= 0 Then
+                m_callStack(m_callDepth).ExitRequested = True
+                m_callStack(m_callDepth).HasReturned = True
+            End If
+            ExecuteStatement = True
+            Exit Function
+        End If
+
+        ' 2b. Err.Clear
+        If UCase$(stmt) = "ERR.CLEAR" Then
+            If m_callDepth >= 0 Then
+                m_callStack(m_callDepth).LastErrorNum = 0
+                m_callStack(m_callDepth).LastErrorDesc = vbNullString
+            End If
+            ExecuteStatement = True
+            Exit Function
+        End If
+
+        ' 2c. Err.Raise
+        If UCase$(Left$(stmt, 10)) = "ERR.RAISE " Then
+            Dim errRaiseArg As String
+            errRaiseArg = Trim$(Mid$(stmt, 11))
+            Dim eParts() As String
+            eParts = Split(errRaiseArg, ",")
+            Dim eNum As Long
+            eNum = CLng(EvalExpr(Trim$(eParts(0))))
+            Dim eDesc As String
+            eDesc = vbNullString
+            If UBound(eParts) >= 1 Then eDesc = CStr(EvalExpr(Trim$(eParts(1))))
+            If m_callDepth >= 0 Then
+                m_callStack(m_callDepth).LastErrorNum = eNum
+                m_callStack(m_callDepth).LastErrorDesc = eDesc
+            End If
+            Err.Raise eNum, "VbaInterpreter", eDesc
+            ExecuteStatement = True
+            Exit Function
+        End If
+
+        ' 3. Dim / Static / Const declarations
+        If UCase$(Left$(stmt, 4)) = "DIM " Or UCase$(Left$(stmt, 7)) = "STATIC " Or UCase$(Left$(stmt, 6)) = "CONST " Then
+            Dim declPart As String
+            If UCase$(Left$(stmt, 4)) = "DIM " Then declPart = Mid$(stmt, 5)
+            If UCase$(Left$(stmt, 7)) = "STATIC " Then declPart = Mid$(stmt, 8)
+            If UCase$(Left$(stmt, 6)) = "CONST " Then declPart = Mid$(stmt, 7)
+            ProcessDimStatement declPart
+            ExecuteStatement = True
+            Exit Function
+        End If
+
+        ' 4. Single-line If: If cond Then stmt1 [Else stmt2]
+        If UCase$(Left$(stmt, 3)) = "IF " Then
+            Dim thenPos As Long
+            thenPos = InStr(1, stmt, " Then ", vbTextCompare)
+            If thenPos > 0 Then
+                Dim condStr As String
+                condStr = Trim$(Mid$(stmt, 4, thenPos - 4))
+                Dim remainder As String
+                remainder = Trim$(Mid$(stmt, thenPos + 6))
+                If Len(remainder) > 0 Then
+                    Dim elsePos As Long
+                    elsePos = InStr(1, remainder, " Else ", vbTextCompare)
+                    Dim thenBranch As String
+                    Dim elseBranch As String
+                    If elsePos > 0 Then
+                        thenBranch = Trim$(Left$(remainder, elsePos - 1))
+                        elseBranch = Trim$(Mid$(remainder, elsePos + 6))
+                    Else
+                        thenBranch = remainder
+                        elseBranch = vbNullString
+                    End If
+
+                    Dim condBool As Boolean
+                    condBool = CBool(EvalExpr(condStr))
+                    If condBool Then
+                        ExecuteStatement thenBranch
+                    ElseIf Len(elseBranch) > 0 Then
+                        ExecuteStatement elseBranch
+                    End If
+                    ExecuteStatement = True
+                    Exit Function
+                End If
+            End If
+        End If
+
+        ' 5. DoCmd calls
+        If UCase$(Left$(stmt, 6)) = "DOCMD." Then
+            ExecuteDoCmdCall Mid$(stmt, 7)
+            ExecuteStatement = True
+            Exit Function
+        End If
+
+        ' 6. Assignment: [Let / Set] target = expr
+        Dim eqPos As Long
+        eqPos = InStr(1, stmt, "=")
+        If eqPos > 1 Then
+            Dim lhs As String
+            Dim rhs As String
+            lhs = ExpandWithPrefix(Trim$(Left$(stmt, eqPos - 1)))
+            rhs = ExpandWithPrefix(Trim$(Mid$(stmt, eqPos + 1)))
+
+            If UCase$(Left$(lhs, 4)) = "LET " Then lhs = ExpandWithPrefix(Trim$(Mid$(lhs, 5)))
+            If UCase$(Left$(lhs, 4)) = "SET " Then lhs = ExpandWithPrefix(Trim$(Mid$(lhs, 5)))
+
+            Dim exprResult As Variant
+            If IsObject(EvalExpr(rhs)) Then
+                Set exprResult = EvalExpr(rhs)
+            Else
+                exprResult = EvalExpr(rhs)
+            End If
+            ExecuteAssignment lhs, exprResult
+            ExecuteStatement = True
+            Exit Function
+        End If
+
+        ' 7. Standalone Sub / Method Call
+        ExecuteStandaloneCall stmt
+        Dim curResume As Boolean
+        curResume = False
+        If m_callDepth >= 0 Then curResume = m_callStack(m_callDepth).OnErrorResumeNext
+        ExecuteStatement = (Err.Number = 0 Or curResume)
+        On Error GoTo 0
+    End Function
+
+    Private Sub ProcessDimStatement(ByVal decl As String)
+        Dim parts() As String
+        parts = Split(decl, ",")
+        Dim i As Long
+        For i = 0 To UBound(parts)
+            Dim item As String
+            item = Trim$(parts(i))
+            Dim asPos As Long
+            asPos = InStr(1, item, " As ", vbTextCompare)
+            Dim varName As String
+            If asPos > 0 Then
+                varName = Trim$(Left$(item, asPos - 1))
+            Else
+                varName = item
+            End If
+            If Len(varName) > 0 Then
+                SetVariable varName, Empty
+            End If
+        Next i
+    End Sub
+
+    Private Sub ExecuteAssignment(ByVal target As String, ByVal newVal As Variant)
+        Dim t As String
+        t = ExpandWithPrefix(Trim$(target))
+
+        ' Function return value
+        If m_callDepth >= 0 Then
+            If Len(m_callStack(m_callDepth).CurrentProcName) > 0 And LCase$(t) = m_callStack(m_callDepth).CurrentProcName Then
+                If IsObject(newVal) Then
+                    Set m_callStack(m_callDepth).ReturnValue = newVal
+                Else
+                    m_callStack(m_callDepth).ReturnValue = newVal
+                End If
+                m_callStack(m_callDepth).HasReturned = True
+            End If
+        End If
+
+        ' Me!Control = v OR Me.Control = v
+        If UCase$(Left$(t, 3)) = "ME!" Or UCase$(Left$(t, 3)) = "ME." Then
+            Dim memberName As String
+            memberName = Mid$(t, 4)
+            If Not m_activeForm Is Nothing Then
+                Select Case UCase$(memberName)
+                    Case "FILTER"
+                        m_activeForm.Filter = CStr(newVal)
+                    Case "FILTERON"
+                        m_activeForm.FilterOn = CBool(newVal)
+                        If m_activeForm.FilterOn Then m_activeForm.Requery
+                    Case "ORDERBY"
+                        m_activeForm.OrderBy = CStr(newVal)
+                    Case "ORDERBYON"
+                        m_activeForm.OrderByOn = CBool(newVal)
+                        If m_activeForm.OrderByOn Then m_activeForm.Requery
+                    Case "CAPTION"
+                        m_activeForm.Caption = CStr(newVal)
+                    Case "RECORDSOURCE"
+                        m_activeForm.RecordSource = CStr(newVal)
+                        m_activeForm.Requery
+                    Case Else
+                        Dim c As AccessControl
+                        Set c = m_activeForm.Controls.Item(memberName)
+                        If Not c Is Nothing Then
+                            c.Value = newVal
+                        End If
+                End Select
+                Exit Sub
+            End If
+        End If
+
+        ' Forms!Form1!Control = v
+        If UCase$(Left$(t, 6)) = "FORMS!" Then
+            Dim bangParts() As String
+            bangParts = Split(t, "!")
+            If UBound(bangParts) >= 2 Then
+                AccessObjectModel.SetFormControlValue bangParts(1), bangParts(2), newVal
+                Exit Sub
+            End If
+        End If
+
+        ' TempVars!VarName = v
+        If UCase$(Left$(t, 9)) = "TEMPVARS!" Then
+            AccessObjectModel.TempVars.Add Mid$(t, 10), newVal
+            Exit Sub
+        End If
+
+        ' Check if target matches form control directly without Me
+        If Not m_activeForm Is Nothing Then
+            Dim directCtl As AccessControl
+            Set directCtl = m_activeForm.Controls.Item(t)
+            If Not directCtl Is Nothing Then
+                directCtl.Value = newVal
+                Exit Sub
+            End If
+        End If
+
+        ' Fallback to local / procedure scope variable
+        SetVariable t, newVal
+    End Sub
+
+    Private Sub ExecuteDoCmdCall(ByVal cmdExpr As String)
+        Dim cmd As String
+        Dim argStr As String
+        Dim parenOpen As Long
+        parenOpen = InStr(1, cmdExpr, "(")
+        If parenOpen > 0 And Right$(cmdExpr, 1) = ")" Then
+            cmd = Trim$(Left$(cmdExpr, parenOpen - 1))
+            argStr = Mid$(cmdExpr, parenOpen + 1, Len(cmdExpr) - parenOpen - 1)
+        Else
+            Dim spPos As Long
+            spPos = InStr(1, cmdExpr, " ")
+            If spPos > 0 Then
+                cmd = Trim$(Left$(cmdExpr, spPos - 1))
+                argStr = Trim$(Mid$(cmdExpr, spPos + 1))
+            Else
+                cmd = Trim$(cmdExpr)
+                argStr = vbNullString
+            End If
+        End If
+
+        Dim args() As String
+        args = SplitArguments(argStr)
+
+        Select Case UCase$(cmd)
+            Case "OPENFORM"
+                If UBound(args) >= 0 Then
+                    Dim fName As String: fName = CleanArg(args(0))
+                    Dim fView As Long: fView = 0
+                    Dim fFilter As String: fFilter = ""
+                    Dim fWhere As String: fWhere = ""
+                    If UBound(args) >= 1 And Len(args(1)) > 0 Then fView = CLng(VBA.Val(CleanArg(args(1))))
+                    If UBound(args) >= 2 Then fFilter = CleanArg(args(2))
+                    If UBound(args) >= 3 Then fWhere = CleanArg(args(3))
+                    AccessObjectModel.DoCmd.OpenForm fName, fView, fFilter, fWhere
+                End If
+            Case "CLOSE"
+                Dim cType As Long: cType = 2
+                Dim cName As String: cName = ""
+                Dim cSave As Long: cSave = 0
+                If UBound(args) >= 0 And Len(args(0)) > 0 Then cType = CLng(VBA.Val(CleanArg(args(0))))
+                If UBound(args) >= 1 Then cName = CleanArg(args(1))
+                If UBound(args) >= 2 And Len(args(2)) > 0 Then cSave = CLng(VBA.Val(CleanArg(args(2))))
+                AccessObjectModel.DoCmd.Close cType, cName, cSave
+            Case "OPENREPORT"
+                If UBound(args) >= 0 Then
+                    Dim rName As String: rName = CleanArg(args(0))
+                    Dim rView As Long: rView = 2
+                    Dim rWhere As String: rWhere = ""
+                    If UBound(args) >= 1 And Len(args(1)) > 0 Then rView = CLng(VBA.Val(CleanArg(args(1))))
+                    If UBound(args) >= 3 Then rWhere = CleanArg(args(3))
+                    AccessObjectModel.DoCmd.OpenReport rName, rView, , rWhere
+                End If
+            Case "RUNSQL"
+                If UBound(args) >= 0 Then
+                    Dim sSql As String: sSql = CleanArg(args(0))
+                    AccessObjectModel.DoCmd.RunSQL sSql
+                End If
+            Case "REQUERY"
+                Dim ctlRequery As String: ctlRequery = ""
+                If UBound(args) >= 0 Then ctlRequery = CleanArg(args(0))
+                AccessObjectModel.DoCmd.Requery ctlRequery
+            Case "HOURGLASS"
+                Dim hOn As Boolean: hOn = True
+                If UBound(args) >= 0 And Len(args(0)) > 0 Then hOn = CBool(EvalExpr(args(0)))
+                AccessObjectModel.DoCmd.Hourglass hOn
+            Case "SETWARNINGS"
+                Dim wOn As Boolean: wOn = True
+                If UBound(args) >= 0 And Len(args(0)) > 0 Then wOn = CBool(EvalExpr(args(0)))
+                AccessObjectModel.DoCmd.SetWarnings wOn
+            Case "BEEP"
+                AccessObjectModel.DoCmd.Beep
+        End Select
+    End Sub
+
+    Private Sub ExecuteStandaloneCall(ByVal callStmt As String)
+        Dim s As String
+        s = Trim$(callStmt)
+        If UCase$(Left$(s, 5)) = "CALL " Then s = Trim$(Mid$(s, 6))
+
+        ' MacroRunner support
+        If UCase$(Left$(s, 12)) = "MACRORUNNER." Then
+            Dim mRest As String
+            mRest = Mid$(s, 13)
+            Dim mParen As Long
+            mParen = InStr(1, mRest, "(")
+            If mParen > 0 Then
+                MacroRunner.ExecuteMacro GetActiveDatabase(), Trim$(Left$(mRest, mParen - 1))
+            Else
+                MacroRunner.ExecuteMacro GetActiveDatabase(), Trim$(mRest)
+            End If
+            Exit Sub
+        End If
+
+        ' Object method call: obj.Method(args)
+        Dim dotPos As Long
+        dotPos = InStr(1, s, ".")
+        If dotPos > 1 Then
+            Dim objVar As String
+            Dim methodPart As String
+            objVar = Trim$(Left$(s, dotPos - 1))
+            methodPart = Trim$(Mid$(s, dotPos + 1))
+
+            Dim targetObj As Object
+            If UCase$(objVar) = "CURRENTDB" Then
+                Set targetObj = GetActiveDatabase()
+            Else
+                Dim vObj As Variant
+                vObj = GetVariable(objVar)
+                If IsObject(vObj) Then Set targetObj = vObj
+            End If
+
+            If Not targetObj Is Nothing Then
+                Dim mName As String
+                Dim mArgsStr As String
+                Dim mParenPos As Long
+                mParenPos = InStr(1, methodPart, "(")
+                If mParenPos > 0 And Right$(methodPart, 1) = ")" Then
+                    mName = Trim$(Left$(methodPart, mParenPos - 1))
+                    mArgsStr = Mid$(methodPart, mParenPos + 1, Len(methodPart) - mParenPos - 1)
+                Else
+                    Dim mSpacePos As Long
+                    mSpacePos = InStr(1, methodPart, " ")
+                    If mSpacePos > 0 Then
+                        mName = Trim$(Left$(methodPart, mSpacePos - 1))
+                        mArgsStr = Trim$(Mid$(methodPart, mSpacePos + 1))
+                    Else
+                        mName = Trim$(methodPart)
+                        mArgsStr = vbNullString
+                    End If
+                End If
+
+                Select Case UCase$(mName)
+                    Case "EXECUTE"
+                        Dim sqlArg As String: sqlArg = EvalStringOrExprArg(mArgsStr)
+                        targetObj.Execute sqlArg
+                    Case "CLOSE"
+                        targetObj.Close
+                    Case "MOVENEXT"
+                        targetObj.MoveNext
+                    Case "MOVEPREVIOUS"
+                        targetObj.MovePrevious
+                    Case "MOVEFIRST"
+                        targetObj.MoveFirst
+                    Case "MOVELAST"
+                        targetObj.MoveLast
+                    Case "ADDNEW"
+                        targetObj.AddNew
+                    Case "UPDATE"
+                        targetObj.Update
+                    Case "DELETE"
+                        targetObj.Delete
+                    Case "REQUERY"
+                        targetObj.Requery
+                End Select
+                Exit Sub
+            End If
+        End If
+
+        ' Check DeclareBridge
+        Dim dSpace As Long
+        Dim dFn As String
+        Dim dArgStr As String
+        dSpace = InStr(1, s, " ")
+        If dSpace > 0 Then
+            dFn = Trim$(Left$(s, dSpace - 1))
+            dArgStr = Trim$(Mid$(s, dSpace + 1))
+        Else
+            dFn = Trim$(s)
+            dArgStr = vbNullString
+        End If
+
+        If DeclareBridge.HasDeclare(dFn) Then
+            Dim dParts() As String
+            dParts = SplitArguments(dArgStr)
+            Dim dvArgs() As Variant
+            Dim j As Long
+            If UBound(dParts) >= 0 Then
+                ReDim dvArgs(0 To UBound(dParts))
+                For j = 0 To UBound(dParts)
+                    dvArgs(j) = EvalExpr(dParts(j))
+                Next j
+            Else
+                ReDim dvArgs(0 To -1)
+            End If
+            DeclareBridge.InvokeDeclare dFn, dvArgs
+            Exit Sub
+        End If
+
+        ' MsgBox prompt [, buttons] [, title]
+        If UCase$(Left$(s, 7)) = "MSGBOX " Then
+            Dim msgParts() As String
+            msgParts = SplitArguments(Mid$(s, 8))
+            Dim prompt As String: prompt = CStr(EvalExpr(Trim$(msgParts(0))))
+            Dim buttons As Long: buttons = 0
+            Dim title As String: title = ""
+            If UBound(msgParts) >= 1 Then buttons = CLng(EvalExpr(Trim$(msgParts(1))))
+            If UBound(msgParts) >= 2 Then title = CStr(EvalExpr(Trim$(msgParts(2))))
+            VbaStdLib.ShowMsgBox prompt, buttons, title
+            Exit Sub
+        End If
+
+        ' Fallback procedure invocation: ProcedureName arg1, arg2
+        If Len(dArgStr) > 0 Then
+            Dim callArgs() As String
+            callArgs = SplitArguments(dArgStr)
+            Dim evalArgs() As Variant
+            If UBound(callArgs) >= 0 Then
+                ReDim evalArgs(0 To UBound(callArgs))
+                For j = 0 To UBound(callArgs)
+                    evalArgs(j) = EvalExpr(callArgs(j))
+                Next j
+            Else
+                ReDim evalArgs(0 To -1)
+            End If
+            Dim curSrc As String
+            If m_callDepth >= 0 Then curSrc = m_callStack(m_callDepth).ProcSource
+            If Len(curSrc) > 0 And HasProcedureInSource(curSrc, dFn) Then
+                ExecuteProcedure curSrc, m_activeForm, dFn, evalArgs
+            End If
+        Else
+            Dim curSrc0 As String
+            If m_callDepth >= 0 Then curSrc0 = m_callStack(m_callDepth).ProcSource
+            If Len(curSrc0) > 0 And HasProcedureInSource(curSrc0, dFn) Then
+                ExecuteProcedure curSrc0, m_activeForm, dFn
+            End If
+        End If
+    End Sub
+
+    Private Function CleanArg(ByVal arg As String) As String
+        Dim s As String
+        s = Trim$(arg)
+        If Left$(s, 1) = """" And Right$(s, 1) = """" And Len(s) >= 2 Then
+            CleanArg = Mid$(s, 2, Len(s) - 2)
+        Else
+            CleanArg = s
+        End If
+    End Function
+
+    Private Function EvalStringOrExprArg(ByVal arg As String) As String
+        Dim s As String
+        s = Trim$(arg)
+        If Left$(s, 1) = """" And Right$(s, 1) = """" And Len(s) >= 2 Then
+            EvalStringOrExprArg = Mid$(s, 2, Len(s) - 2)
+        Else
+            Dim v As Variant
+            v = EvalExpr(arg)
+            If IsNull(v) Or IsEmpty(v) Then
+                EvalStringOrExprArg = vbNullString
+            Else
+                EvalStringOrExprArg = CStr(v)
+            End If
+        End If
+    End Function
+
+    Public Function EvalExpr(ByVal expressionText As String) As Variant
+        Dim s As String
+        s = ExpandWithPrefix(Trim$(expressionText))
+        If Len(s) = 0 Then
+            EvalExpr = Empty
+            Exit Function
+        End If
+
+        ' Check parenthesized expression (e.g. (k * 10))
+        If Left$(s, 1) = "(" And Right$(s, 1) = ")" Then
+            Dim depthP As Long, inQP As Boolean, pIdx As Long, fullEnclosed As Boolean
+            depthP = 0: inQP = False: fullEnclosed = True
+            For pIdx = 1 To Len(s) - 1
+                Dim cp As String: cp = Mid$(s, pIdx, 1)
+                If cp = """" Then
+                    inQP = Not inQP
+                ElseIf Not inQP Then
+                    If cp = "(" Then depthP = depthP + 1
+                    If cp = ")" Then depthP = depthP - 1
+                    If depthP = 0 Then
+                        fullEnclosed = False
+                        Exit For
+                    End If
+                End If
+            Next pIdx
+            If fullEnclosed Then
+                EvalExpr = EvalExpr(Mid$(s, 2, Len(s) - 2))
+                Exit Function
+            End If
+        End If
+
+        ' 1. Literals
+        If s = """" & """" Then
+            EvalExpr = vbNullString
+            Exit Function
+        End If
+        If Left$(s, 1) = """" And Right$(s, 1) = """" And Len(s) >= 2 Then
+            If InStr(2, Mid$(s, 2, Len(s) - 2), """") = 0 Then
+                EvalExpr = Mid$(s, 2, Len(s) - 2)
+                Exit Function
+            End If
+        End If
+        If UCase$(s) = "TRUE" Then EvalExpr = True: Exit Function
+        If UCase$(s) = "FALSE" Then EvalExpr = False: Exit Function
+        If UCase$(s) = "NULL" Then EvalExpr = Null: Exit Function
+        If UCase$(s) = "EMPTY" Then EvalExpr = Empty: Exit Function
+        If UCase$(s) = "CURRENTDB" Or UCase$(s) = "CURRENTDB()" Then
+            Set EvalExpr = GetActiveDatabase()
+            Exit Function
+        End If
+        If UCase$(s) = "ERR.NUMBER" Or UCase$(s) = "ERR" Then
+            If m_callDepth >= 0 Then
+                EvalExpr = m_callStack(m_callDepth).LastErrorNum
+            Else
+                EvalExpr = 0&
+            End If
+            Exit Function
+        End If
+        If UCase$(s) = "ERR.DESCRIPTION" Then
+            If m_callDepth >= 0 Then
+                EvalExpr = m_callStack(m_callDepth).LastErrorDesc
+            Else
+                EvalExpr = vbNullString
+            End If
+            Exit Function
+        End If
+        If IsNumeric(s) Then
+            If InStr(s, ".") > 0 Then
+                EvalExpr = CDbl(s)
+            Else
+                EvalExpr = CLng(s)
+            End If
+            Exit Function
+        End If
+
+        ' 2. Bracketed reference [Name]
+        If Left$(s, 1) = "[" And Right$(s, 1) = "]" And InStr(2, s, "[") = 0 Then
+            s = Mid$(s, 2, Len(s) - 2)
+        End If
+
+        ' 3. Bang and Object Model Access: Forms!Form1!Control
+        If UCase$(Left$(s, 6)) = "FORMS!" Then
+            Dim fParts() As String
+            fParts = Split(s, "!")
+            If UBound(fParts) >= 2 Then
+                EvalExpr = AccessObjectModel.GetFormControlValue(fParts(1), fParts(2))
+                Exit Function
+            End If
+        End If
+
+        ' TempVars!VarName
+        If UCase$(Left$(s, 9)) = "TEMPVARS!" Then
+            EvalExpr = AccessObjectModel.TempVars.Item(Mid$(s, 10))
+            Exit Function
+        End If
+
+        ' Me!Control / Me.Control
+        If UCase$(Left$(s, 3)) = "ME!" Or UCase$(Left$(s, 3)) = "ME." Then
+            Dim mName As String
+            mName = Mid$(s, 4)
+            If Not m_activeForm Is Nothing Then
+                Select Case UCase$(mName)
+                    Case "FILTER": EvalExpr = m_activeForm.Filter: Exit Function
+                    Case "FILTERON": EvalExpr = m_activeForm.FilterOn: Exit Function
+                    Case "ORDERBY": EvalExpr = m_activeForm.OrderBy: Exit Function
+                    Case "CAPTION": EvalExpr = m_activeForm.Caption: Exit Function
+                    Case Else
+                        Dim ctl As AccessControl
+                        Set ctl = m_activeForm.Controls.Item(mName)
+                        If Not ctl Is Nothing Then
+                            EvalExpr = ctl.Value
+                            Exit Function
+                        End If
+                End Select
+            End If
+        End If
+
+        ' Check active form controls directly without Me
+        If Not m_activeForm Is Nothing Then
+            Dim directC As AccessControl
+            Set directC = m_activeForm.Controls.Item(s)
+            If Not directC Is Nothing Then
+                EvalExpr = directC.Value
+                Exit Function
+            End If
+        End If
+
+        ' Check variables
+        If IsObject(GetVariable(s)) Then
+            Set EvalExpr = GetVariable(s)
+            Exit Function
+        End If
+        Dim varVal As Variant
+        varVal = GetVariable(s)
+        If Not IsEmpty(varVal) Then
+            EvalExpr = varVal
+            Exit Function
+        End If
+
+        ' Object member / bang access: e.g. rs!FieldName, rs.RecordCount, rs.EOF, db.OpenRecordset(...)
+        Dim bangPos As Long
+        bangPos = InStr(1, s, "!")
+        If bangPos > 1 And InStr(1, s, " ") = 0 Then
+            Dim bObjName As String
+            Dim bFieldName As String
+            bObjName = Left$(s, bangPos - 1)
+            bFieldName = Mid$(s, bangPos + 1)
+            Dim bObj As Object
+            Dim vB As Variant
+            vB = GetVariable(bObjName)
+            If IsObject(vB) Then Set bObj = vB
+            If Not bObj Is Nothing Then
+                On Error Resume Next
+                EvalExpr = bObj.Fields(bFieldName).Value
+                On Error GoTo 0
+                Exit Function
+            End If
+        End If
+
+        Dim dotPos As Long
+        dotPos = InStr(1, s, ".")
+        If dotPos > 1 Then
+            Dim dObjName As String
+            Dim dPropName As String
+            dObjName = Left$(s, dotPos - 1)
+            dPropName = Mid$(s, dotPos + 1)
+
+            Dim dObj As Object
+            If UCase$(dObjName) = "CURRENTDB" Then
+                Set dObj = GetActiveDatabase()
+            Else
+                Dim vD As Variant
+                vD = GetVariable(dObjName)
+                If IsObject(vD) Then Set dObj = vD
+            End If
+
+            If Not dObj Is Nothing Then
+                Dim openParenIdx As Long
+                openParenIdx = InStr(1, dPropName, "(")
+                If openParenIdx > 0 And Right$(dPropName, 1) = ")" Then
+                    Dim dMethod As String
+                    dMethod = UCase$(Trim$(Left$(dPropName, openParenIdx - 1)))
+                    Dim dArgsStr As String
+                    dArgsStr = Mid$(dPropName, openParenIdx + 1, Len(dPropName) - openParenIdx - 1)
+                    If dMethod = "OPENRECORDSET" Then
+                        Dim orsArgs() As String
+                        orsArgs = SplitArguments(dArgsStr)
+                        If UBound(orsArgs) >= 0 Then
+                            Set EvalExpr = dObj.OpenRecordset(EvalStringOrExprArg(orsArgs(0)))
+                            Exit Function
+                        End If
+                    End If
+                End If
+
+                If UCase$(Left$(dPropName, 7)) = "FIELDS(" And Right$(dPropName, 1) = ")" Then
+                    Dim fKeyExpr As String
+                    fKeyExpr = Mid$(dPropName, 8, Len(dPropName) - 8)
+                    Dim fKeyVal As Variant
+                    fKeyVal = EvalExpr(fKeyExpr)
+                    EvalExpr = dObj.Fields(fKeyVal).Value
+                    Exit Function
+                End If
+
+                On Error Resume Next
+                Select Case UCase$(dPropName)
+                    Case "RECORDCOUNT": EvalExpr = dObj.RecordCount: On Error GoTo 0: Exit Function
+                    Case "EOF": EvalExpr = dObj.EOF: On Error GoTo 0: Exit Function
+                    Case "BOF": EvalExpr = dObj.BOF: On Error GoTo 0: Exit Function
+                    Case "NAME": EvalExpr = dObj.Name: On Error GoTo 0: Exit Function
+                End Select
+                EvalExpr = CallByName(dObj, dPropName, VbGet)
+                On Error GoTo 0
+                Exit Function
+            End If
+        End If
+
+        ' 4. Function call: FuncName(arg1, arg2, ...)
+        Dim fnName As String
+        Dim innerArgs As String
+        If IsEnclosedFunctionCall(s, fnName, innerArgs) Then
+            Dim fnRes As Variant
+            If IsObject(EvalFunctionCall(fnName, innerArgs)) Then
+                Set EvalExpr = EvalFunctionCall(fnName, innerArgs)
+            Else
+                EvalExpr = EvalFunctionCall(fnName, innerArgs)
+            End If
+            Exit Function
+        End If
+
+        ' 5. Operators: Binary & Relational
+        EvalExpr = EvalBinaryOp(s)
+    End Function
+
+    Private Function FindTopLevelOp(ByVal expr As String, ByVal opStr As String) As Long
+        Dim inQuote As Boolean
+        Dim parenDepth As Long
+        Dim i As Long
+        Dim n As Long
+        Dim opLen As Long
+        n = Len(expr)
+        opLen = Len(opStr)
+        If n < opLen Then Exit Function
+
+        For i = 1 To n - opLen + 1
+            Dim c As String
+            c = Mid$(expr, i, 1)
+            If c = """" Then
+                inQuote = Not inQuote
+            ElseIf Not inQuote Then
+                If c = "(" Then
+                    parenDepth = parenDepth + 1
+                ElseIf c = ")" Then
+                    If parenDepth > 0 Then parenDepth = parenDepth - 1
+                ElseIf parenDepth = 0 Then
+                    If StrComp(Mid$(expr, i, opLen), opStr, vbTextCompare) = 0 Then
+                        FindTopLevelOp = i
+                        Exit Function
+                    End If
+                End If
+            End If
+        Next i
+    End Function
+
+    Private Function IsEnclosedFunctionCall(ByVal s As String, ByRef outFnName As String, ByRef outArgs As String) As Boolean
+        Dim parenPos As Long
+        parenPos = InStr(1, s, "(")
+        If parenPos <= 1 Or Right$(s, 1) <> ")" Then Exit Function
+
+        outFnName = UCase$(Trim$(Left$(s, parenPos - 1)))
+        If InStr(1, outFnName, " ") > 0 Or InStr(1, outFnName, """") > 0 Or InStr(1, outFnName, "&") > 0 Or InStr(1, outFnName, "+") > 0 Then Exit Function
+
+        Dim i As Long, depth As Long, inQuote As Boolean
+        depth = 0
+        For i = parenPos To Len(s)
+            Dim c As String
+            c = Mid$(s, i, 1)
+            If c = """" Then
+                inQuote = Not inQuote
+            ElseIf Not inQuote Then
+                If c = "(" Then
+                    depth = depth + 1
+                ElseIf c = ")" Then
+                    depth = depth - 1
+                    If depth = 0 Then
+                        If i = Len(s) Then
+                            outArgs = Mid$(s, parenPos + 1, Len(s) - parenPos - 1)
+                            IsEnclosedFunctionCall = True
+                        End If
+                        Exit Function
+                    End If
+                End If
+            End If
+        Next i
+    End Function
+
+    Private Function HasProcedureInSource(ByVal src As String, ByVal procName As String) As Boolean
+        Dim pTarget As String
+        pTarget = LCase$(Trim$(procName))
+        Dim lines() As String
+        lines = Split(src, vbCrLf)
+        Dim i As Long
+        For i = 0 To UBound(lines)
+            Dim l As String
+            l = LCase$(Trim$(lines(i)))
+            If Left$(l, 9) = "function " Or Left$(l, 4) = "sub " _
+               Or Left$(l, 16) = "public function " Or Left$(l, 11) = "public sub " _
+               Or Left$(l, 17) = "private function " Or Left$(l, 12) = "private sub " Then
+                Dim openParen As Long
+                openParen = InStr(1, l, "(")
+                Dim namePart As String
+                If openParen > 0 Then
+                    namePart = Trim$(Left$(l, openParen - 1))
+                Else
+                    namePart = l
+                End If
+                Dim tokens() As String
+                tokens = Split(namePart, " ")
+                If UBound(tokens) >= 1 Then
+                    If tokens(UBound(tokens)) = pTarget Then
+                        HasProcedureInSource = True
+                        Exit Function
+                    End If
+                End If
+            End If
+        Next i
+        HasProcedureInSource = False
+    End Function
+
+    Private Function EvalFunctionCall(ByVal fnName As String, ByVal argsText As String) As Variant
+        Dim args() As String
+        args = SplitArguments(argsText)
+
+        If DeclareBridge.HasDeclare(fnName) Then
+            Dim vArgs() As Variant
+            Dim k As Long
+            If UBound(args) >= 0 Then
+                ReDim vArgs(0 To UBound(args))
+                For k = 0 To UBound(args)
+                    vArgs(k) = EvalExpr(args(k))
+                Next k
+            Else
+                ReDim vArgs(0 To -1)
+            End If
+            EvalFunctionCall = DeclareBridge.InvokeDeclare(fnName, vArgs)
+            Exit Function
+        End If
+
+        Select Case fnName
+            Case "CURRENTDB"
+                Set EvalFunctionCall = GetActiveDatabase()
+            Case "NZ"
+                Dim vArg As Variant
+                vArg = EvalExpr(args(0))
+                Dim vRepl As Variant
+                If UBound(args) >= 1 Then vRepl = EvalExpr(args(1)) Else vRepl = ""
+                EvalFunctionCall = VbaStdLib.Nz(vArg, vRepl)
+            Case "IIF"
+                Dim condVal As Boolean
+                condVal = CBool(EvalExpr(args(0)))
+                If condVal Then
+                    EvalFunctionCall = EvalExpr(args(1))
+                Else
+                    EvalFunctionCall = EvalExpr(args(2))
+                End If
+            Case "CHOOSE"
+                Dim chIdx As Long
+                chIdx = CLng(EvalExpr(args(0)))
+                If chIdx >= 1 And chIdx <= UBound(args) Then
+                    EvalFunctionCall = EvalExpr(args(chIdx))
+                Else
+                    EvalFunctionCall = Null
+                End If
+            Case "SWITCH"
+                Dim swI As Long
+                For swI = 0 To UBound(args) - 1 Step 2
+                    Dim swCond As Variant
+                    swCond = EvalExpr(args(swI))
+                    If Not IsNull(swCond) Then
+                        If CBool(swCond) Then
+                            EvalFunctionCall = EvalExpr(args(swI + 1))
+                            Exit Function
+                        End If
+                    End If
+                Next swI
+                EvalFunctionCall = Null
+            Case "ISNULL"
+                EvalFunctionCall = IsNull(EvalExpr(args(0)))
+            Case "ISEMPTY"
+                EvalFunctionCall = IsEmpty(EvalExpr(args(0)))
+            Case "ISNUMERIC"
+                EvalFunctionCall = IsNumeric(EvalExpr(args(0)))
+            Case "LEN"
+                Dim sVal As String
+                sVal = Nz(EvalExpr(args(0)), "")
+                EvalFunctionCall = CLng(Len(sVal))
+            Case "MID"
+                Dim mStr As String, mStart As Long
+                mStr = Nz(EvalExpr(args(0)), "")
+                mStart = CLng(EvalExpr(args(1)))
+                If UBound(args) >= 2 Then
+                    EvalFunctionCall = Mid$(mStr, mStart, CLng(EvalExpr(args(2))))
+                Else
+                    EvalFunctionCall = Mid$(mStr, mStart)
+                End If
+            Case "LEFT"
+                EvalFunctionCall = Left$(Nz(EvalExpr(args(0)), ""), CLng(EvalExpr(args(1))))
+            Case "RIGHT"
+                EvalFunctionCall = Right$(Nz(EvalExpr(args(0)), ""), CLng(EvalExpr(args(1))))
+            Case "TRIM"
+                EvalFunctionCall = Trim$(Nz(EvalExpr(args(0)), ""))
+            Case "UCASE"
+                EvalFunctionCall = UCase$(Nz(EvalExpr(args(0)), ""))
+            Case "LCASE"
+                EvalFunctionCall = LCase$(Nz(EvalExpr(args(0)), ""))
+            Case "CSTR"
+                EvalFunctionCall = CStr(Nz(EvalExpr(args(0)), ""))
+            Case "CLNG"
+                EvalFunctionCall = CLng(VBA.Val(CStr(Nz(EvalExpr(args(0)), "0"))))
+            Case "CINT"
+                EvalFunctionCall = CInt(VBA.Val(CStr(Nz(EvalExpr(args(0)), "0"))))
+            Case "CDBL"
+                EvalFunctionCall = CDbl(VBA.Val(CStr(Nz(EvalExpr(args(0)), "0"))))
+            Case "VAL"
+                EvalFunctionCall = VBA.Val(CStr(Nz(EvalExpr(args(0)), "0")))
+            Case "ROUND"
+                Dim rNum As Double, rDig As Long
+                rNum = CDbl(VBA.Val(CStr(Nz(EvalExpr(args(0)), "0"))))
+                If UBound(args) >= 1 Then rDig = CLng(VBA.Val(CStr(Nz(EvalExpr(args(1)), "0")))) Else rDig = 0
+                EvalFunctionCall = VBA.Round(rNum, rDig)
+            Case "DATE"
+                EvalFunctionCall = Date
+            Case "NOW"
+                EvalFunctionCall = Now
+            Case "YEAR"
+                EvalFunctionCall = Year(CDate(EvalExpr(args(0))))
+            Case "MONTH"
+                EvalFunctionCall = Month(CDate(EvalExpr(args(0))))
+            Case "DAY"
+                EvalFunctionCall = Day(CDate(EvalExpr(args(0))))
+            Case "FORMAT"
+                Dim fVal As Variant
+                fVal = EvalExpr(args(0))
+                Dim fPattern As String: If UBound(args) >= 1 Then fPattern = CleanArg(args(1)) Else fPattern = ""
+                EvalFunctionCall = VbaStdLib.FormatValue(fVal, fPattern)
+            Case "DLOOKUP", "DSUM", "DCOUNT", "DAVG", "DMIN", "DMAX"
+                Dim dExpr As String: dExpr = EvalStringOrExprArg(args(0))
+                Dim dDom As String: dDom = EvalStringOrExprArg(args(1))
+                Dim dCrit As String: If UBound(args) >= 2 Then dCrit = EvalStringOrExprArg(args(2)) Else dCrit = ""
+                EvalFunctionCall = VbaStdLib.EvalDomainAggregate(fnName, dExpr, dDom, dCrit)
+            Case "MSGBOX"
+                Dim pPrompt As String: pPrompt = CStr(EvalExpr(args(0)))
+                Dim pBtn As Long: If UBound(args) >= 1 Then pBtn = CLng(EvalExpr(args(1))) Else pBtn = 0
+                Dim pTitle As String: If UBound(args) >= 2 Then pTitle = CStr(EvalExpr(args(2))) Else pTitle = ""
+                EvalFunctionCall = VbaStdLib.ShowMsgBox(pPrompt, pBtn, pTitle)
+            Case Else
+                ' User-defined or recursive function invocation
+                Dim evaledArgs() As Variant
+                Dim aI As Long
+                If UBound(args) >= 0 Then
+                    ReDim evaledArgs(0 To UBound(args))
+                    For aI = 0 To UBound(args)
+                        evaledArgs(aI) = EvalExpr(args(aI))
+                    Next aI
+                Else
+                    ReDim evaledArgs(0 To -1)
+                End If
+
+                Dim curProcSrc As String
+                If m_callDepth >= 0 Then curProcSrc = m_callStack(m_callDepth).ProcSource
+                If Len(curProcSrc) > 0 And HasProcedureInSource(curProcSrc, fnName) Then
+                    Dim recurseRes As Variant
+                    recurseRes = ExecuteProcedure(curProcSrc, m_activeForm, fnName, evaledArgs)
+                    If IsObject(recurseRes) Then
+                        Set EvalFunctionCall = recurseRes
+                    Else
+                        EvalFunctionCall = recurseRes
+                    End If
+                    Exit Function
+                End If
+
+                EvalFunctionCall = Null
+        End Select
+    End Function
+
+    Private Function EvalBinaryOp(ByVal expr As String) As Variant
+        Dim opPos As Long
+
+        ' String Concatenation &
+        opPos = FindTopLevelOp(expr, " & ")
+        If opPos = 0 Then opPos = FindTopLevelOp(expr, "&")
+        If opPos > 0 Then
+            Dim s1 As Variant, s2 As Variant
+            Dim opSpan As Long
+            If Mid$(expr, opPos, 3) = " & " Then opSpan = 3 Else opSpan = 1
+            s1 = EvalExpr(Trim$(Left$(expr, opPos - 1)))
+            s2 = EvalExpr(Trim$(Mid$(expr, opPos + opSpan)))
+            EvalBinaryOp = Nz(s1, "") & Nz(s2, "")
+            Exit Function
+        End If
+
+        ' Logical And
+        opPos = FindTopLevelOp(expr, " And ")
+        If opPos > 0 Then
+            EvalBinaryOp = (CBool(EvalExpr(Trim$(Left$(expr, opPos - 1)))) And CBool(EvalExpr(Trim$(Mid$(expr, opPos + 5)))))
+            Exit Function
+        End If
+
+        ' Logical Or
+        opPos = FindTopLevelOp(expr, " Or ")
+        If opPos > 0 Then
+            EvalBinaryOp = (CBool(EvalExpr(Trim$(Left$(expr, opPos - 1)))) Or CBool(EvalExpr(Trim$(Mid$(expr, opPos + 4)))))
+            Exit Function
+        End If
+
+        ' Comparison =
+        opPos = FindTopLevelOp(expr, " = ")
+        If opPos > 0 Then
+            EvalBinaryOp = (EvalExpr(Trim$(Left$(expr, opPos - 1))) = EvalExpr(Trim$(Mid$(expr, opPos + 3))))
+            Exit Function
+        End If
+
+        ' Comparison <>
+        opPos = FindTopLevelOp(expr, " <> ")
+        If opPos > 0 Then
+            EvalBinaryOp = (EvalExpr(Trim$(Left$(expr, opPos - 1))) <> EvalExpr(Trim$(Mid$(expr, opPos + 4))))
+            Exit Function
+        End If
+
+        ' Comparison <=
+        opPos = FindTopLevelOp(expr, " <= ")
+        If opPos > 0 Then
+            EvalBinaryOp = (VBA.Val(CStr(EvalExpr(Trim$(Left$(expr, opPos - 1))))) <= VBA.Val(CStr(EvalExpr(Trim$(Mid$(expr, opPos + 4))))))
+            Exit Function
+        End If
+
+        ' Comparison >=
+        opPos = FindTopLevelOp(expr, " >= ")
+        If opPos > 0 Then
+            EvalBinaryOp = (VBA.Val(CStr(EvalExpr(Trim$(Left$(expr, opPos - 1))))) >= VBA.Val(CStr(EvalExpr(Trim$(Mid$(expr, opPos + 4))))))
+            Exit Function
+        End If
+
+        ' Less than <
+        opPos = FindTopLevelOp(expr, " < ")
+        If opPos > 0 Then
+            EvalBinaryOp = (VBA.Val(CStr(EvalExpr(Trim$(Left$(expr, opPos - 1))))) < VBA.Val(CStr(EvalExpr(Trim$(Mid$(expr, opPos + 3))))))
+            Exit Function
+        End If
+
+        ' Greater than >
+        opPos = FindTopLevelOp(expr, " > ")
+        If opPos > 0 Then
+            EvalBinaryOp = (VBA.Val(CStr(EvalExpr(Trim$(Left$(expr, opPos - 1))))) > VBA.Val(CStr(EvalExpr(Trim$(Mid$(expr, opPos + 3))))))
+            Exit Function
+        End If
+
+        ' Addition +
+        opPos = FindTopLevelOp(expr, " + ")
+        If opPos > 0 Then
+            EvalBinaryOp = VBA.Val(CStr(Nz(EvalExpr(Trim$(Left$(expr, opPos - 1))), "0"))) + VBA.Val(CStr(Nz(EvalExpr(Trim$(Mid$(expr, opPos + 3))), "0")))
+            Exit Function
+        End If
+
+        ' Subtraction -
+        opPos = FindTopLevelOp(expr, " - ")
+        If opPos > 0 Then
+            EvalBinaryOp = VBA.Val(CStr(Nz(EvalExpr(Trim$(Left$(expr, opPos - 1))), "0"))) - VBA.Val(CStr(Nz(EvalExpr(Trim$(Mid$(expr, opPos + 3))), "0")))
+            Exit Function
+        End If
+
+        ' Multiplication *
+        opPos = FindTopLevelOp(expr, " * ")
+        If opPos > 0 Then
+            EvalBinaryOp = VBA.Val(CStr(Nz(EvalExpr(Trim$(Left$(expr, opPos - 1))), "0"))) * VBA.Val(CStr(Nz(EvalExpr(Trim$(Mid$(expr, opPos + 3))), "0")))
+            Exit Function
+        End If
+
+        ' Division /
+        opPos = FindTopLevelOp(expr, " / ")
+        If opPos > 0 Then
+            Dim denom As Double
+            denom = VBA.Val(CStr(Nz(EvalExpr(Trim$(Mid$(expr, opPos + 3))), "0")))
+            If denom <> 0 Then
+                EvalBinaryOp = VBA.Val(CStr(Nz(EvalExpr(Trim$(Left$(expr, opPos - 1))), "0"))) / denom
+            Else
+                EvalBinaryOp = Null
+            End If
+            Exit Function
+        End If
+
+        EvalBinaryOp = expr
+    End Function
+
+    Private Function MatchSelectCaseClause(ByVal targetVal As Variant, ByVal clauseList As String) As Boolean
+        Dim parts() As String
+        parts = Split(clauseList, ",")
+        Dim idx As Long
+        For idx = 0 To UBound(parts)
+            Dim item As String
+            item = Trim$(parts(idx))
+
+            If UCase$(Left$(item, 7)) = "IS >= " Or UCase$(Left$(item, 6)) = "IS >=" Then
+                Dim valGte As Double
+                valGte = VBA.Val(CStr(Nz(EvalExpr(Mid$(item, InStr(item, "=") + 1)), "0")))
+                If VBA.Val(CStr(Nz(targetVal, "0"))) >= valGte Then
+                    MatchSelectCaseClause = True
+                    Exit Function
+                End If
+            ElseIf UCase$(Left$(item, 7)) = "IS <= " Or UCase$(Left$(item, 6)) = "IS <=" Then
+                Dim valLte As Double
+                valLte = VBA.Val(CStr(Nz(EvalExpr(Mid$(item, InStr(item, "=") + 1)), "0")))
+                If VBA.Val(CStr(Nz(targetVal, "0"))) <= valLte Then
+                    MatchSelectCaseClause = True
+                    Exit Function
+                End If
+            ElseIf UCase$(Left$(item, 6)) = "IS <> " Or UCase$(Left$(item, 5)) = "IS <>" Then
+                Dim valNeq As String
+                valNeq = CStr(Nz(EvalExpr(Mid$(item, InStr(item, ">") + 1)), ""))
+                If CStr(Nz(targetVal, "")) <> valNeq Then
+                    MatchSelectCaseClause = True
+                    Exit Function
+                End If
+            ElseIf UCase$(Left$(item, 5)) = "IS > " Or UCase$(Left$(item, 4)) = "IS >" Then
+                Dim valGt As Double
+                valGt = VBA.Val(CStr(Nz(EvalExpr(Mid$(item, InStr(item, ">") + 1)), "0")))
+                If VBA.Val(CStr(Nz(targetVal, "0"))) > valGt Then
+                    MatchSelectCaseClause = True
+                    Exit Function
+                End If
+            ElseIf UCase$(Left$(item, 5)) = "IS < " Or UCase$(Left$(item, 4)) = "IS <" Then
+                Dim valLt As Double
+                valLt = VBA.Val(CStr(Nz(EvalExpr(Mid$(item, InStr(item, "<") + 1)), "0")))
+                If VBA.Val(CStr(Nz(targetVal, "0"))) < valLt Then
+                    MatchSelectCaseClause = True
+                    Exit Function
+                End If
+            Else
+                Dim cVal As Variant
+                cVal = EvalExpr(item)
+                If targetVal = cVal Then
+                    MatchSelectCaseClause = True
+                    Exit Function
+                End If
+            End If
+        Next idx
+        MatchSelectCaseClause = False
+    End Function
+
+    ' Executes complete procedure source code with block If/Else, Select Case, With ... End With,
+    ' Pre-compiled Jump Targets (For/Next, Do/Loop, While/Wend), Activation Frames & Recursion
+    Public Function ExecuteProcedure( _
+        ByVal procSource As String, _
+        Optional ByVal formObj As AccessForm = Nothing, _
+        Optional ByVal procName As String = "", _
+        Optional ByVal argsList As Variant = Empty _
+    ) As Variant
+
+        If m_moduleVars Is Nothing Or m_callDepth < 0 Then
+            InitializeInterpreter
+        End If
+        If Not formObj Is Nothing Then SetActiveForm formObj
+
+        Dim lines() As String
+        lines = Split(procSource, vbCrLf)
+        Dim stepCount As Long
+        stepCount = 0
+
+        ' Unpack arguments if passed in argsList
+        Dim passedArgs() As Variant
+        Dim numPassedArgs As Long
+        numPassedArgs = 0
+        If IsArray(argsList) Then
+            If Not IsEmpty(argsList) Then
+                On Error Resume Next
+                Dim lb As Long, ub As Long
+                lb = LBound(argsList)
+                ub = UBound(argsList)
+                If Err.Number = 0 And ub >= lb Then
+                    numPassedArgs = ub - lb + 1
+                    ReDim passedArgs(0 To numPassedArgs - 1)
+                    Dim aIdx As Long
+                    For aIdx = 0 To numPassedArgs - 1
+                        If IsObject(argsList(lb + aIdx)) Then
+                            Set passedArgs(aIdx) = argsList(lb + aIdx)
+                        Else
+                            passedArgs(aIdx) = argsList(lb + aIdx)
+                        End If
+                    Next aIdx
+                End If
+                On Error GoTo 0
+            End If
+        ElseIf Not IsEmpty(argsList) Then
+            numPassedArgs = 1
+            ReDim passedArgs(0 To 0)
+            If IsObject(argsList) Then
+                Set passedArgs(0) = argsList
+            Else
+                passedArgs(0) = argsList
+            End If
+        End If
+
+        ' Extract procedure name and possible arguments embedded in procName (e.g. Factorial(5))
+        Dim rawProcName As String
+        rawProcName = Trim$(procName)
+        Dim parenPos As Long
+        parenPos = InStr(1, rawProcName, "(")
+        If parenPos > 1 And Right$(rawProcName, 1) = ")" Then
+            Dim innerCallArgs As String
+            innerCallArgs = Mid$(rawProcName, parenPos + 1, Len(rawProcName) - parenPos - 1)
+            rawProcName = Trim$(Left$(rawProcName, parenPos - 1))
+            If numPassedArgs = 0 And Len(Trim$(innerCallArgs)) > 0 Then
+                Dim splitArgStrs() As String
+                splitArgStrs = SplitArguments(innerCallArgs)
+                If UBound(splitArgStrs) >= 0 Then
+                    numPassedArgs = UBound(splitArgStrs) + 1
+                    ReDim passedArgs(0 To numPassedArgs - 1)
+                    For aIdx = 0 To numPassedArgs - 1
+                        passedArgs(aIdx) = EvalExpr(splitArgStrs(aIdx))
+                    Next aIdx
+                End If
+            End If
+        End If
+
+        Dim targetProc As String
+        targetProc = LCase$(Trim$(rawProcName))
+        Dim startLine As Long: startLine = -1
+        Dim endLine As Long: endLine = -1
+        Dim paramNames() As String
+        Dim paramCount As Long: paramCount = 0
+        Dim i As Long
+
+        If Len(targetProc) > 0 Then
+            For i = 0 To UBound(lines)
+                Dim hLine As String
+                hLine = Trim$(lines(i))
+                If Len(hLine) > 0 And Left$(hLine, 1) <> "'" Then
+                    Dim isProcHeader As Boolean
+                    isProcHeader = False
+                    Dim pKw As String: pKw = ""
+                    Dim pPos As Long: pPos = 0
+
+                    If InStr(1, hLine, "Function ", vbTextCompare) > 0 Then
+                        pPos = InStr(1, hLine, "Function ", vbTextCompare)
+                        pKw = "Function "
+                        isProcHeader = True
+                    ElseIf InStr(1, hLine, "Sub ", vbTextCompare) > 0 Then
+                        pPos = InStr(1, hLine, "Sub ", vbTextCompare)
+                        pKw = "Sub "
+                        isProcHeader = True
+                    End If
+
+                    If isProcHeader Then
+                        Dim remainderH As String
+                        remainderH = Trim$(Mid$(hLine, pPos + Len(pKw)))
+                        Dim pOpen As Long
+                        pOpen = InStr(1, remainderH, "(")
+                        Dim foundName As String
+                        If pOpen > 0 Then
+                            foundName = LCase$(Trim$(Left$(remainderH, pOpen - 1)))
+                        Else
+                            foundName = LCase$(Trim$(remainderH))
+                        End If
+
+                        If foundName = targetProc Then
+                            startLine = i
+                            If pOpen > 0 Then
+                                Dim pClose As Long
+                                pClose = InStrRev(remainderH, ")")
+                                If pClose > pOpen Then
+                                    Dim paramStr As String
+                                    paramStr = Mid$(remainderH, pOpen + 1, pClose - pOpen - 1)
+                                    If Len(Trim$(paramStr)) > 0 Then
+                                        Dim rawParams() As String
+                                        rawParams = Split(paramStr, ",")
+                                        paramCount = UBound(rawParams) + 1
+                                        ReDim paramNames(0 To paramCount - 1)
+                                        Dim pIdx As Long
+                                        For pIdx = 0 To paramCount - 1
+                                            paramNames(pIdx) = CleanParamName(rawParams(pIdx))
+                                        Next pIdx
+                                    End If
+                                End If
+                            End If
+                            Exit For
+                        End If
+                    End If
+                End If
+            Next i
+
+            If startLine >= 0 Then
+                For i = startLine + 1 To UBound(lines)
+                    Dim eLine As String
+                    eLine = UCase$(Trim$(lines(i)))
+                    If eLine = "END FUNCTION" Or eLine = "END SUB" Then
+                        endLine = i
+                        Exit For
+                    End If
+                Next i
+            End If
+        End If
+
+        ' Default to scanning first procedure if targetProc not matched
+        If startLine < 0 Then
+            For i = 0 To UBound(lines)
+                Dim fLine As String
+                fLine = Trim$(lines(i))
+                If Len(fLine) > 0 And Left$(fLine, 1) <> "'" Then
+                    If InStr(1, fLine, "Sub ", vbTextCompare) > 0 Or InStr(1, fLine, "Function ", vbTextCompare) > 0 Then
+                        startLine = i
+                        Dim sKw As Long
+                        sKw = InStr(1, fLine, "Function ", vbTextCompare)
+                        If sKw = 0 Then sKw = InStr(1, fLine, "Sub ", vbTextCompare)
+                        Dim afterS As String
+                        If InStr(1, fLine, "Function ", vbTextCompare) > 0 Then
+                            afterS = Trim$(Mid$(fLine, sKw + 9))
+                        Else
+                            afterS = Trim$(Mid$(fLine, sKw + 4))
+                        End If
+                        Dim pO As Long
+                        pO = InStr(1, afterS, "(")
+                        If pO > 0 Then
+                            targetProc = LCase$(Trim$(Left$(afterS, pO - 1)))
+                        Else
+                            targetProc = LCase$(Trim$(afterS))
+                        End If
+                        Exit For
+                    End If
+                End If
+            Next i
+            If startLine >= 0 Then
+                For i = startLine + 1 To UBound(lines)
+                    Dim eLine2 As String
+                    eLine2 = UCase$(Trim$(lines(i)))
+                    If eLine2 = "END FUNCTION" Or eLine2 = "END SUB" Then
+                        endLine = i
+                        Exit For
+                    End If
+                Next i
+            End If
+        End If
+
+        If startLine < 0 Then startLine = 0
+        If endLine < 0 Then endLine = UBound(lines)
+
+        ' Push activation frame onto the call stack
+        PushFrame targetProc, procSource
+
+        ' Bind procedure parameters
+        If paramCount > 0 And numPassedArgs > 0 Then
+            For aIdx = 0 To paramCount - 1
+                If aIdx < numPassedArgs Then
+                    SetVariable paramNames(aIdx), passedArgs(aIdx)
+                End If
+            Next aIdx
+        End If
+
+        ' Pre-compiled Jump Targets Table
+        Dim labelMap As Object
+        Set labelMap = PalManager.CreateDictionary()
+
+        Dim forNext() As Long, nextFor() As Long
+        Dim doLoop() As Long, loopDo() As Long
+        Dim whileWend() As Long, wendWhile() As Long
+
+        ReDim forNext(0 To UBound(lines))
+        ReDim nextFor(0 To UBound(lines))
+        ReDim doLoop(0 To UBound(lines))
+        ReDim loopDo(0 To UBound(lines))
+        ReDim whileWend(0 To UBound(lines))
+        ReDim wendWhile(0 To UBound(lines))
+
+        For i = 0 To UBound(lines)
+            forNext(i) = -1: nextFor(i) = -1
+            doLoop(i) = -1: loopDo(i) = -1
+            whileWend(i) = -1: wendWhile(i) = -1
+        Next i
+
+        Dim stkFor(0 To 63) As Long: Dim topFor As Long: topFor = 0
+        Dim stkDo(0 To 63) As Long: Dim topDo As Long: topDo = 0
+        Dim stkWhile(0 To 63) As Long: Dim topWhile As Long: topWhile = 0
+
+        For i = startLine To endLine
+            Dim sLine As String
+            sLine = Trim$(lines(i))
+            If Len(sLine) > 0 And Left$(sLine, 1) <> "'" Then
+                If Right$(sLine, 1) = ":" And InStr(1, sLine, " ") = 0 Then
+                    labelMap.Item(LCase$(Left$(sLine, Len(sLine) - 1))) = i
+                ElseIf UCase$(Left$(sLine, 4)) = "FOR " Then
+                    topFor = topFor + 1
+                    stkFor(topFor) = i
+                ElseIf UCase$(Left$(sLine, 4)) = "NEXT" Then
+                    If topFor > 0 Then
+                        Dim matchedFor As Long
+                        matchedFor = stkFor(topFor)
+                        topFor = topFor - 1
+                        forNext(matchedFor) = i
+                        nextFor(i) = matchedFor
+                    End If
+                ElseIf UCase$(Left$(sLine, 3)) = "DO " Or UCase$(sLine) = "DO" Then
+                    topDo = topDo + 1
+                    stkDo(topDo) = i
+                ElseIf UCase$(Left$(sLine, 5)) = "LOOP " Or UCase$(sLine) = "LOOP" Then
+                    If topDo > 0 Then
+                        Dim matchedDo As Long
+                        matchedDo = stkDo(topDo)
+                        topDo = topDo - 1
+                        doLoop(matchedDo) = i
+                        loopDo(i) = matchedDo
+                    End If
+                ElseIf UCase$(Left$(sLine, 6)) = "WHILE " Then
+                    topWhile = topWhile + 1
+                    stkWhile(topWhile) = i
+                ElseIf UCase$(sLine) = "WEND" Then
+                    If topWhile > 0 Then
+                        Dim matchedWhile As Long
+                        matchedWhile = stkWhile(topWhile)
+                        topWhile = topWhile - 1
+                        whileWend(matchedWhile) = i
+                        wendWhile(i) = matchedWhile
+                    End If
+                End If
+            End If
+        Next i
+
+        ' Execution state stack for block If / ElseIf / Else / End If
+        Dim ifActive(0 To 31) As Boolean
+        Dim ifExecuted(0 To 31) As Boolean
+        Dim ifDepth As Long
+        ifDepth = 0
+        ifActive(0) = True
+        ifExecuted(0) = False
+
+        ' Execution state stack for Select Case / Case / Case Else / End Select
+        Dim selTarget(0 To 15) As Variant
+        Dim selActive(0 To 15) As Boolean
+        Dim selMatched(0 To 15) As Boolean
+        Dim selDepth As Long
+        selDepth = 0
+        selActive(0) = True
+        selMatched(0) = False
+
+        ' Stack for With ... End With prefixes
+        Dim withStack(0 To 15) As String
+        Dim withDepth As Long
+        withDepth = 0
+
+        Dim ip As Long
+        ip = startLine
+        If startLine < endLine And startLine >= 0 Then
+            Dim checkHdr As String
+            checkHdr = Trim$(lines(startLine))
+            If InStr(1, checkHdr, "Function ", vbTextCompare) > 0 Or InStr(1, checkHdr, "Sub ", vbTextCompare) > 0 Then
+                ip = startLine + 1
+            End If
+        End If
+
+        Do While ip <= endLine
+            stepCount = stepCount + 1
+            If stepCount > WATCHDOG_MAX_STEPS Then
+                Err.Raise 1001, "VbaInterpreter", "Execution halted: watchdog loop limit exceeded"
+                Exit Do
+            End If
+
+            If m_callStack(m_callDepth).ExitRequested Or m_callStack(m_callDepth).HasReturned Then
+                Exit Do
+            End If
+
+            Dim lineText As String
+            lineText = Trim$(lines(ip))
+            If Len(lineText) = 0 Or Left$(lineText, 1) = "'" Then
+                ip = ip + 1
+                GoTo LoopContinue
+            End If
+
+            Dim uText As String
+            uText = UCase$(lineText)
+
+            ' Procedure Footer
+            If uText = "END SUB" Or uText = "END FUNCTION" Then
+                Exit Do
+            End If
+
+            ' Procedure Header
+            If Left$(uText, 4) = "SUB " Or Left$(uText, 9) = "FUNCTION " _
+               Or Left$(uText, 11) = "PRIVATE SUB" Or Left$(uText, 10) = "PUBLIC SUB" _
+               Or Left$(uText, 16) = "PRIVATE FUNCTION" Or Left$(uText, 15) = "PUBLIC FUNCTION" Then
+                ip = ip + 1
+                GoTo LoopContinue
+            End If
+
+            ' Label definition line
+            If Right$(lineText, 1) = ":" And InStr(1, lineText, " ") = 0 Then
+                ip = ip + 1
+                GoTo LoopContinue
+            End If
+
+            ' Select Case ...
+            If Left$(uText, 12) = "SELECT CASE " Then
+                selDepth = selDepth + 1
+                If ifActive(ifDepth) And selActive(selDepth - 1) Then
+                    selTarget(selDepth) = EvalExpr(Trim$(Mid$(lineText, 13)))
+                    selActive(selDepth) = False
+                    selMatched(selDepth) = False
+                Else
+                    selTarget(selDepth) = Empty
+                    selActive(selDepth) = False
+                    selMatched(selDepth) = True
+                End If
+                ip = ip + 1
+                GoTo LoopContinue
+            End If
+
+            ' Case Else
+            If uText = "CASE ELSE" Then
+                If selDepth > 0 Then
+                    If ifActive(ifDepth) And selActive(selDepth - 1) And Not selMatched(selDepth) Then
+                        selActive(selDepth) = True
+                        selMatched(selDepth) = True
+                    Else
+                        selActive(selDepth) = False
+                    End If
+                End If
+                ip = ip + 1
+                GoTo LoopContinue
+            End If
+
+            ' Case <exprList>
+            If Left$(uText, 5) = "CASE " Then
+                If selDepth > 0 Then
+                    If ifActive(ifDepth) And selActive(selDepth - 1) And Not selMatched(selDepth) Then
+                        Dim caseMatch As Boolean
+                        caseMatch = MatchSelectCaseClause(selTarget(selDepth), Trim$(Mid$(lineText, 6)))
+                        selActive(selDepth) = caseMatch
+                        selMatched(selDepth) = caseMatch
+                    Else
+                        selActive(selDepth) = False
+                    End If
+                End If
+                ip = ip + 1
+                GoTo LoopContinue
+            End If
+
+            ' End Select
+            If uText = "END SELECT" Then
+                If selDepth > 0 Then selDepth = selDepth - 1
+                ip = ip + 1
+                GoTo LoopContinue
+            End If
+
+            ' With <obj>
+            If Left$(uText, 5) = "WITH " Then
+                If ifActive(ifDepth) And selActive(selDepth) Then
+                    withDepth = withDepth + 1
+                    withStack(withDepth) = ExpandWithPrefix(Trim$(Mid$(lineText, 6)))
+                    m_callStack(m_callDepth).WithPrefix = withStack(withDepth)
+                End If
+                ip = ip + 1
+                GoTo LoopContinue
+            End If
+
+            ' End With
+            If uText = "END WITH" Then
+                If ifActive(ifDepth) And selActive(selDepth) Then
+                    If withDepth > 0 Then withDepth = withDepth - 1
+                    If withDepth > 0 Then
+                        m_callStack(m_callDepth).WithPrefix = withStack(withDepth)
+                    Else
+                        m_callStack(m_callDepth).WithPrefix = vbNullString
+                    End If
+                End If
+                ip = ip + 1
+                GoTo LoopContinue
+            End If
+
+            ' Block If ... Then
+            If Left$(uText, 3) = "IF " And Right$(uText, 5) = " THEN" Then
+                ifDepth = ifDepth + 1
+                Dim blockCondStr As String
+                blockCondStr = Trim$(Mid$(lineText, 4, Len(lineText) - 8))
+                If ifActive(ifDepth - 1) And selActive(selDepth) Then
+                    Dim bCond As Boolean
+                    bCond = CBool(EvalExpr(blockCondStr))
+                    ifActive(ifDepth) = bCond
+                    ifExecuted(ifDepth) = bCond
+                Else
+                    ifActive(ifDepth) = False
+                    ifExecuted(ifDepth) = True
+                End If
+                ip = ip + 1
+                GoTo LoopContinue
+            End If
+
+            ' ElseIf ... Then
+            If Left$(uText, 7) = "ELSEIF " And Right$(uText, 5) = " THEN" Then
+                If ifDepth > 0 Then
+                    If ifActive(ifDepth - 1) And selActive(selDepth) And Not ifExecuted(ifDepth) Then
+                        Dim elseIfCondStr As String
+                        elseIfCondStr = Trim$(Mid$(lineText, 8, Len(lineText) - 12))
+                        Dim eiCond As Boolean
+                        eiCond = CBool(EvalExpr(elseIfCondStr))
+                        ifActive(ifDepth) = eiCond
+                        ifExecuted(ifDepth) = eiCond
+                    Else
+                        ifActive(ifDepth) = False
+                    End If
+                End If
+                ip = ip + 1
+                GoTo LoopContinue
+            End If
+
+            ' Else
+            If uText = "ELSE" Then
+                If ifDepth > 0 Then
+                    If ifActive(ifDepth - 1) And selActive(selDepth) And Not ifExecuted(ifDepth) Then
+                        ifActive(ifDepth) = True
+                        ifExecuted(ifDepth) = True
+                    Else
+                        ifActive(ifDepth) = False
+                    End If
+                End If
+                ip = ip + 1
+                GoTo LoopContinue
+            End If
+
+            ' End If
+            If uText = "END IF" Then
+                If ifDepth > 0 Then ifDepth = ifDepth - 1
+                ip = ip + 1
+                GoTo LoopContinue
+            End If
+
+            ' If not inside active block, skip
+            If Not (ifActive(ifDepth) And selActive(selDepth)) Then
+                ip = ip + 1
+                GoTo LoopContinue
+            End If
+
+            ' On Error GoTo / Resume Next / GoTo 0
+            If Left$(uText, 9) = "ON ERROR " Then
+                Dim errDirective As String
+                errDirective = Trim$(Mid$(uText, 10))
+                If errDirective = "RESUME NEXT" Then
+                    m_callStack(m_callDepth).OnErrorResumeNext = True
+                    m_callStack(m_callDepth).ErrorGotoLabel = vbNullString
+                ElseIf errDirective = "GOTO 0" Then
+                    m_callStack(m_callDepth).OnErrorResumeNext = False
+                    m_callStack(m_callDepth).ErrorGotoLabel = vbNullString
+                ElseIf Left$(errDirective, 5) = "GOTO " Then
+                    m_callStack(m_callDepth).ErrorGotoLabel = Trim$(Mid$(lineText, 15))
+                    m_callStack(m_callDepth).OnErrorResumeNext = False
+                End If
+                ip = ip + 1
+                GoTo LoopContinue
+            End If
+
+            ' Err.Clear
+            If uText = "ERR.CLEAR" Then
+                m_callStack(m_callDepth).LastErrorNum = 0
+                m_callStack(m_callDepth).LastErrorDesc = vbNullString
+                ip = ip + 1
+                GoTo LoopContinue
+            End If
+
+            ' Err.Raise
+            If Left$(uText, 10) = "ERR.RAISE " Then
+                Dim eArgStr As String
+                eArgStr = Trim$(Mid$(lineText, 11))
+                Dim ePartsList() As String
+                ePartsList = Split(eArgStr, ",")
+                Dim errCodeNum As Long
+                errCodeNum = CLng(EvalExpr(Trim$(ePartsList(0))))
+                Dim errDescStr As String
+                errDescStr = vbNullString
+                If UBound(ePartsList) >= 1 Then errDescStr = CStr(EvalExpr(Trim$(ePartsList(1))))
+                m_callStack(m_callDepth).LastErrorNum = errCodeNum
+                m_callStack(m_callDepth).LastErrorDesc = errDescStr
+
+                If Len(m_callStack(m_callDepth).ErrorGotoLabel) > 0 Then
+                    Dim tgtLbl As String
+                    tgtLbl = LCase$(m_callStack(m_callDepth).ErrorGotoLabel)
+                    If labelMap.Exists(tgtLbl) Then
+                        ip = CLng(labelMap.Item(tgtLbl))
+                        GoTo LoopContinue
+                    End If
+                End If
+
+                If m_callStack(m_callDepth).OnErrorResumeNext Then
+                    ip = ip + 1
+                    GoTo LoopContinue
+                Else
+                    Err.Raise errCodeNum, "VbaInterpreter", errDescStr
+                    Exit Do
+                End If
+            End If
+
+            ' Exit Sub / Exit Function
+            If uText = "EXIT SUB" Or uText = "EXIT FUNCTION" Then
+                m_callStack(m_callDepth).ExitRequested = True
+                Exit Do
+            End If
+
+            ' Exit For
+            If uText = "EXIT FOR" Then
+                Dim efIdx As Long
+                For efIdx = 0 To UBound(lines)
+                    If forNext(efIdx) > ip And ip > efIdx Then
+                        ip = forNext(efIdx) + 1
+                        GoTo LoopContinue
+                    End If
+                Next efIdx
+                ip = ip + 1
+                GoTo LoopContinue
+            End If
+
+            ' Exit Do
+            If uText = "EXIT DO" Then
+                Dim edIdx As Long
+                For edIdx = 0 To UBound(lines)
+                    If doLoop(edIdx) > ip And ip > edIdx Then
+                        ip = doLoop(edIdx) + 1
+                        GoTo LoopContinue
+                    End If
+                Next edIdx
+                ip = ip + 1
+                GoTo LoopContinue
+            End If
+
+            ' For <var> = <start> To <end> [Step <step>]
+            If Left$(uText, 4) = "FOR " Then
+                Dim afterForStr As String
+                afterForStr = Trim$(Mid$(lineText, 5))
+                Dim forStepVal As Double: forStepVal = 1#
+                Dim stepPos As Long
+                stepPos = InStr(1, afterForStr, " Step ", vbTextCompare)
+                If stepPos > 0 Then
+                    forStepVal = CDbl(VBA.Val(CStr(EvalExpr(Trim$(Mid$(afterForStr, stepPos + 6))))))
+                    afterForStr = Trim$(Left$(afterForStr, stepPos - 1))
+                End If
+                Dim toPos As Long
+                toPos = InStr(1, afterForStr, " To ", vbTextCompare)
+                If toPos > 0 Then
+                    Dim forEqPos As Long
+                    Dim forVarPart As String
+                    forVarPart = Trim$(Left$(afterForStr, toPos - 1))
+                    forEqPos = InStr(1, forVarPart, "=")
+                    Dim forVarName As String
+                    Dim forStartExpr As String
+                    forVarName = Trim$(Left$(forVarPart, forEqPos - 1))
+                    forStartExpr = Trim$(Mid$(forVarPart, forEqPos + 1))
+                    Dim forEndExpr As String
+                    forEndExpr = Trim$(Mid$(afterForStr, toPos + 4))
+
+                    Dim forStartVal As Double
+                    Dim forEndVal As Double
+                    forStartVal = CDbl(VBA.Val(CStr(EvalExpr(forStartExpr))))
+                    forEndVal = CDbl(VBA.Val(CStr(EvalExpr(forEndExpr))))
+
+                    SetVariable forVarName, forStartVal
+
+                    If (forStepVal >= 0 And forStartVal > forEndVal) Or (forStepVal < 0 And forStartVal < forEndVal) Then
+                        If forNext(ip) >= 0 Then
+                            ip = forNext(ip) + 1
+                        Else
+                            ip = ip + 1
+                        End If
+                    Else
+                        ip = ip + 1
+                    End If
+                    GoTo LoopContinue
+                End If
+            End If
+
+            ' Next [<var>]
+            If Left$(uText, 4) = "NEXT" Then
+                Dim nForIdx As Long
+                nForIdx = nextFor(ip)
+                If nForIdx >= 0 Then
+                    Dim matchedForLine As String
+                    matchedForLine = Trim$(lines(nForIdx))
+                    Dim nAfterFor As String
+                    nAfterFor = Trim$(Mid$(matchedForLine, 5))
+                    Dim nStepVal As Double: nStepVal = 1#
+                    Dim nStepPos As Long
+                    nStepPos = InStr(1, nAfterFor, " Step ", vbTextCompare)
+                    If nStepPos > 0 Then
+                        nStepVal = CDbl(VBA.Val(CStr(EvalExpr(Trim$(Mid$(nAfterFor, nStepPos + 6))))))
+                        nAfterFor = Trim$(Left$(nAfterFor, nStepPos - 1))
+                    End If
+                    Dim nToPos As Long
+                    nToPos = InStr(1, nAfterFor, " To ", vbTextCompare)
+                    If nToPos > 0 Then
+                        Dim nEqPos As Long
+                        Dim nVarPart As String
+                        nVarPart = Trim$(Left$(nAfterFor, nToPos - 1))
+                        nEqPos = InStr(1, nVarPart, "=")
+                        Dim nVarName As String
+                        nVarName = Trim$(Left$(nVarPart, nEqPos - 1))
+                        Dim nEndVal As Double
+                        nEndVal = CDbl(VBA.Val(CStr(EvalExpr(Trim$(Mid$(nAfterFor, nToPos + 4))))))
+
+                        Dim nCurVal As Double
+                        nCurVal = CDbl(VBA.Val(CStr(GetVariable(nVarName)))) + nStepVal
+                        SetVariable nVarName, nCurVal
+
+                        If (nStepVal >= 0 And nCurVal <= nEndVal) Or (nStepVal < 0 And nCurVal >= nEndVal) Then
+                            ip = nForIdx + 1
+                        Else
+                            ip = ip + 1
+                        End If
+                        GoTo LoopContinue
+                    End If
+                End If
+                ip = ip + 1
+                GoTo LoopContinue
+            End If
+
+            ' Do [While|Until cond]
+            If Left$(uText, 3) = "DO " Or uText = "DO" Then
+                If Left$(uText, 9) = "DO WHILE " Then
+                    Dim doWhileCond As String
+                    doWhileCond = Trim$(Mid$(lineText, 10))
+                    If Not CBool(EvalExpr(doWhileCond)) Then
+                        If doLoop(ip) >= 0 Then ip = doLoop(ip) + 1 Else ip = ip + 1
+                    Else
+                        ip = ip + 1
+                    End If
+                ElseIf Left$(uText, 9) = "DO UNTIL " Then
+                    Dim doUntilCond As String
+                    doUntilCond = Trim$(Mid$(lineText, 10))
+                    If CBool(EvalExpr(doUntilCond)) Then
+                        If doLoop(ip) >= 0 Then ip = doLoop(ip) + 1 Else ip = ip + 1
+                    Else
+                        ip = ip + 1
+                    End If
+                Else
+                    ip = ip + 1
+                End If
+                GoTo LoopContinue
+            End If
+
+            ' Loop [While|Until cond]
+            If Left$(uText, 5) = "LOOP " Or uText = "LOOP" Then
+                Dim nDoIdx As Long
+                nDoIdx = loopDo(ip)
+                If nDoIdx >= 0 Then
+                    If Left$(uText, 11) = "LOOP WHILE " Then
+                        Dim loopWhileCond As String
+                        loopWhileCond = Trim$(Mid$(lineText, 12))
+                        If CBool(EvalExpr(loopWhileCond)) Then
+                            ip = nDoIdx + 1
+                        Else
+                            ip = ip + 1
+                        End If
+                    ElseIf Left$(uText, 11) = "LOOP UNTIL " Then
+                        Dim loopUntilCond As String
+                        loopUntilCond = Trim$(Mid$(lineText, 12))
+                        If Not CBool(EvalExpr(loopUntilCond)) Then
+                            ip = nDoIdx + 1
+                        Else
+                            ip = ip + 1
+                        End If
+                    Else
+                        ip = nDoIdx
+                    End If
+                Else
+                    ip = ip + 1
+                End If
+                GoTo LoopContinue
+            End If
+
+            ' While <cond>
+            If Left$(uText, 6) = "WHILE " Then
+                Dim whileCondStr As String
+                whileCondStr = Trim$(Mid$(lineText, 7))
+                If Not CBool(EvalExpr(whileCondStr)) Then
+                    If whileWend(ip) >= 0 Then ip = whileWend(ip) + 1 Else ip = ip + 1
+                Else
+                    ip = ip + 1
+                End If
+                GoTo LoopContinue
+            End If
+
+            ' Wend
+            If uText = "WEND" Then
+                Dim nWhileIdx As Long
+                nWhileIdx = wendWhile(ip)
+                If nWhileIdx >= 0 Then
+                    ip = nWhileIdx
+                Else
+                    ip = ip + 1
+                End If
+                GoTo LoopContinue
+            End If
+
+            ' Execute regular statement with error trap & handler routing
+            On Error Resume Next
+            Err.Clear
+            ExecuteStatement lineText
+            If Err.Number <> 0 Then
+                Dim runErrNum As Long
+                Dim runErrDesc As String
+                runErrNum = Err.Number
+                runErrDesc = Err.Description
+                m_callStack(m_callDepth).LastErrorNum = runErrNum
+                m_callStack(m_callDepth).LastErrorDesc = runErrDesc
+
+                If Len(m_callStack(m_callDepth).ErrorGotoLabel) > 0 Then
+                    Dim jumpLbl As String
+                    jumpLbl = LCase$(m_callStack(m_callDepth).ErrorGotoLabel)
+                    If labelMap.Exists(jumpLbl) Then
+                        ip = CLng(labelMap.Item(jumpLbl))
+                        GoTo LoopContinue
+                    End If
+                End If
+
+                If m_callStack(m_callDepth).OnErrorResumeNext Then
+                    ip = ip + 1
+                    GoTo LoopContinue
+                Else
+                    Err.Raise runErrNum, "VbaInterpreter", runErrDesc
+                    Exit Do
+                End If
+            End If
+            On Error GoTo 0
+
+            ip = ip + 1
+
+LoopContinue:
+        Loop
+
+        ' Retrieve procedure return value from the active activation frame
+        Dim procReturnVal As Variant
+        If IsObject(m_callStack(m_callDepth).ReturnValue) Then
+            Set procReturnVal = m_callStack(m_callDepth).ReturnValue
+        Else
+            procReturnVal = m_callStack(m_callDepth).ReturnValue
+        End If
+
+        PopFrame
+
+        If IsObject(procReturnVal) Then
+            Set ExecuteProcedure = procReturnVal
+        Else
+            ExecuteProcedure = procReturnVal
+        End If
+    End Function
+
+End Module

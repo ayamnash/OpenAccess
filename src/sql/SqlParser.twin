@@ -1,0 +1,626 @@
+' File: src/sql/SqlParser.twin
+' Access SQL Lexer, Parser and Unified AST Parser in twinBASIC
+Option Explicit
+
+Public Module SqlParser
+
+    Public Enum SqlTokenType
+        SqlTokKeyword = 1
+        SqlTokIdentifier = 2
+        SqlTokStringLiteral = 3
+        SqlTokNumberLiteral = 4
+        SqlTokDateLiteral = 5
+        SqlTokOperator = 6
+        SqlTokPunctuation = 7
+        SqlTokEOF = 8
+    End Enum
+
+    Public Type SqlToken
+        TokenType As SqlTokenType
+        Value As String
+        Position As Long
+    End Type
+
+    Public Enum SqlStatementType
+        StmtSelect = 1
+        StmtInsert = 2
+        StmtUpdate = 3
+        StmtDelete = 4
+        StmtCreateTable = 5
+        StmtDropTable = 6
+        StmtAlterTable = 7
+        StmtCreateIndex = 8
+        StmtDropIndex = 9
+    End Enum
+
+    Public Type SqlSelectItem
+        Expression As String
+        Alias As String
+        IsAggregate As Boolean
+        AggregateFunc As String
+    End Type
+
+    Public Type SqlOrderByItem
+        ColumnName As String
+        IsDescending As Boolean
+    End Type
+
+    Public Type SqlSelectQuery
+        TableName As String
+        IsSelectAll As Boolean
+        ItemCount As Long
+        Items() As SqlSelectItem
+        WhereClause As String
+        OrderByItems() As SqlOrderByItem
+        HasGroupBy As Boolean
+        GroupByColumn As String
+    End Type
+
+    Public Type SqlInsertQuery
+        TableName As String
+        Columns() As String
+        Values() As Variant
+    End Type
+
+    Public Type SqlUpdateQuery
+        TableName As String
+        Columns() As String
+        Values() As Variant
+        WhereClause As String
+    End Type
+
+    Public Type SqlDeleteQuery
+        TableName As String
+        WhereClause As String
+    End Type
+
+    ' Complete Unified SQL Statement AST
+    Public Type SqlStatement
+        StatementType As SqlStatementType
+        RawSql As String
+        ParametersClause As String
+        SelectClause As String
+        FromClause As String
+        WhereClause As String
+        GroupByClause As String
+        HavingClause As String
+        OrderByClause As String
+        TableName As String
+        IsDistinct As Boolean
+        TopCount As Long
+        AlterAction As String       ' "ADD", "DROP", "ALTER"
+        AlterColName As String
+        AlterColType As String
+        IndexName As String
+        IndexColumns As String
+        IsUniqueIndex As Boolean
+    End Type
+
+    Private Sub AppendToken(ByRef arr() As SqlToken, ByRef count As Long, ByRef tok As SqlToken)
+        ReDim Preserve arr(0 To count)
+        arr(count) = tok
+        count = count + 1
+    End Sub
+
+    Public Function TokenizeInto(ByVal sql As String, ByRef outTokens() As SqlToken) As Long
+        Dim tokCount As Long
+        tokCount = 0
+
+        Dim i As Long
+        Dim length As Long
+        Dim ch As String
+        Dim currTok As SqlToken
+
+        length = Len(sql)
+        i = 1
+
+        Do While i <= length
+            ch = Mid$(sql, i, 1)
+
+            Select Case ch
+                Case " ", vbTab, vbCr, vbLf
+                    i = i + 1
+
+                Case "[", "]"
+                    If ch = "[" Then
+                        Dim closeBracket As Long
+                        closeBracket = InStr(i, sql, "]")
+                        If closeBracket > i Then
+                            currTok.TokenType = SqlTokenType.SqlTokIdentifier
+                            currTok.Value = Mid$(sql, i + 1, closeBracket - i - 1)
+                            currTok.Position = i
+                            AppendToken outTokens, tokCount, currTok
+                            i = closeBracket + 1
+                        Else
+                            i = i + 1
+                        End If
+                    Else
+                        i = i + 1
+                    End If
+
+                Case "'", """"
+                    Dim quoteChar As String
+                    quoteChar = ch
+                    Dim closeQuote As Long
+                    closeQuote = InStr(i + 1, sql, quoteChar)
+                    If closeQuote > i Then
+                        currTok.TokenType = SqlTokenType.SqlTokStringLiteral
+                        currTok.Value = Mid$(sql, i + 1, closeQuote - i - 1)
+                        currTok.Position = i
+                        AppendToken outTokens, tokCount, currTok
+                        i = closeQuote + 1
+                    Else
+                        i = i + 1
+                    End If
+
+                Case "#"
+                    Dim closeHash As Long
+                    closeHash = InStr(i + 1, sql, "#")
+                    If closeHash > i Then
+                        currTok.TokenType = SqlTokenType.SqlTokDateLiteral
+                        currTok.Value = Mid$(sql, i + 1, closeHash - i - 1)
+                        currTok.Position = i
+                        AppendToken outTokens, tokCount, currTok
+                        i = closeHash + 1
+                    Else
+                        i = i + 1
+                    End If
+
+                Case ",", ";", "(", ")", "*"
+                    currTok.TokenType = SqlTokenType.SqlTokPunctuation
+                    currTok.Value = ch
+                    currTok.Position = i
+                    AppendToken outTokens, tokCount, currTok
+                    i = i + 1
+
+                Case "=", "<", ">"
+                    Dim opStr As String
+                    opStr = ch
+                    If i < length Then
+                        Dim nextCh As String
+                        nextCh = Mid$(sql, i + 1, 1)
+                        If (ch = "<" And (nextCh = ">" Or nextCh = "=")) Or (ch = ">" And nextCh = "=") Then
+                            opStr = opStr & nextCh
+                            i = i + 1
+                        End If
+                    End If
+                    currTok.TokenType = SqlTokenType.SqlTokOperator
+                    currTok.Value = opStr
+                    currTok.Position = i
+                    AppendToken outTokens, tokCount, currTok
+                    i = i + 1
+
+                Case Else
+                    If IsNumeric(ch) Or (ch = "-" And IsNumeric(Mid$(sql, i + 1, 1))) Then
+                        Dim numStart As Long
+                        numStart = i
+                        If ch = "-" Then i = i + 1
+                        Do While i <= length And (IsNumeric(Mid$(sql, i, 1)) Or Mid$(sql, i, 1) = ".")
+                            i = i + 1
+                        Loop
+                        currTok.TokenType = SqlTokenType.SqlTokNumberLiteral
+                        currTok.Value = Mid$(sql, numStart, i - numStart)
+                        currTok.Position = numStart
+                        AppendToken outTokens, tokCount, currTok
+                    ElseIf (ch >= "A" And ch <= "Z") Or (ch >= "a" And ch <= "z") Or ch = "_" Then
+                        Dim idStart As Long
+                        idStart = i
+                        Do While i <= length
+                            Dim cChar As String
+                            cChar = Mid$(sql, i, 1)
+                            If Not ((cChar >= "A" And cChar <= "Z") Or (cChar >= "a" And cChar <= "z") Or (cChar >= "0" And cChar <= "9") Or cChar = "_") Then
+                                Exit Do
+                            End If
+                            i = i + 1
+                        Loop
+                        Dim word As String
+                        word = Mid$(sql, idStart, i - idStart)
+                        If IsSqlKeyword(word) Then
+                            currTok.TokenType = SqlTokenType.SqlTokKeyword
+                            currTok.Value = UCase$(word)
+                        Else
+                            currTok.TokenType = SqlTokenType.SqlTokIdentifier
+                            currTok.Value = word
+                        End If
+                        currTok.Position = idStart
+                        AppendToken outTokens, tokCount, currTok
+                    Else
+                        i = i + 1
+                    End If
+            End Select
+        Loop
+
+        currTok.TokenType = SqlTokenType.SqlTokEOF
+        currTok.Value = ""
+        currTok.Position = length + 1
+        AppendToken outTokens, tokCount, currTok
+
+        TokenizeInto = tokCount
+    End Function
+
+    Private Function IsSqlKeyword(ByVal word As String) As Boolean
+        Dim u As String
+        u = UCase$(word)
+        Select Case u
+            Case "SELECT", "FROM", "WHERE", "ORDER", "BY", "ASC", "DESC"
+                IsSqlKeyword = True
+            Case "INSERT", "INTO", "VALUES", "UPDATE", "SET", "DELETE"
+                IsSqlKeyword = True
+            Case "AND", "OR", "NOT", "LIKE", "IN", "BETWEEN", "IS", "NULL"
+                IsSqlKeyword = True
+            Case "AS", "GROUP", "HAVING", "COUNT", "SUM", "AVG", "MIN", "MAX"
+                IsSqlKeyword = True
+            Case "ALTER", "TABLE", "ADD", "DROP", "COLUMN", "CREATE", "INDEX", "UNIQUE"
+                IsSqlKeyword = True
+            Case Else
+                IsSqlKeyword = False
+        End Select
+    End Function
+
+    ' Parenthesis- and quote-aware top-level keyword search
+    Public Function FindSqlClauseKeyword(ByVal s As String, ByVal kw As String) As Long
+        Dim inSq As Boolean, inDq As Boolean, inBk As Long, inPar As Long
+        Dim kwLen As Long, sLen As Long, i As Long
+        Dim c As String, prevC As String, nextC As String
+        kwLen = Len(kw)
+        sLen = Len(s)
+        If sLen < kwLen Then Exit Function
+        For i = 1 To sLen - kwLen + 1
+            c = Mid$(s, i, 1)
+            If c = "'" And Not inDq Then
+                inSq = Not inSq
+            ElseIf c = """" And Not inSq Then
+                inDq = Not inDq
+            ElseIf c = "[" And Not inSq And Not inDq Then
+                inBk = inBk + 1
+            ElseIf c = "]" And Not inSq And Not inDq Then
+                If inBk > 0 Then inBk = inBk - 1
+            ElseIf c = "(" And Not inSq And Not inDq Then
+                inPar = inPar + 1
+            ElseIf c = ")" And Not inSq And Not inDq Then
+                If inPar > 0 Then inPar = inPar - 1
+            ElseIf Not inSq And Not inDq And inBk = 0 And inPar = 0 Then
+                If StrComp(Mid$(s, i, kwLen), kw, vbTextCompare) = 0 Then
+                    If i > 1 Then prevC = Mid$(s, i - 1, 1) Else prevC = " "
+                    If i + kwLen <= sLen Then nextC = Mid$(s, i + kwLen, 1) Else nextC = " "
+                    If (prevC = " " Or prevC = vbTab Or prevC = vbCr Or prevC = vbLf Or prevC = ")") And (nextC = " " Or nextC = vbTab Or nextC = vbCr Or nextC = vbLf Or nextC = "(") Then
+                        FindSqlClauseKeyword = i
+                        Exit Function
+                    End If
+                End If
+            End If
+        Next i
+        FindSqlClauseKeyword = 0
+    End Function
+
+    ' Master Unified SQL Statement Parser
+    Public Function ParseSql(ByVal sql As String) As SqlStatement
+        Dim stmt As SqlStatement
+        Dim s As String
+        s = Trim$(sql)
+        If Right$(s, 1) = ";" Then s = Left$(s, Len(s) - 1)
+        s = Trim$(s)
+        stmt.RawSql = s
+
+        If UCase$(Left$(s, 11)) = "PARAMETERS " Then
+            Dim semiPos As Long
+            semiPos = InStr(1, s, ";")
+            If semiPos > 0 Then
+                stmt.ParametersClause = Trim$(Mid$(s, 12, semiPos - 12))
+                s = Trim$(Mid$(s, semiPos + 1))
+            End If
+        End If
+
+        Dim us As String
+        us = UCase$(s)
+
+        If Left$(us, 7) = "SELECT " Then
+            stmt.StatementType = SqlStatementType.StmtSelect
+            ParseSelectClauses s, stmt
+        ElseIf Left$(us, 12) = "INSERT INTO " Then
+            stmt.StatementType = SqlStatementType.StmtInsert
+            stmt.FromClause = Trim$(Mid$(s, 13))
+        ElseIf Left$(us, 7) = "UPDATE " Then
+            stmt.StatementType = SqlStatementType.StmtUpdate
+        ElseIf Left$(us, 12) = "DELETE FROM " Or Left$(us, 14) = "DELETE * FROM " Then
+            stmt.StatementType = SqlStatementType.StmtDelete
+        ElseIf Left$(us, 13) = "CREATE TABLE " Then
+            stmt.StatementType = SqlStatementType.StmtCreateTable
+        ElseIf Left$(us, 11) = "DROP TABLE " Then
+            stmt.StatementType = SqlStatementType.StmtDropTable
+            stmt.TableName = CleanColName(Mid$(s, 12))
+        ElseIf Left$(us, 12) = "ALTER TABLE " Then
+            stmt.StatementType = SqlStatementType.StmtAlterTable
+            ParseAlterTableClauses s, stmt
+        ElseIf Left$(us, 13) = "CREATE INDEX " Or Left$(us, 20) = "CREATE UNIQUE INDEX " Then
+            stmt.StatementType = SqlStatementType.StmtCreateIndex
+            ParseCreateIndexClauses s, stmt
+        ElseIf Left$(us, 11) = "DROP INDEX " Then
+            stmt.StatementType = SqlStatementType.StmtDropIndex
+            ParseDropIndexClauses s, stmt
+        End If
+
+        ParseSql = stmt
+    End Function
+
+    Private Sub ParseSelectClauses(ByVal sIn As String, ByRef stmt As SqlStatement)
+        Dim s As String
+        s = sIn
+
+        Dim obPos As Long
+        obPos = FindSqlClauseKeyword(s, "ORDER BY")
+        If obPos > 0 Then
+            stmt.OrderByClause = Trim$(Mid$(s, obPos + 8))
+            s = Trim$(Left$(s, obPos - 1))
+        End If
+
+        Dim hvPos As Long
+        hvPos = FindSqlClauseKeyword(s, "HAVING")
+        If hvPos > 0 Then
+            stmt.HavingClause = Trim$(Mid$(s, hvPos + 6))
+            s = Trim$(Left$(s, hvPos - 1))
+        End If
+
+        Dim gbPos As Long
+        gbPos = FindSqlClauseKeyword(s, "GROUP BY")
+        If gbPos > 0 Then
+            stmt.GroupByClause = Trim$(Mid$(s, gbPos + 8))
+            s = Trim$(Left$(s, gbPos - 1))
+        End If
+
+        Dim whPos As Long
+        whPos = FindSqlClauseKeyword(s, "WHERE")
+        If whPos > 0 Then
+            stmt.WhereClause = Trim$(Mid$(s, whPos + 5))
+            s = Trim$(Left$(s, whPos - 1))
+        End If
+
+        Dim fromPos As Long
+        fromPos = FindSqlClauseKeyword(s, "FROM")
+        If fromPos > 0 Then
+            stmt.FromClause = Trim$(Mid$(s, fromPos + 4))
+            s = Trim$(Left$(s, fromPos - 1))
+            If UCase$(Left$(s, 7)) = "SELECT " Then
+                s = Trim$(Mid$(s, 8))
+                If UCase$(Left$(s, 9)) = "DISTINCT " Then
+                    stmt.IsDistinct = True
+                    s = Trim$(Mid$(s, 10))
+                ElseIf UCase$(Left$(s, 12)) = "DISTINCTROW " Then
+                    stmt.IsDistinct = True
+                    s = Trim$(Mid$(s, 13))
+                End If
+                If UCase$(Left$(s, 4)) = "TOP " Then
+                    s = Trim$(Mid$(s, 5))
+                    Dim spTop As Long
+                    spTop = InStr(1, s, " ")
+                    If spTop > 0 Then
+                        stmt.TopCount = Val(Left$(s, spTop - 1))
+                        s = Trim$(Mid$(s, spTop + 1))
+                        If UCase$(Left$(s, 8)) = "PERCENT " Then s = Trim$(Mid$(s, 9))
+                    End If
+                End If
+            End If
+            stmt.SelectClause = s
+        Else
+            If UCase$(Left$(s, 7)) = "SELECT " Then
+                stmt.SelectClause = Trim$(Mid$(s, 8))
+            Else
+                stmt.FromClause = s
+            End If
+        End If
+
+        stmt.TableName = CleanColName(stmt.FromClause)
+    End Sub
+
+    Private Sub ParseAlterTableClauses(ByVal sIn As String, ByRef stmt As SqlStatement)
+        Dim rest As String
+        rest = Trim$(Mid$(sIn, 13))
+        Dim sp As Long
+        sp = InStr(1, rest, " ")
+        If sp <= 0 Then Exit Sub
+        stmt.TableName = CleanColName(Left$(rest, sp - 1))
+        Dim actionPart As String
+        actionPart = Trim$(Mid$(rest, sp + 1))
+
+        Dim uAct As String
+        uAct = UCase$(actionPart)
+        If Left$(uAct, 4) = "ADD " Then
+            stmt.AlterAction = "ADD"
+            Dim subPart As String
+            subPart = Trim$(Mid$(actionPart, 5))
+            If UCase$(Left$(subPart, 7)) = "COLUMN " Then subPart = Trim$(Mid$(subPart, 8))
+            Dim spCol As Long
+            spCol = InStr(1, subPart, " ")
+            If spCol > 0 Then
+                stmt.AlterColName = CleanColName(Left$(subPart, spCol - 1))
+                stmt.AlterColType = Trim$(Mid$(subPart, spCol + 1))
+            Else
+                stmt.AlterColName = CleanColName(subPart)
+                stmt.AlterColType = "TEXT(255)"
+            End If
+        ElseIf Left$(uAct, 5) = "DROP " Then
+            stmt.AlterAction = "DROP"
+            Dim dropPart As String
+            dropPart = Trim$(Mid$(actionPart, 6))
+            If UCase$(Left$(dropPart, 7)) = "COLUMN " Then dropPart = Trim$(Mid$(dropPart, 8))
+            stmt.AlterColName = CleanColName(dropPart)
+        ElseIf Left$(uAct, 6) = "ALTER " Then
+            stmt.AlterAction = "ALTER"
+            Dim altPart As String
+            altPart = Trim$(Mid$(actionPart, 7))
+            If UCase$(Left$(altPart, 7)) = "COLUMN " Then altPart = Trim$(Mid$(altPart, 8))
+            Dim spAlt As Long
+            spAlt = InStr(1, altPart, " ")
+            If spAlt > 0 Then
+                stmt.AlterColName = CleanColName(Left$(altPart, spAlt - 1))
+                stmt.AlterColType = Trim$(Mid$(altPart, spAlt + 1))
+            Else
+                stmt.AlterColName = CleanColName(altPart)
+            End If
+        End If
+    End Sub
+
+    Private Sub ParseCreateIndexClauses(ByVal sIn As String, ByRef stmt As SqlStatement)
+        Dim isUnique As Boolean
+        isUnique = (InStr(1, UCase$(Left$(sIn, 22)), " UNIQUE ") > 0)
+        stmt.IsUniqueIndex = isUnique
+
+        Dim rest As String
+        If isUnique Then
+            rest = Trim$(Mid$(sIn, 21))
+        Else
+            rest = Trim$(Mid$(sIn, 14))
+        End If
+
+        Dim onPos As Long
+        onPos = InStr(1, rest, " ON ", vbTextCompare)
+        If onPos <= 0 Then Exit Sub
+
+        stmt.IndexName = CleanColName(Left$(rest, onPos - 1))
+        Dim afterOn As String
+        afterOn = Trim$(Mid$(rest, onPos + 4))
+
+        Dim pOpen As Long, pClose As Long
+        pOpen = InStr(1, afterOn, "(")
+        pClose = InStrRev(afterOn, ")")
+        If pOpen > 0 And pClose > pOpen Then
+            stmt.TableName = CleanColName(Left$(afterOn, pOpen - 1))
+            stmt.IndexColumns = Trim$(Mid$(afterOn, pOpen + 1, pClose - pOpen - 1))
+        Else
+            stmt.TableName = CleanColName(afterOn)
+        End If
+    End Sub
+
+    Private Sub ParseDropIndexClauses(ByVal sIn As String, ByRef stmt As SqlStatement)
+        Dim rest As String
+        rest = Trim$(Mid$(sIn, 12))
+        Dim onPos As Long
+        onPos = InStr(1, rest, " ON ", vbTextCompare)
+        If onPos > 0 Then
+            stmt.IndexName = CleanColName(Left$(rest, onPos - 1))
+            stmt.TableName = CleanColName(Mid$(rest, onPos + 4))
+        Else
+            stmt.IndexName = CleanColName(rest)
+        End If
+    End Sub
+
+    Public Function CleanColName(ByVal s As String) As String
+        Dim res As String
+        res = Trim$(s)
+        res = Replace$(Replace$(res, "[", ""), "]", "")
+        Dim dotPos As Long
+        dotPos = InStrRev(res, ".")
+        If dotPos > 0 Then res = Mid$(res, dotPos + 1)
+        CleanColName = Trim$(res)
+    End Function
+
+    Public Function ParseSelect(ByVal sql As String) As SqlSelectQuery
+        Dim q As SqlSelectQuery
+        Dim tokens() As SqlToken
+        Dim totalTokens As Long
+        totalTokens = TokenizeInto(sql, tokens)
+
+        Dim idx As Long
+        idx = 0
+        Dim tok As SqlToken
+        tok = tokens(idx)
+
+        If tok.Value <> "SELECT" Then
+            Err.Raise vbObjectError + 3100, "SqlParser.ParseSelect", "Expected SELECT statement."
+        End If
+        idx = idx + 1
+
+        tok = tokens(idx)
+        If tok.Value = "*" Then
+            q.IsSelectAll = True
+            idx = idx + 1
+        Else
+            q.IsSelectAll = False
+            Dim itemCount As Long
+            itemCount = 0
+
+            Do While idx < totalTokens
+                tok = tokens(idx)
+                If tok.Value = "FROM" Or tok.TokenType = SqlTokenType.SqlTokEOF Then Exit Do
+
+                Dim item As SqlSelectItem
+                item.IsAggregate = False
+                item.AggregateFunc = ""
+                item.Alias = ""
+
+                If tok.TokenType = SqlTokenType.SqlTokKeyword And (tok.Value = "COUNT" Or tok.Value = "SUM" Or tok.Value = "AVG" Or tok.Value = "MIN" Or tok.Value = "MAX") Then
+                    item.IsAggregate = True
+                    item.AggregateFunc = tok.Value
+                    idx = idx + 2
+                    Dim argTok As SqlToken
+                    argTok = tokens(idx)
+                    item.Expression = argTok.Value
+                    idx = idx + 1
+                Else
+                    item.Expression = tok.Value
+                End If
+
+                idx = idx + 1
+                If idx < totalTokens Then
+                    Dim nextTok As SqlToken
+                    nextTok = tokens(idx)
+                    If nextTok.Value = "AS" Then
+                        idx = idx + 1
+                        Dim aliasTok As SqlToken
+                        aliasTok = tokens(idx)
+                        item.Alias = aliasTok.Value
+                        idx = idx + 1
+                    End If
+                    If idx < totalTokens Then
+                        Dim commaTok As SqlToken
+                        commaTok = tokens(idx)
+                        If commaTok.Value = "," Then
+                            idx = idx + 1
+                        End If
+                    End If
+                End If
+
+                ReDim Preserve q.Items(0 To itemCount)
+                q.Items(itemCount) = item
+                itemCount = itemCount + 1
+            Loop
+            q.ItemCount = itemCount
+        End If
+
+        If idx >= totalTokens Then
+            Err.Raise vbObjectError + 3101, "SqlParser.ParseSelect", "Expected FROM clause."
+        End If
+        tok = tokens(idx)
+        If tok.Value <> "FROM" Then
+            Err.Raise vbObjectError + 3101, "SqlParser.ParseSelect", "Expected FROM clause."
+        End If
+        idx = idx + 1
+
+        tok = tokens(idx)
+        q.TableName = tok.Value
+        idx = idx + 1
+
+        If idx < totalTokens Then
+            tok = tokens(idx)
+            If tok.Value = "WHERE" Then
+                idx = idx + 1
+                tok = tokens(idx)
+                Dim whereStart As Long
+                whereStart = tok.Position
+                Dim obPos As Long
+                obPos = InStr(whereStart, sql, " ORDER BY ", vbTextCompare)
+                If obPos > 0 Then
+                    q.WhereClause = Trim$(Mid$(sql, whereStart, obPos - whereStart))
+                Else
+                    q.WhereClause = Trim$(Mid$(sql, whereStart))
+                    If Right$(q.WhereClause, 1) = ";" Then
+                        q.WhereClause = Left$(q.WhereClause, Len(q.WhereClause) - 1)
+                    End If
+                End If
+            End If
+        End If
+
+        ParseSelect = q
+    End Function
+
+End Module

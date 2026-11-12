@@ -1,0 +1,12 @@
+' File: src/studio/pal/ITextEditor.twin
+' Plan 7 WS7: Platform Abstraction Layer - Text Editor Component Interface
+Option Explicit
+
+Public Interface ITextEditor
+    Sub SetContent(ByVal text As String)
+    Function GetContent() As String
+    Function GetCaretLine() As Long
+    Function GetCaretColumn() As Long
+    Sub SetSelection(ByVal startPos As Long, ByVal length As Long)
+    Sub HighlightRange(ByVal startPos As Long, ByVal length As Long, ByVal colorRgb As Long)
+End Interface

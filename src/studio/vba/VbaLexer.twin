@@ -1,0 +1,511 @@
+' File: src/studio/vba/VbaLexer.twin
+' Plan 7 WS5.2: Complete Visual Basic for Applications (VBA) Lexer
+Option Explicit
+
+[ Description ("High-Performance VBA Lexer and Tokenizer for OpenAccess Studio") ]
+Public Module VbaLexer
+
+    Public Enum VbaTokenType
+        TokNone = 0
+        TokKeyword = 1
+        TokIdentifier = 2
+        TokStringLiteral = 3
+        TokNumberLiteral = 4
+        TokDateLiteral = 5
+        TokOperator = 6
+        TokPunctuation = 7
+        TokComment = 8
+        TokNewLine = 9
+        TokDirective = 10
+        TokBang = 11
+        TokEOF = 12
+    End Enum
+
+    Public Type VbaToken
+        TokenType As VbaTokenType
+        Value As String
+        LineNumber As Long
+        ColumnNumber As Long
+        Length As Long
+    End Type
+
+    ' Tokenize an entire VBA source string into an array of VbaToken structures
+    Public Function Tokenize(ByVal sourceCode As String, ByRef outTokenCount As Long) As VbaToken()
+        Dim tokens() As VbaToken
+        Dim maxTok As Long
+        Dim tokCount As Long
+        Dim srcLen As Long
+        Dim pos As Long
+        Dim curLine As Long
+        Dim curCol As Long
+        Dim ch As String
+        Dim nextCh As String
+        Dim startPos As Long
+        Dim startCol As Long
+        Dim tokText As String
+        Dim tokKind As VbaTokenType
+
+        srcLen = Len(sourceCode)
+        If srcLen = 0 Then
+            outTokenCount = 0
+            ReDim tokens(0 To 0)
+            tokens(0).TokenType = TokEOF
+            tokens(0).LineNumber = 1
+            tokens(0).ColumnNumber = 1
+            Tokenize = tokens
+            Exit Function
+        End If
+
+        maxTok = 1024
+        ReDim tokens(0 To maxTok - 1)
+        tokCount = 0
+        pos = 1
+        curLine = 1
+        curCol = 1
+
+        Do While pos <= srcLen
+            ch = Mid$(sourceCode, pos, 1)
+
+            ' 1. Whitespace: spaces and tabs (ignored except as token separators)
+            If ch = " " Or ch = vbTab Then
+                pos = pos + 1
+                curCol = curCol + 1
+
+            ' 2. Underscore: line continuation or identifier
+            ElseIf ch = "_" Then
+                Dim isLineContAllowed As Boolean
+                isLineContAllowed = False
+                If pos = 1 Then
+                    isLineContAllowed = True
+                ElseIf Mid$(sourceCode, pos - 1, 1) = " " Or Mid$(sourceCode, pos - 1, 1) = vbTab Then
+                    isLineContAllowed = True
+                End If
+
+                If isLineContAllowed Then
+                    ' Check if next non-whitespace on this line is a newline
+                    Dim pAhead As Long
+                    Dim isCont As Boolean
+                    pAhead = pos + 1
+                    isCont = False
+                    Do While pAhead <= srcLen
+                        Dim aheadCh As String
+                        aheadCh = Mid$(sourceCode, pAhead, 1)
+                        If aheadCh = " " Or aheadCh = vbTab Then
+                            pAhead = pAhead + 1
+                        ElseIf aheadCh = vbCr Or aheadCh = vbLf Then
+                            isCont = True
+                            Exit Do
+                        ElseIf aheadCh = "'" Then
+                            ' Comment after line continuation is valid
+                            isCont = True
+                            Exit Do
+                        Else
+                            Exit Do
+                        End If
+                    Loop
+
+                    If isCont Then
+                        ' Skip up to and through the newline
+                        pos = pAhead
+                        If pos <= srcLen Then
+                            If Mid$(sourceCode, pos, 1) = "'" Then
+                                ' Skip comment
+                                Do While pos <= srcLen And Mid$(sourceCode, pos, 1) <> vbCr And Mid$(sourceCode, pos, 1) <> vbLf
+                                    pos = pos + 1
+                                Loop
+                            End If
+                            If pos <= srcLen And Mid$(sourceCode, pos, 1) = vbCr Then pos = pos + 1
+                            If pos <= srcLen And Mid$(sourceCode, pos, 1) = vbLf Then pos = pos + 1
+                        End If
+                        curLine = curLine + 1
+                        curCol = 1
+                    Else
+                        ' Treat as underscore identifier
+                        startPos = pos
+                        startCol = curCol
+                        pos = pos + 1
+                        curCol = curCol + 1
+                        AddToken tokens, tokCount, maxTok, TokIdentifier, "_", curLine, startCol, 1
+                    End If
+                Else
+                    ' Treat as underscore identifier
+                    startPos = pos
+                    startCol = curCol
+                    pos = pos + 1
+                    curCol = curCol + 1
+                    AddToken tokens, tokCount, maxTok, TokIdentifier, "_", curLine, startCol, 1
+                End If
+
+            ' 3. Newline: vbCrLf, vbCr, vbLf, or colon statement separator ':'
+            ElseIf ch = vbCr Or ch = vbLf Then
+                startCol = curCol
+                If ch = vbCr And pos < srcLen Then
+                    If Mid$(sourceCode, pos + 1, 1) = vbLf Then pos = pos + 1
+                End If
+                pos = pos + 1
+                curLine = curLine + 1
+                curCol = 1
+                ' Only emit newline if previous token was not already a newline or BOF
+                If tokCount > 0 Then
+                    If tokens(tokCount - 1).TokenType <> TokNewLine Then
+                        AddToken tokens, tokCount, maxTok, TokNewLine, vbCrLf, curLine - 1, startCol, 1
+                    End If
+                End If
+
+            ' 4. Colon statement separator ':' or named argument assignment ':='
+            ElseIf ch = ":" Then
+                If pos < srcLen Then
+                    If Mid$(sourceCode, pos + 1, 1) = "=" Then
+                        AddToken tokens, tokCount, maxTok, TokPunctuation, ":=", curLine, curCol, 2
+                        pos = pos + 2
+                        curCol = curCol + 2
+                    Else
+                        startCol = curCol
+                        pos = pos + 1
+                        curCol = curCol + 1
+                        If tokCount > 0 Then
+                            If tokens(tokCount - 1).TokenType <> TokNewLine Then
+                                AddToken tokens, tokCount, maxTok, TokNewLine, ":", curLine, startCol, 1
+                            End If
+                        End If
+                    End If
+                Else
+                    startCol = curCol
+                    pos = pos + 1
+                    curCol = curCol + 1
+                    If tokCount > 0 Then
+                        If tokens(tokCount - 1).TokenType <> TokNewLine Then
+                            AddToken tokens, tokCount, maxTok, TokNewLine, ":", curLine, startCol, 1
+                        End If
+                    End If
+                End If
+
+            ' 5. Single-quote Comment: ' ...
+            ElseIf ch = "'" Then
+                startPos = pos
+                startCol = curCol
+                Do While pos <= srcLen And Mid$(sourceCode, pos, 1) <> vbCr And Mid$(sourceCode, pos, 1) <> vbLf
+                    pos = pos + 1
+                    curCol = curCol + 1
+                Loop
+                tokText = Mid$(sourceCode, startPos, pos - startPos)
+                AddToken tokens, tokCount, maxTok, TokComment, tokText, curLine, startCol, Len(tokText)
+
+            ' 6. String Literal: " ... "
+            ElseIf ch = """" Then
+                startPos = pos
+                startCol = curCol
+                pos = pos + 1
+                curCol = curCol + 1
+                Do While pos <= srcLen
+                    If Mid$(sourceCode, pos, 1) = """" Then
+                        If pos < srcLen And Mid$(sourceCode, pos + 1, 1) = """" Then
+                            pos = pos + 2
+                            curCol = curCol + 2
+                        Else
+                            pos = pos + 1
+                            curCol = curCol + 1
+                            Exit Do
+                        End If
+                    ElseIf Mid$(sourceCode, pos, 1) = vbCr Or Mid$(sourceCode, pos, 1) = vbLf Then
+                        If Mid$(sourceCode, pos, 1) = vbCr And pos < srcLen And Mid$(sourceCode, pos + 1, 1) = vbLf Then
+                            pos = pos + 2
+                        Else
+                            pos = pos + 1
+                        End If
+                        curLine = curLine + 1
+                        curCol = 1
+                    Else
+                        pos = pos + 1
+                        curCol = curCol + 1
+                    End If
+                Loop
+                tokText = Mid$(sourceCode, startPos, pos - startPos)
+                AddToken tokens, tokCount, maxTok, TokStringLiteral, tokText, curLine, startCol, Len(tokText)
+
+            ' 7. Date Literal: # ... # or Compiler Directive #If, #Const, #Else, #End
+            ElseIf ch = "#" Then
+                startPos = pos
+                startCol = curCol
+                Dim isDir As Boolean
+                isDir = False
+                If pos < srcLen Then
+                    Dim dirCandidate As String
+                    dirCandidate = UCase$(Mid$(sourceCode, pos + 1, 6))
+                    If Left$(dirCandidate, 2) = "IF" Or Left$(dirCandidate, 6) = "ELSEIF" Or Left$(dirCandidate, 4) = "ELSE" Or Left$(dirCandidate, 3) = "END" Or Left$(dirCandidate, 5) = "CONST" Then
+                        isDir = True
+                    End If
+                End If
+
+                If isDir Then
+                    ' Compiler directive
+                    pos = pos + 1
+                    curCol = curCol + 1
+                    Do While pos <= srcLen And (IsAlphaNumeric(Mid$(sourceCode, pos, 1)) Or Mid$(sourceCode, pos, 1) = " ")
+                        If Mid$(sourceCode, pos, 1) = vbCr Or Mid$(sourceCode, pos, 1) = vbLf Then Exit Do
+                        pos = pos + 1
+                        curCol = curCol + 1
+                    Loop
+                    tokText = Trim$(Mid$(sourceCode, startPos, pos - startPos))
+                    AddToken tokens, tokCount, maxTok, TokDirective, tokText, curLine, startCol, Len(tokText)
+                Else
+                    ' Date / Time literal (e.g. #May 15, 2026#, #12:30:00 PM#)
+                    pos = pos + 1
+                    curCol = curCol + 1
+                    Do While pos <= srcLen And Mid$(sourceCode, pos, 1) <> "#" And Mid$(sourceCode, pos, 1) <> vbCr And Mid$(sourceCode, pos, 1) <> vbLf
+                        pos = pos + 1
+                        curCol = curCol + 1
+                    Loop
+                    If pos <= srcLen And Mid$(sourceCode, pos, 1) = "#" Then
+                        pos = pos + 1
+                        curCol = curCol + 1
+                    End If
+                    tokText = Mid$(sourceCode, startPos, pos - startPos)
+                    AddToken tokens, tokCount, maxTok, TokDateLiteral, tokText, curLine, startCol, Len(tokText)
+                End If
+
+            ' 8. Bracketed Identifier: [ ... ]
+            ElseIf ch = "[" Then
+                startPos = pos
+                startCol = curCol
+                pos = pos + 1
+                curCol = curCol + 1
+                Do While pos <= srcLen And Mid$(sourceCode, pos, 1) <> "]" And Mid$(sourceCode, pos, 1) <> vbCr And Mid$(sourceCode, pos, 1) <> vbLf
+                    pos = pos + 1
+                    curCol = curCol + 1
+                Loop
+                If pos <= srcLen And Mid$(sourceCode, pos, 1) = "]" Then
+                    pos = pos + 1
+                    curCol = curCol + 1
+                End If
+                tokText = Mid$(sourceCode, startPos, pos - startPos)
+                AddToken tokens, tokCount, maxTok, TokIdentifier, tokText, curLine, startCol, Len(tokText)
+
+            ' 9. Bang operator: !
+            ElseIf ch = "!" Then
+                AddToken tokens, tokCount, maxTok, TokBang, "!", curLine, curCol, 1
+                pos = pos + 1
+                curCol = curCol + 1
+
+            ' 10. Number Literal: digits, fractional dot (.5), &H (hex) or &O (octal)
+            ElseIf IsDigit(ch) Or (ch = "." And pos < srcLen And IsDigit(Mid$(sourceCode, pos + 1, 1))) Or (ch = "&" And pos < srcLen And (UCase$(Mid$(sourceCode, pos + 1, 1)) = "H" Or UCase$(Mid$(sourceCode, pos + 1, 1)) = "O")) Then
+                startPos = pos
+                startCol = curCol
+
+                If ch = "&" Then
+                    ' Hex or octal literal
+                    pos = pos + 2
+                    curCol = curCol + 2
+                    Do While pos <= srcLen And (IsHexDigit(Mid$(sourceCode, pos, 1)))
+                        pos = pos + 1
+                        curCol = curCol + 1
+                    Loop
+                    ' Trailing type suffix like & or % or #
+                    If pos <= srcLen And (Mid$(sourceCode, pos, 1) = "&" Or Mid$(sourceCode, pos, 1) = "%") Then
+                        pos = pos + 1
+                        curCol = curCol + 1
+                    End If
+                Else
+                    ' Decimal number or leading dot (.5)
+                    If ch = "." Then
+                        pos = pos + 1
+                        curCol = curCol + 1
+                    End If
+                    Do While pos <= srcLen And IsDigit(Mid$(sourceCode, pos, 1))
+                        pos = pos + 1
+                        curCol = curCol + 1
+                    Loop
+                    ' Check for fractional dot if not already passed
+                    If ch <> "." And pos < srcLen And Mid$(sourceCode, pos, 1) = "." And IsDigit(Mid$(sourceCode, pos + 1, 1)) Then
+                        pos = pos + 2
+                        curCol = curCol + 2
+                        Do While pos <= srcLen And IsDigit(Mid$(sourceCode, pos, 1))
+                            pos = pos + 1
+                            curCol = curCol + 1
+                        Loop
+                    End If
+                    ' Check for exponent E/e or D/d
+                    If pos <= srcLen Then
+                        Dim expCh As String
+                        expCh = UCase$(Mid$(sourceCode, pos, 1))
+                        If expCh = "E" Or expCh = "D" Then
+                            If pos < srcLen Then
+                                Dim afterExp As String
+                                afterExp = Mid$(sourceCode, pos + 1, 1)
+                                If afterExp = "+" Or afterExp = "-" Then
+                                    If pos + 1 < srcLen And IsDigit(Mid$(sourceCode, pos + 2, 1)) Then
+                                        pos = pos + 3
+                                        curCol = curCol + 3
+                                        Do While pos <= srcLen And IsDigit(Mid$(sourceCode, pos, 1))
+                                            pos = pos + 1
+                                            curCol = curCol + 1
+                                        Loop
+                                    End If
+                                ElseIf IsDigit(afterExp) Then
+                                    pos = pos + 2
+                                    curCol = curCol + 2
+                                    Do While pos <= srcLen And IsDigit(Mid$(sourceCode, pos, 1))
+                                        pos = pos + 1
+                                        curCol = curCol + 1
+                                    Loop
+                                End If
+                            End If
+                        End If
+                    End If
+                    ' Type suffix: %, &, !, #, @
+                    If pos <= srcLen Then
+                        Dim sfx As String
+                        sfx = Mid$(sourceCode, pos, 1)
+                        If sfx = "%" Or sfx = "&" Or sfx = "!" Or sfx = "#" Or sfx = "@" Then
+                            pos = pos + 1
+                            curCol = curCol + 1
+                        End If
+                    End If
+                End If
+
+                tokText = Mid$(sourceCode, startPos, pos - startPos)
+                AddToken tokens, tokCount, maxTok, TokNumberLiteral, tokText, curLine, startCol, Len(tokText)
+
+            ' 11. Multi-character Operators: <=, >=, <>, :=
+            ElseIf ch = "<" And pos < srcLen And (Mid$(sourceCode, pos + 1, 1) = "=" Or Mid$(sourceCode, pos + 1, 1) = ">") Then
+                tokText = Mid$(sourceCode, pos, 2)
+                AddToken tokens, tokCount, maxTok, TokOperator, tokText, curLine, curCol, 2
+                pos = pos + 2
+                curCol = curCol + 2
+            ElseIf ch = ">" And pos < srcLen And Mid$(sourceCode, pos + 1, 1) = "=" Then
+                AddToken tokens, tokCount, maxTok, TokOperator, ">=", curLine, curCol, 2
+                pos = pos + 2
+                curCol = curCol + 2
+
+
+            ' 12. Single-character Operators and Punctuation: +, -, *, /, \, ^, &, =, <, >, (, ), ,, ., ;
+            ElseIf InStr("+-*/\^&=<>()[],.;", ch) > 0 Then
+                startCol = curCol
+                pos = pos + 1
+                curCol = curCol + 1
+                If InStr("+-*/\^&=<>", ch) > 0 Then
+                    tokKind = TokOperator
+                Else
+                    tokKind = TokPunctuation
+                End If
+                AddToken tokens, tokCount, maxTok, tokKind, ch, curLine, startCol, 1
+
+            ' 13. Identifiers, Keywords, and Rem Comments
+            ElseIf IsAlpha(ch) Or ch = "_" Then
+                startPos = pos
+                startCol = curCol
+                Do While pos <= srcLen And (IsAlphaNumeric(Mid$(sourceCode, pos, 1)) Or Mid$(sourceCode, pos, 1) = "_")
+                    pos = pos + 1
+                    curCol = curCol + 1
+                Loop
+                ' Check type suffix: %, &, !, #, $, @
+                If pos <= srcLen Then
+                    Dim idSfx As String
+                    idSfx = Mid$(sourceCode, pos, 1)
+                    If idSfx = "%" Or idSfx = "&" Or idSfx = "#" Or idSfx = "$" Or idSfx = "@" Then
+                        pos = pos + 1
+                        curCol = curCol + 1
+                    ElseIf idSfx = "!" Then
+                        ' Look ahead past any whitespace: if next token is identifier or bracket, it's BANG ACCESS!
+                        Dim pBangAhead As Long
+                        pBangAhead = pos + 1
+                        Do While pBangAhead <= srcLen And (Mid$(sourceCode, pBangAhead, 1) = " " Or Mid$(sourceCode, pBangAhead, 1) = vbTab)
+                            pBangAhead = pBangAhead + 1
+                        Loop
+                        If pBangAhead <= srcLen And (IsAlpha(Mid$(sourceCode, pBangAhead, 1)) Or Mid$(sourceCode, pBangAhead, 1) = "[" Or Mid$(sourceCode, pBangAhead, 1) = "_") Then
+                            ' Bang access: do NOT consume ! as type suffix
+                        Else
+                            pos = pos + 1
+                            curCol = curCol + 1
+                        End If
+                    End If
+                End If
+
+                tokText = Mid$(sourceCode, startPos, pos - startPos)
+
+                ' Check for Rem comment
+                If UCase$(tokText) = "REM" Then
+                    Do While pos <= srcLen And Mid$(sourceCode, pos, 1) <> vbCr And Mid$(sourceCode, pos, 1) <> vbLf
+                        pos = pos + 1
+                        curCol = curCol + 1
+                    Loop
+                    tokText = Mid$(sourceCode, startPos, pos - startPos)
+                    AddToken tokens, tokCount, maxTok, TokComment, tokText, curLine, startCol, Len(tokText)
+                ElseIf IsVbaKeyword(tokText) Then
+                    AddToken tokens, tokCount, maxTok, TokKeyword, tokText, curLine, startCol, Len(tokText)
+                Else
+                    AddToken tokens, tokCount, maxTok, TokIdentifier, tokText, curLine, startCol, Len(tokText)
+                End If
+
+            Else
+                ' Unknown character, record as punctuation
+                AddToken tokens, tokCount, maxTok, TokPunctuation, ch, curLine, curCol, 1
+                pos = pos + 1
+                curCol = curCol + 1
+            End If
+        Loop
+
+        ' Emit EOF token
+        AddToken tokens, tokCount, maxTok, TokEOF, vbNullString, curLine, curCol, 0
+        outTokenCount = tokCount
+        ReDim Preserve tokens(0 To tokCount - 1)
+        Tokenize = tokens
+    End Function
+
+    Private Sub AddToken(ByRef tokens() As VbaToken, ByRef tokCount As Long, ByRef maxTok As Long, ByVal tType As VbaTokenType, ByVal valStr As String, ByVal lineNo As Long, ByVal colNo As Long, ByVal length As Long)
+        If tokCount >= maxTok Then
+            maxTok = maxTok * 2
+            ReDim Preserve tokens(0 To maxTok - 1)
+        End If
+        tokens(tokCount).TokenType = tType
+        tokens(tokCount).Value = valStr
+        tokens(tokCount).LineNumber = lineNo
+        tokens(tokCount).ColumnNumber = colNo
+        tokens(tokCount).Length = length
+        tokCount = tokCount + 1
+    End Sub
+
+    Private Function IsAlpha(ByVal c As String) As Boolean
+        Dim a As Integer
+        If Len(c) = 0 Then Exit Function
+        a = Asc(c)
+        IsAlpha = (a >= 65 And a <= 90) Or (a >= 97 And a <= 122)
+    End Function
+
+    Private Function IsDigit(ByVal c As String) As Boolean
+        Dim a As Integer
+        If Len(c) = 0 Then Exit Function
+        a = Asc(c)
+        IsDigit = (a >= 48 And a <= 57)
+    End Function
+
+    Private Function IsHexDigit(ByVal c As String) As Boolean
+        Dim a As Integer
+        If Len(c) = 0 Then Exit Function
+        a = Asc(c)
+        IsHexDigit = (a >= 48 And a <= 57) Or (a >= 65 And a <= 70) Or (a >= 97 And a <= 102)
+    End Function
+
+    Private Function IsAlphaNumeric(ByVal c As String) As Boolean
+        IsAlphaNumeric = IsAlpha(c) Or IsDigit(c)
+    End Function
+
+    Public Function IsVbaKeyword(ByVal word As String) As Boolean
+        Select Case UCase$(Trim$(word))
+            Case "AND", "AS", "BYREF", "BYVAL", "CALL", "CASE", "CONST", _
+                 "DATABASE", "DIM", "DO", "EACH", "ELSE", "ELSEIF", "EMPTY", "END", _
+                 "ENUM", "EQV", "ERROR", "EXIT", "EXPLICIT", "FALSE", "FOR", _
+                 "FUNCTION", "GET", "GLOBAL", "GOSUB", "GOTO", "IF", "IMP", "IN", _
+                 "IS", "LET", "LIKE", "LOCAL", "LOOP", "LSET", "ME", "MOD", "NEW", _
+                 "NEXT", "NOT", "NOTHING", "NULL", "ON", "OPTION", "OPTIONAL", "OR", _
+                 "PARAMARRAY", "PRESERVE", "PRIVATE", "PROPERTY", "PUBLIC", "RAISEEVENT", _
+                 "REDIM", "REM", "RESUME", "RETURN", "RSET", "SELECT", "SET", "STATIC", _
+                 "STEP", "STOP", "SUB", "TEXT", "THEN", "TIME", "TO", "TRUE", "TYPE", _
+                 "UNTIL", "WEND", "WHILE", "WITH", "WITHEVENTS", "XOR"
+                IsVbaKeyword = True
+            Case Else
+                IsVbaKeyword = False
+        End Select
+    End Function
+
+End Module

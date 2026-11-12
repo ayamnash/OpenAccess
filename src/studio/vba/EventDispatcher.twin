@@ -1,0 +1,136 @@
+' File: src/studio/vba/EventDispatcher.twin
+' Plan 7 WS5.6 & WS5.8: Form & Control Event Dispatcher & Macro Binding
+Option Explicit
+
+Public Module EventDispatcher
+
+    Private m_eventDepth As Long
+
+    Public Function DispatchFormEvent(ByVal formObj As AccessForm, ByVal eventName As String, Optional ByRef outCancel As Boolean = False) As Boolean
+        If formObj Is Nothing Then Exit Function
+        outCancel = False
+
+        ' Prevent recursive event storm
+        If m_eventDepth > 10 Then Exit Function
+        m_eventDepth = m_eventDepth + 1
+
+        On Error GoTo Cleanup
+        Dim procName As String
+        procName = "Form_" & eventName
+
+        Dim modName As String
+        modName = "Form_" & formObj.Name
+
+        Dim procCode As String
+        procCode = VbaProjectStore.GetModuleCode(modName, procName)
+
+        If Len(procCode) > 0 Then
+            VbaInterpreter.InitializeInterpreter
+            VbaInterpreter.SetVariable "Cancel", False
+            VbaInterpreter.ExecuteProcedure procCode, formObj, procName
+
+            Dim cancelVar As Variant
+            cancelVar = VbaInterpreter.GetVariable("Cancel")
+            If Not IsEmpty(cancelVar) And Not IsNull(cancelVar) Then
+                outCancel = CBool(cancelVar)
+            End If
+            DispatchFormEvent = True
+        Else
+            ' Check for attached Macro (WS5.8)
+            Dim db As Object
+            Set db = AccessObjectModel.CurrentDb()
+            If MacroRunner.ExecuteMacro(db, modName & "." & eventName) Then
+                DispatchFormEvent = True
+            ElseIf MacroRunner.ExecuteMacro(db, formObj.Name & "_" & eventName) Then
+                DispatchFormEvent = True
+            Else
+                DispatchFormEvent = False
+            End If
+        End If
+
+Cleanup:
+        m_eventDepth = m_eventDepth - 1
+        On Error GoTo 0
+    End Function
+
+    Public Function DispatchControlEvent(ByVal formObj As AccessForm, ByVal ctlName As String, ByVal eventName As String, Optional ByRef outCancel As Boolean = False) As Boolean
+        If formObj Is Nothing Then Exit Function
+        outCancel = False
+
+        If m_eventDepth > 10 Then Exit Function
+        m_eventDepth = m_eventDepth + 1
+
+        On Error GoTo Cleanup
+        Dim procName As String
+        procName = ctlName & "_" & eventName
+
+        Dim modName As String
+        modName = "Form_" & formObj.Name
+
+        Dim procCode As String
+        procCode = VbaProjectStore.GetModuleCode(modName, procName)
+
+        If Len(procCode) > 0 Then
+            VbaInterpreter.InitializeInterpreter
+            VbaInterpreter.SetVariable "Cancel", False
+            VbaInterpreter.ExecuteProcedure procCode, formObj, procName
+
+            Dim cancelVar As Variant
+            cancelVar = VbaInterpreter.GetVariable("Cancel")
+            If Not IsEmpty(cancelVar) And Not IsNull(cancelVar) Then
+                outCancel = CBool(cancelVar)
+            End If
+            DispatchControlEvent = True
+        Else
+            ' Check for attached Macro (WS5.8)
+            Dim db As Object
+            Set db = AccessObjectModel.CurrentDb()
+            If MacroRunner.ExecuteMacro(db, procName) Then
+                DispatchControlEvent = True
+            ElseIf MacroRunner.ExecuteMacro(db, formObj.Name & "." & procName) Then
+                DispatchControlEvent = True
+            Else
+                DispatchControlEvent = False
+            End If
+        End If
+
+Cleanup:
+        m_eventDepth = m_eventDepth - 1
+        On Error GoTo 0
+    End Function
+
+    Public Function ExecuteMacroAction(ByVal actionName As String, ByVal argumentText As String, Optional ByVal formObj As AccessForm = Nothing) As Boolean
+        On Error Resume Next
+        Dim db As Object
+        Set db = AccessObjectModel.CurrentDb()
+
+        Select Case UCase$(Trim$(actionName))
+            Case "MACRO", "RUNMACRO"
+                ExecuteMacroAction = MacroRunner.ExecuteMacro(db, argumentText)
+                Exit Function
+            Case "OPENFORM"
+                AccessObjectModel.DoCmd.OpenForm argumentText
+            Case "CLOSE"
+                AccessObjectModel.DoCmd.Close , argumentText
+            Case "OPENQUERY"
+                AccessObjectModel.DoCmd.OpenQuery argumentText
+            Case "RUNSQL"
+                AccessObjectModel.DoCmd.RunSQL argumentText
+            Case "SETWARNINGS"
+                Dim sWarn As String
+                sWarn = Trim$(argumentText)
+                Dim bWarn As Boolean
+                bWarn = (StrComp(sWarn, "True", vbTextCompare) = 0 Or StrComp(sWarn, "Yes", vbTextCompare) = 0 Or StrComp(sWarn, "-1", vbTextCompare) = 0)
+                AccessObjectModel.DoCmd.SetWarnings bWarn
+            Case "REQUERY"
+                If Not formObj Is Nothing Then formObj.Requery
+            Case Else
+                If MacroRunner.ExecuteMacro(db, actionName) Then
+                    ExecuteMacroAction = True
+                    Exit Function
+                End If
+        End Select
+        ExecuteMacroAction = (Err.Number = 0)
+        On Error GoTo 0
+    End Function
+End Module

@@ -1,0 +1,933 @@
+' File: src/storage/PageWriter.twin
+' Bounds-Checked Page Writer and Page-Level Rollback Journal Engine in twinBASIC
+Option Explicit
+
+Module PageWriter
+
+    Private Const PAGE_SIZE_JET4 As Long = 4096
+    Private Const JOURNAL_MAGIC As String = "OAJRNL01"
+    Private Const MAX_JET4_OFFSET As LongLong = 2147483647^
+
+    ' Active Transaction Rollback Journal State
+    Private m_inTrans As Boolean
+    Private m_transDbFileNum As Integer
+    Private m_transDbPath As String
+    Private m_transJournalPath As String
+    Private m_transJournalFileNum As Integer
+    Private m_transInitialPages As Long
+    Private m_transRecordCount As Long
+    Private m_transJournaledPages As Collection
+    Private m_lastError As String
+    Private m_lastRegisteredFileNum As Integer
+    Private m_lastRegisteredDbPath As String
+
+    Private Type OVERLAPPED
+        Internal As LongPtr
+        InternalHigh As LongPtr
+        Offset As Long
+        OffsetHigh As Long
+        hEvent As LongPtr
+    End Type
+
+    Private Const LOCKFILE_FAIL_IMMEDIATELY As Long = 1
+    Private Const LOCKFILE_EXCLUSIVE_LOCK As Long = 2
+
+    #If Win64 Then
+        Private Declare PtrSafe Sub CopyMemory Lib "kernel32" Alias "RtlMoveMemory" (ByVal Destination As LongPtr, ByVal Source As LongPtr, ByVal Length As LongLong)
+        Private Declare PtrSafe Function CreateFileW Lib "kernel32" (ByVal lpFileName As LongPtr, ByVal dwDesiredAccess As Long, ByVal dwShareMode As Long, ByVal lpSecurityAttributes As LongPtr, ByVal dwCreationDisposition As Long, ByVal dwFlagsAndAttributes As Long, ByVal hTemplateFile As LongPtr) As LongPtr
+        Private Declare PtrSafe Function CloseHandle Lib "kernel32" (ByVal hObject As LongPtr) As Long
+        Private Declare PtrSafe Function SetFilePointerEx Lib "kernel32" (ByVal hFile As LongPtr, ByVal liDistanceToMove As LongLong, ByRef lpNewFilePointer As LongLong, ByVal dwMoveMethod As Long) As Long
+        Private Declare PtrSafe Function SetEndOfFile Lib "kernel32" (ByVal hFile As LongPtr) As Long
+        Private Declare PtrSafe Function FlushFileBuffers Lib "kernel32" (ByVal hFile As LongPtr) As Long
+        Private Declare PtrSafe Function LockFileEx Lib "kernel32" (ByVal hFile As LongPtr, ByVal dwFlags As Long, ByVal dwReserved As Long, ByVal nNumberOfBytesToLockLow As Long, ByVal nNumberOfBytesToLockHigh As Long, ByRef lpOverlapped As OVERLAPPED) As Long
+        Private Declare PtrSafe Function UnlockFileEx Lib "kernel32" (ByVal hFile As LongPtr, ByVal dwReserved As Long, ByVal nNumberOfBytesToLockLow As Long, ByVal nNumberOfBytesToLockHigh As Long, ByRef lpOverlapped As OVERLAPPED) As Long
+        Private Declare PtrSafe Function GetModuleFileNameW Lib "kernel32" (ByVal hModule As LongPtr, ByVal lpFilename As LongPtr, ByVal nSize As Long) As Long
+    #Else
+        Private Declare Sub CopyMemory Lib "kernel32" Alias "RtlMoveMemory" (ByVal Destination As LongPtr, ByVal Source As LongPtr, ByVal Length As Long)
+        Private Declare Function CreateFileW Lib "kernel32" (ByVal lpFileName As LongPtr, ByVal dwDesiredAccess As Long, ByVal dwShareMode As Long, ByVal lpSecurityAttributes As LongPtr, ByVal dwCreationDisposition As Long, ByVal dwFlagsAndAttributes As Long, ByVal hTemplateFile As LongPtr) As LongPtr
+        Private Declare Function CloseHandle Lib "kernel32" (ByVal hObject As LongPtr) As Long
+        Private Declare Function SetFilePointerEx Lib "kernel32" (ByVal hFile As LongPtr, ByVal liDistanceToMove As LongLong, ByRef lpNewFilePointer As LongLong, ByVal dwMoveMethod As Long) As Long
+        Private Declare Function SetEndOfFile Lib "kernel32" (ByVal hFile As LongPtr) As Long
+        Private Declare Function FlushFileBuffers Lib "kernel32" (ByVal hFile As LongPtr) As Long
+        Private Declare Function LockFileEx Lib "kernel32" (ByVal hFile As LongPtr, ByVal dwFlags As Long, ByVal dwReserved As Long, ByVal nNumberOfBytesToLockLow As Long, ByVal nNumberOfBytesToLockHigh As Long, ByRef lpOverlapped As OVERLAPPED) As Long
+        Private Declare Function UnlockFileEx Lib "kernel32" (ByVal hFile As LongPtr, ByVal dwReserved As Long, ByVal nNumberOfBytesToLockLow As Long, ByVal nNumberOfBytesToLockHigh As Long, ByRef lpOverlapped As OVERLAPPED) As Long
+        Private Declare Function GetModuleFileNameW Lib "kernel32" (ByVal hModule As LongPtr, ByVal lpFilename As LongPtr, ByVal nSize As Long) As Long
+    #End If
+
+    Public Function TruncateFile(ByVal filePath As String, ByVal newByteLength As LongLong) As Boolean
+        Dim hFile As LongPtr
+        hFile = CreateFileW(StrPtr(filePath), &H80000000 Or &H40000000, 1 Or 2 Or 4, 0, 3, &H80, 0)
+        If hFile = 0 Or hFile = -1 Then Exit Function
+
+        Dim newPos As LongLong
+        If SetFilePointerEx(hFile, newByteLength, newPos, 0) <> 0 Then
+            If SetEndOfFile(hFile) <> 0 Then
+                FlushFileBuffers hFile
+                TruncateFile = True
+            End If
+        End If
+        CloseHandle hFile
+    End Function
+
+    Public Sub FlushFileToDisk(ByVal filePath As String)
+        Dim hFile As LongPtr
+        If Len(Trim$(filePath)) = 0 Then Exit Sub
+        hFile = CreateFileW(StrPtr(filePath), &H80000000 Or &H40000000, 1 Or 2 Or 4, 0, 3, &H80, 0)
+        If hFile <> 0 And hFile <> -1 Then
+            FlushFileBuffers hFile
+            CloseHandle hFile
+        End If
+    End Sub
+
+    Public Function IsFileLockedByAnotherProcess(ByVal filePath As String) As Boolean
+        Dim h As LongPtr
+        Dim code As Long
+
+        If Len(Trim$(filePath)) = 0 Then Exit Function
+        If Len(Dir$(filePath)) = 0 Then Exit Function
+
+        h = CreateFileW(StrPtr(filePath), &H80000000 Or &H40000000, 0, 0, 3, &H80, 0)
+        If h = -1 Or h = 0 Then
+            code = Err.LastDllError
+            IsFileLockedByAnotherProcess = (code = 32 Or code = 33)
+        Else
+            CloseHandle h
+            IsFileLockedByAnotherProcess = False
+        End If
+    End Function
+
+    Public Function IsAccessLockFileActive(ByVal dbPath As String) As Boolean
+        Dim dotPos As Long
+        Dim ext As String
+        Dim basePath As String
+        Dim lockPath1 As String
+        Dim lockPath2 As String
+
+        If Len(Trim$(dbPath)) = 0 Then Exit Function
+        dotPos = InStrRev(dbPath, ".")
+        If dotPos > 0 Then
+            basePath = Left$(dbPath, dotPos - 1)
+            ext = LCase$(Mid$(dbPath, dotPos))
+        Else
+            basePath = dbPath
+            ext = ""
+        End If
+
+        lockPath1 = basePath & ".laccdb"
+        lockPath2 = basePath & ".ldb"
+
+        If IsFileLockedByAnotherProcess(lockPath1) Or IsFileLockedByAnotherProcess(lockPath2) Then
+            IsAccessLockFileActive = True
+        Else
+            IsAccessLockFileActive = False
+        End If
+    End Function
+
+    Public Function LockPageRange(ByVal filePath As String, ByVal startPage As Long, ByVal pageCount As Long, Optional ByVal exclusive As Boolean = True) As LongPtr
+        Dim hFile As LongPtr
+        hFile = CreateFileW(StrPtr(filePath), &H80000000 Or &H40000000, 1 Or 2 Or 4, 0, 3, &H80, 0)
+        If hFile = 0 Or hFile = -1 Then Exit Function
+
+        Dim ov As OVERLAPPED
+        Dim startOffset As LongLong
+        startOffset = CLngLng(startPage) * CLngLng(PAGE_SIZE_JET4)
+        ov.Offset = CLng(startOffset And &HFFFFFFFF^)
+        ov.OffsetHigh = CLng((startOffset \ &H100000000^) And &HFFFFFFFF^)
+
+        Dim totalBytes As LongLong
+        totalBytes = CLngLng(pageCount) * CLngLng(PAGE_SIZE_JET4)
+        Dim lowBytes As Long, highBytes As Long
+        lowBytes = CLng(totalBytes And &HFFFFFFFF^)
+        highBytes = CLng((totalBytes \ &H100000000^) And &HFFFFFFFF^)
+
+        Dim flags As Long
+        flags = LOCKFILE_FAIL_IMMEDIATELY
+        If exclusive Then flags = flags Or LOCKFILE_EXCLUSIVE_LOCK
+
+        If LockFileEx(hFile, flags, 0, lowBytes, highBytes, ov) <> 0 Then
+            LockPageRange = hFile
+        Else
+            CloseHandle hFile
+            LockPageRange = 0
+        End If
+    End Function
+
+    Public Function UnlockPageRange(ByVal hFile As LongPtr, ByVal startPage As Long, ByVal pageCount As Long) As Boolean
+        If hFile = 0 Or hFile = -1 Then Exit Function
+
+        Dim ov As OVERLAPPED
+        Dim startOffset As LongLong
+        startOffset = CLngLng(startPage) * CLngLng(PAGE_SIZE_JET4)
+        ov.Offset = CLng(startOffset And &HFFFFFFFF^)
+        ov.OffsetHigh = CLng((startOffset \ &H100000000^) And &HFFFFFFFF^)
+
+        Dim totalBytes As LongLong
+        totalBytes = CLngLng(pageCount) * CLngLng(PAGE_SIZE_JET4)
+        Dim lowBytes As Long, highBytes As Long
+        lowBytes = CLng(totalBytes And &HFFFFFFFF^)
+        highBytes = CLng((totalBytes \ &H100000000^) And &HFFFFFFFF^)
+
+        Dim res As Long
+        res = UnlockFileEx(hFile, 0, lowBytes, highBytes, ov)
+        CloseHandle hFile
+        UnlockPageRange = (res <> 0)
+    End Function
+
+    Public Property Get IsInTransaction(Optional ByVal dbFileNum As Integer = 0) As Boolean
+        If dbFileNum = 0 Then
+            IsInTransaction = m_inTrans
+        Else
+            IsInTransaction = (m_inTrans And m_transDbFileNum = dbFileNum)
+        End If
+    End Property
+
+    Public Sub RegisterDatabaseHandle(ByVal fileNum As Integer, ByVal dbPath As String)
+        If fileNum > 0 And Len(Trim$(dbPath)) > 0 Then
+            m_lastRegisteredFileNum = fileNum
+            m_lastRegisteredDbPath = dbPath
+        ElseIf fileNum = 0 Then
+            m_lastRegisteredFileNum = 0
+            m_lastRegisteredDbPath = vbNullString
+        End If
+    End Sub
+
+    Public Function BeginAutoTransaction(ByVal fileNum As Integer, ByVal currentTotalPages As Long) As Boolean
+        BeginAutoTransaction = False
+        If m_inTrans Then Exit Function
+        If fileNum <= 0 Or currentTotalPages <= 0 Then Exit Function
+        If fileNum <> m_lastRegisteredFileNum Or Len(Trim$(m_lastRegisteredDbPath)) = 0 Then Exit Function
+
+        On Error Resume Next
+        BeginTransaction fileNum, m_lastRegisteredDbPath, currentTotalPages
+        If Err.Number = 0 And m_inTrans Then
+            BeginAutoTransaction = True
+        End If
+        Err.Clear
+        On Error GoTo 0
+    End Function
+
+    Public Sub BeginTransaction(ByVal dbFileNum As Integer, ByVal dbPath As String, ByVal currentTotalPages As Long)
+        Dim hdr(0 To 15) As Byte
+        Dim i As Long
+
+        If m_inTrans Then
+            Err.Raise vbObjectError + 3034, "PageWriter.BeginTransaction", "A transaction is already active."
+        End If
+        If dbFileNum <= 0 Or Len(Trim$(dbPath)) = 0 Then
+            Err.Raise vbObjectError + 3034, "PageWriter.BeginTransaction", "Invalid database file handle for transaction."
+        End If
+
+        m_transJournalPath = dbPath & ".journal"
+        If Len(Dir$(m_transJournalPath)) > 0 Then
+            Kill m_transJournalPath
+        End If
+
+        m_transJournalFileNum = FreeFile()
+        Open m_transJournalPath For Binary Access Read Write Lock Read Write As #m_transJournalFileNum
+
+        For i = 1 To 8
+            hdr(i - 1) = CByte(Asc(Mid$(JOURNAL_MAGIC, i, 1)))
+        Next i
+        WriteInt32LE hdr, 8, currentTotalPages
+        WriteInt32LE hdr, 12, 0
+        Put #m_transJournalFileNum, 1&, hdr
+
+        m_transDbFileNum = dbFileNum
+        m_transDbPath = dbPath
+        m_transInitialPages = currentTotalPages
+        m_transRecordCount = 0
+        Set m_transJournaledPages = New Collection
+        m_inTrans = True
+    End Sub
+
+    Private Sub JournalPageBeforeWrite(ByVal fileNum As Integer, ByVal pageNumber As Long, ByVal pageSize As Long)
+        Dim key As String
+        Dim exists As Boolean
+        Dim dummy As Long
+        Dim origBuf(0 To 4095) As Byte
+        Dim dbOffset As LongLong
+        Dim entryOffset As Long
+        Dim pgHdr(0 To 3) As Byte
+        Dim cntBytes(0 To 3) As Byte
+
+        If Not m_inTrans Then Exit Sub
+        If fileNum <> m_transDbFileNum Then Exit Sub
+        If pageNumber < 0 Or pageNumber >= m_transInitialPages Then Exit Sub
+
+        key = "P_" & CStr(pageNumber)
+        exists = False
+        On Error Resume Next
+        dummy = CLng(m_transJournaledPages(key))
+        If Err.Number = 0 Then exists = True
+        Err.Clear
+        On Error GoTo 0
+        If exists Then Exit Sub
+
+        ' Read original before-image of page from database file
+        dbOffset = (CLngLng(pageNumber) * CLngLng(PAGE_SIZE_JET4)) + 1^
+        Get #fileNum, CLng(dbOffset), origBuf
+
+        ' Append (pageNumber: 4 bytes, beforeImage: 4096 bytes) to journal file
+        entryOffset = 17& + (m_transRecordCount * (4& + pageSize))
+        WriteInt32LE pgHdr, 0, pageNumber
+        Put #m_transJournalFileNum, entryOffset, pgHdr
+        Put #m_transJournalFileNum, entryOffset + 4&, origBuf
+
+        m_transRecordCount = m_transRecordCount + 1
+        WriteInt32LE cntBytes, 0, m_transRecordCount
+        Put #m_transJournalFileNum, 13&, cntBytes
+
+        If Len(m_transJournalPath) > 0 Then
+            FlushFileToDisk m_transJournalPath
+        End If
+
+        m_transJournaledPages.Add pageNumber, key
+    End Sub
+
+    Public Sub CommitTransaction()
+        Dim hCommitLock As LongPtr
+        Dim lockPages As Long
+
+        If Not m_inTrans Then
+            Err.Raise vbObjectError + 3034, "PageWriter.CommitTransaction", "Cannot CommitTrans without an active transaction."
+        End If
+
+        lockPages = m_transInitialPages
+        If Len(m_transDbPath) > 0 And lockPages > 0 Then
+            hCommitLock = LockPageRange(m_transDbPath, 0, lockPages, True)
+        End If
+
+        If Len(m_transDbPath) > 0 Then
+            FlushFileToDisk m_transDbPath
+        End If
+
+        If m_transJournalFileNum > 0 Then
+            Close #m_transJournalFileNum
+            m_transJournalFileNum = 0
+        End If
+        If Len(m_transJournalPath) > 0 Then
+            If Len(Dir$(m_transJournalPath)) > 0 Then
+                Kill m_transJournalPath
+            End If
+        End If
+
+        m_inTrans = False
+        m_transDbFileNum = 0
+        m_transDbPath = vbNullString
+        m_transJournalPath = vbNullString
+        m_transInitialPages = 0
+        m_transRecordCount = 0
+        Set m_transJournaledPages = Nothing
+
+        If hCommitLock <> 0 Then
+            UnlockPageRange hCommitLock, 0, lockPages
+        End If
+    End Sub
+
+    Public Sub RollbackTransaction(ByRef outRestoredTotalPages As Long)
+        Dim i As Long
+        Dim pgHdr(0 To 3) As Byte
+        Dim origBuf(0 To 4095) As Byte
+        Dim entryOffset As Long
+        Dim pageNum As Long
+        Dim dbOffset As LongLong
+        Dim targetBytes As LongLong
+
+        If Not m_inTrans Then
+            Err.Raise vbObjectError + 3034, "PageWriter.RollbackTransaction", "Cannot Rollback without an active transaction."
+        End If
+
+        For i = 0 To m_transRecordCount - 1
+            entryOffset = 17& + (i * (4& + PAGE_SIZE_JET4))
+            Get #m_transJournalFileNum, entryOffset, pgHdr
+            pageNum = FormatProbe.ReadInt32LE(pgHdr, 0)
+            Get #m_transJournalFileNum, entryOffset + 4&, origBuf
+
+            If pageNum >= 0 And pageNum < m_transInitialPages Then
+                dbOffset = (CLngLng(pageNum) * CLngLng(PAGE_SIZE_JET4)) + 1^
+                Put #m_transDbFileNum, CLng(dbOffset), origBuf
+            End If
+        Next i
+
+        outRestoredTotalPages = m_transInitialPages
+
+        If m_transInitialPages > 0 And Len(m_transDbPath) > 0 Then
+            targetBytes = CLngLng(m_transInitialPages) * CLngLng(PAGE_SIZE_JET4)
+            TruncateFile m_transDbPath, targetBytes
+        End If
+
+        If m_transJournalFileNum > 0 Then
+            Close #m_transJournalFileNum
+            m_transJournalFileNum = 0
+        End If
+        If Len(m_transJournalPath) > 0 Then
+            If Len(Dir$(m_transJournalPath)) > 0 Then
+                Kill m_transJournalPath
+            End If
+        End If
+
+        m_inTrans = False
+        m_transDbFileNum = 0
+        m_transDbPath = vbNullString
+        m_transJournalPath = vbNullString
+        m_transInitialPages = 0
+        m_transRecordCount = 0
+        Set m_transJournaledPages = Nothing
+
+        CatalogReader.InvalidatePageDirectory
+        CatalogReader.DropFilePageCache 0
+    End Sub
+
+    Public Sub RecoverHotJournalIfPresent(ByVal dbPath As String)
+        Dim jPath As String
+        Dim jFile As Integer
+        Dim dbFile As Integer
+        Dim hdr(0 To 15) As Byte
+        Dim magic As String
+        Dim initPages As Long
+        Dim recCount As Long
+        Dim i As Long
+        Dim pgHdr(0 To 3) As Byte
+        Dim origBuf(0 To 4095) As Byte
+        Dim entryOffset As Long
+        Dim pageNum As Long
+        Dim dbOffset As LongLong
+        Dim recTargetBytes As LongLong
+        Dim jTime As Date
+        Dim dbTime As Date
+
+        If Len(Trim$(dbPath)) = 0 Then Exit Sub
+        jPath = dbPath & ".journal"
+        If Len(Dir$(jPath)) = 0 Then Exit Sub
+        If Len(Dir$(dbPath)) = 0 Then Exit Sub
+
+        If m_inTrans And StrComp(m_transDbPath, dbPath, vbTextCompare) = 0 Then
+            Exit Sub
+        End If
+
+        On Error Resume Next
+        jFile = FreeFile()
+        Open jPath For Binary Access Read Write Lock Read Write As #jFile
+        If Err.Number <> 0 Then
+            Err.Clear
+            On Error GoTo 0
+            Exit Sub
+        End If
+
+        jTime = FileDateTime(jPath)
+        dbTime = FileDateTime(dbPath)
+        If Err.Number = 0 Then
+            If DateDiff("s", jTime, dbTime) > 2 Then
+                Close #jFile
+                jFile = 0
+                Kill jPath
+                On Error GoTo 0
+                Exit Sub
+            End If
+        End If
+        Err.Clear
+        On Error GoTo CleanUp
+
+        If LOF(jFile) < 16 Then
+            Close #jFile
+            jFile = 0
+            Kill jPath
+            Exit Sub
+        End If
+
+        Get #jFile, 1&, hdr
+        magic = FormatProbe.ExtractAsciiZ(hdr, 0, 8)
+        If magic <> JOURNAL_MAGIC Then
+            Close #jFile
+            jFile = 0
+            Exit Sub
+        End If
+
+        initPages = FormatProbe.ReadInt32LE(hdr, 8)
+        recCount = FormatProbe.ReadInt32LE(hdr, 12)
+
+        dbFile = FreeFile()
+        Open dbPath For Binary Access Read Write Shared As #dbFile
+
+        For i = 0 To recCount - 1
+            entryOffset = 17& + (i * (4& + PAGE_SIZE_JET4))
+            If entryOffset + 4& + PAGE_SIZE_JET4 - 1& <= LOF(jFile) Then
+                Get #jFile, entryOffset, pgHdr
+                pageNum = FormatProbe.ReadInt32LE(pgHdr, 0)
+                Get #jFile, entryOffset + 4&, origBuf
+                If pageNum >= 0 And pageNum < initPages Then
+                    dbOffset = (CLngLng(pageNum) * CLngLng(PAGE_SIZE_JET4)) + 1^
+                    Put #dbFile, CLng(dbOffset), origBuf
+                End If
+            End If
+        Next i
+
+        Close #dbFile
+        dbFile = 0
+        Close #jFile
+        jFile = 0
+        Kill jPath
+
+        If initPages > 0 Then
+            recTargetBytes = CLngLng(initPages) * CLngLng(PAGE_SIZE_JET4)
+            TruncateFile dbPath, recTargetBytes
+        End If
+        CatalogReader.DropFilePageCache 0
+        Exit Sub
+
+CleanUp:
+        On Error Resume Next
+        If dbFile > 0 Then Close #dbFile
+        If jFile > 0 Then Close #jFile
+        On Error GoTo 0
+    End Sub
+
+    Public Sub WritePageBytes(ByVal fileNum As Integer, ByVal totalPages As Long, ByVal pageNumber As Long, ByRef pageBuf() As Byte, Optional ByVal pageSize As Long = PAGE_SIZE_JET4)
+        If pageNumber < 0 Or pageNumber >= totalPages Then
+            Err.Raise vbObjectError + 3301, "PageWriter.WritePageBytes", "Page number " & CStr(pageNumber) & " is out of bounds (TotalPages=" & CStr(totalPages) & ")."
+        End If
+
+        If (UBound(pageBuf) - LBound(pageBuf) + 1) <> pageSize Then
+            Err.Raise vbObjectError + 3302, "PageWriter.WritePageBytes", "Buffer size (" & CStr(UBound(pageBuf) - LBound(pageBuf) + 1) & ") does not match required PageSize (" & CStr(pageSize) & ")."
+        End If
+
+        Dim byteOffset As LongLong
+        byteOffset = (CLngLng(pageNumber) * CLngLng(pageSize)) + 1^
+        If byteOffset + CLngLng(pageSize) > MAX_JET4_OFFSET Then
+            Err.Raise vbObjectError + 3035, "PageWriter.WritePageBytes", "Database file size limit (2 GB) exceeded."
+        End If
+
+        JournalPageBeforeWrite fileNum, pageNumber, pageSize
+        Put #fileNum, CLng(byteOffset), pageBuf
+        If pageSize = PAGE_SIZE_JET4 Then
+            CatalogReader.PutCachedPage fileNum, pageNumber, pageBuf
+        End If
+    End Sub
+
+    Public Function AllocateNewPage(ByVal fileNum As Integer, ByRef totalPages As Long, ByVal pageType As Byte, Optional ByVal ownerTdefPage As Long = 0, Optional ByVal pageSize As Long = PAGE_SIZE_JET4) As Long
+        Dim newPageBuf() As Byte
+        Dim newPageNum As Long
+        Dim byteOffset As LongLong
+        Dim umap() As Byte
+        Dim byteIdx As Long
+        Dim bitIdx As Long
+
+        ReDim newPageBuf(0 To pageSize - 1)
+        newPageBuf(0) = pageType
+        newPageBuf(1) = &H1&
+
+        If pageType = &H1& And ownerTdefPage > 0 Then
+            ' Write free space hint (4096 - 14 = 4082) at offset 2 and TDEF owner page at offset 4
+            WriteUInt16LE newPageBuf, 2, pageSize - 14
+            WriteInt32LE newPageBuf, 4, ownerTdefPage
+            WriteUInt16LE newPageBuf, 12, 0 ' 0 rows initially
+        End If
+
+        newPageNum = totalPages
+        byteOffset = (CLngLng(newPageNum) * CLngLng(pageSize)) + 1^
+        If byteOffset + CLngLng(pageSize) > MAX_JET4_OFFSET Then
+            Err.Raise vbObjectError + 3035, "PageWriter.AllocateNewPage", "Database file size limit (2 GB) exceeded."
+        End If
+
+        Put #fileNum, CLng(byteOffset), newPageBuf
+        If pageSize = PAGE_SIZE_JET4 Then
+            CatalogReader.PutCachedPage fileNum, newPageNum, newPageBuf
+        End If
+
+        totalPages = totalPages + 1
+        If pageType = &H1& And ownerTdefPage > 0 Then
+            CatalogReader.RegisterDataPage fileNum, ownerTdefPage, newPageNum
+            UpdateTableUsageMapBit fileNum, totalPages, ownerTdefPage, newPageNum, True, pageSize
+        End If
+
+        ' Mark allocated page bit in Page 1 global Usage Map if Page 1 is a Usage Map (0x05)
+        If totalPages > 2 And newPageNum < ((pageSize - 8) * 8) Then
+            umap = CatalogReader.ReadPageBytes(fileNum, totalPages, 1, pageSize)
+            If umap(0) = &H5& Then
+                byteIdx = 8 + (newPageNum \ 8)
+                bitIdx = newPageNum Mod 8
+                umap(byteIdx) = umap(byteIdx) Or CByte(2 ^ bitIdx)
+                WritePageBytes fileNum, totalPages, 1, umap, pageSize
+            ElseIf umap(0) = &H1& Then
+                UpdateUsageMapByPtr fileNum, totalPages, &H100&, newPageNum, False, pageSize
+            End If
+        End If
+
+        AllocateNewPage = newPageNum
+    End Function
+
+    Public Sub UpdateTableUsageMapBit(ByVal fileNum As Integer, ByRef totalPages As Long, ByVal ownerTdefPage As Long, ByVal dataPageNum As Long, ByVal isAllocated As Boolean, Optional ByVal pageSize As Long = PAGE_SIZE_JET4)
+        Dim tdefBuf() As Byte
+        Dim umapPtr As Long
+        Dim fmapPtr As Long
+
+        If fileNum <= 0 Or ownerTdefPage <= 0 Or ownerTdefPage >= totalPages Then Exit Sub
+        If dataPageNum <= 0 Or dataPageNum >= totalPages Then Exit Sub
+
+        tdefBuf = CatalogReader.ReadPageBytes(fileNum, totalPages, ownerTdefPage, pageSize)
+        If tdefBuf(0) <> &H2& Then Exit Sub
+
+        ' 1. Update owned pages usage map at TDEF offset 55 (used_pages)
+        umapPtr = FormatProbe.ReadInt32LE(tdefBuf, 55)
+        If umapPtr >= 256 Then
+            UpdateUsageMapByPtr fileNum, totalPages, umapPtr, dataPageNum, isAllocated, pageSize
+        End If
+
+        ' 2. Update free-space pages map at TDEF offset 59 (free_pages)
+        fmapPtr = FormatProbe.ReadInt32LE(tdefBuf, 59)
+        If fmapPtr >= 256 And fmapPtr <> umapPtr Then
+            UpdateUsageMapByPtr fileNum, totalPages, fmapPtr, dataPageNum, isAllocated, pageSize
+        End If
+    End Sub
+
+    Public Sub UpdateLvalUsageMapBit(ByVal fileNum As Integer, ByRef totalPages As Long, ByVal ownerTdefPage As Long, ByVal lvalPageNum As Long, ByVal isAllocated As Boolean, Optional ByVal pageSize As Long = PAGE_SIZE_JET4)
+        Dim tdefBuf() As Byte
+        Dim numCols As Long
+        Dim numIdx As Long
+        Dim nri As Long
+        Dim off As Long
+        Dim i As Long
+        Dim nmLen As Long
+        Dim lvColNum As Long
+        Dim lvUsedPtr As Long
+        Dim lvFreePtr As Long
+        Dim offIdxDefs As Long
+        Dim offIdxNames As Long
+        Dim startNameOff As Long
+        Dim testTry As Long
+        Dim curTryOff As Long
+        Dim tryLen As Long
+
+        If fileNum <= 0 Or ownerTdefPage <= 0 Or ownerTdefPage >= totalPages Then Exit Sub
+        If lvalPageNum <= 0 Or lvalPageNum >= totalPages Then Exit Sub
+
+        tdefBuf = CatalogReader.ReadPageBytes(fileNum, totalPages, ownerTdefPage, pageSize)
+        If tdefBuf(0) <> &H2& Then Exit Sub
+        If FormatProbe.ReadInt32LE(tdefBuf, 4) <> 0 Then Exit Sub
+
+        numCols = FormatProbe.ReadUInt16LE(tdefBuf, 45)
+        numIdx = FormatProbe.ReadInt32LE(tdefBuf, 47)
+        nri = FormatProbe.ReadInt32LE(tdefBuf, 51)
+        off = 63 + (12 * nri) + (25 * numCols)
+        For i = 0 To numCols - 1
+            If off + 2 > pageSize Then Exit Sub
+            nmLen = FormatProbe.ReadUInt16LE(tdefBuf, off)
+            off = off + 2 + nmLen
+        Next i
+        
+        offIdxDefs = off + (52 * nri)
+        offIdxNames = offIdxDefs + (28 * numIdx)
+        startNameOff = offIdxNames
+        For testTry = 0 To 8 Step 4
+            curTryOff = offIdxNames + testTry
+            If curTryOff + 4 < pageSize Then
+                tryLen = FormatProbe.ReadUInt16LE(tdefBuf, curTryOff)
+                If tryLen > 0 And tryLen <= 128 And (curTryOff + 2 + tryLen) <= pageSize Then
+                    If tdefBuf(curTryOff + 3) = 0 And tdefBuf(curTryOff + 2) >= 32 And tdefBuf(curTryOff + 2) <= 126 Then
+                        startNameOff = curTryOff
+                        Exit For
+                    End If
+                End If
+            End If
+        Next testTry
+        off = startNameOff
+
+        Do While off + 10 <= pageSize
+            lvColNum = FormatProbe.ReadUInt16LE(tdefBuf, off)
+            If lvColNum = &HFFFF& Then Exit Do
+            lvUsedPtr = FormatProbe.ReadInt32LE(tdefBuf, off + 2)
+            lvFreePtr = FormatProbe.ReadInt32LE(tdefBuf, off + 6)
+            If lvUsedPtr >= 256 Then
+                UpdateUsageMapByPtr fileNum, totalPages, lvUsedPtr, lvalPageNum, isAllocated, pageSize
+            End If
+            If lvFreePtr >= 256 And lvFreePtr <> lvUsedPtr Then
+                UpdateUsageMapByPtr fileNum, totalPages, lvFreePtr, lvalPageNum, isAllocated, pageSize
+            End If
+            off = off + 10
+        Loop
+    End Sub
+
+    Private Sub UpdateUsageMapByPtr(ByVal fileNum As Integer, ByRef totalPages As Long, ByVal umapPtr As Long, ByVal dataPageNum As Long, ByVal isAllocated As Boolean, ByVal pageSize As Long)
+        Dim umapRow As Long
+        Dim umapPage As Long
+        Dim umapBuf() As Byte
+        Dim numSlots As Long
+        Dim rawEntry As Long
+        Dim rStart As Long
+        Dim rEnd As Long
+        Dim sScan As Long
+        Dim sEntry As Long
+        Dim sOff As Long
+        Dim mapType As Byte
+        Dim basePage As Long
+        Dim bitmapBytes As Long
+        Dim maxInlineBits As Long
+        Dim hasAnyBit As Boolean
+        Dim bScan As Long
+        Dim relPage As Long
+        Dim byteIdx As Long
+        Dim bitIdx As Long
+        Dim bitMask As Byte
+        Dim ptrSlots As Long
+        Dim bitsPerPage As Long
+        Dim chunkIdx As Long
+        Dim pageInChunk As Long
+        Dim ptrOffset As Long
+        Dim refMapPage As Long
+        Dim refBuf() As Byte
+        Dim newRefPage As Long
+        Dim oldByteIdx As Long
+        Dim oldBitIdx As Long
+        Dim oldPageNum As Long
+
+        umapRow = umapPtr And &HFF&
+        umapPage = (umapPtr \ &H100&) And &HFFFFFF
+        If umapPage <= 0 Or umapPage >= totalPages Then Exit Sub
+
+        umapBuf = CatalogReader.ReadPageBytes(fileNum, totalPages, umapPage, pageSize)
+        If umapBuf(0) <> &H1& Then Exit Sub
+
+        numSlots = FormatProbe.ReadUInt16LE(umapBuf, 12)
+        If umapRow < 0 Or umapRow >= numSlots Then Exit Sub
+
+        rawEntry = FormatProbe.ReadUInt16LE(umapBuf, 14 + (umapRow * 2))
+        If (rawEntry And &H8000&) <> 0 Then Exit Sub
+
+        rStart = rawEntry And &H1FFF&
+        rEnd = pageSize
+        For sScan = 0 To numSlots - 1
+            If sScan <> umapRow Then
+                sEntry = FormatProbe.ReadUInt16LE(umapBuf, 14 + (sScan * 2))
+                sOff = sEntry And &H1FFF&
+                If sOff > rStart And sOff < rEnd Then
+                    rEnd = sOff
+                End If
+            End If
+        Next sScan
+
+        If rStart <= 0 Or rEnd <= rStart + 5 Or rEnd > pageSize Then Exit Sub
+
+        mapType = umapBuf(rStart)
+        bitsPerPage = (pageSize - 4) * 8
+
+        If mapType = 0 Then
+            basePage = FormatProbe.ReadInt32LE(umapBuf, rStart + 1)
+            bitmapBytes = rEnd - (rStart + 5)
+            maxInlineBits = bitmapBytes * 8
+            If isAllocated And bitmapBytes > 0 Then
+                hasAnyBit = False
+                For bScan = 0 To bitmapBytes - 1
+                    If umapBuf(rStart + 5 + bScan) <> 0 Then
+                        hasAnyBit = True
+                        Exit For
+                    End If
+                Next bScan
+                If Not hasAnyBit And (basePage < 0 Or dataPageNum < basePage Or (dataPageNum - basePage) >= maxInlineBits) Then
+                    basePage = (dataPageNum \ 8) * 8
+                    WriteInt32LE umapBuf, rStart + 1, basePage
+                End If
+            End If
+            relPage = dataPageNum - basePage
+
+            If relPage >= 0 And relPage < maxInlineBits Then
+                byteIdx = rStart + 5 + (relPage \ 8)
+                bitIdx = relPage Mod 8
+                bitMask = CByte(2 ^ bitIdx)
+                If isAllocated Then
+                    umapBuf(byteIdx) = umapBuf(byteIdx) Or bitMask
+                Else
+                    umapBuf(byteIdx) = umapBuf(byteIdx) And (Not bitMask)
+                End If
+                WritePageBytes fileNum, totalPages, umapPage, umapBuf, pageSize
+                Exit Sub
+            ElseIf isAllocated And bitmapBytes >= 4 Then
+                ' Inline bitmap overflow: promote Type 0 inline map to Type 1 reference map
+                newRefPage = AllocateNewPage(fileNum, totalPages, &H5&, 0, pageSize)
+                refBuf = CatalogReader.ReadPageBytes(fileNum, totalPages, newRefPage, pageSize)
+                refBuf(0) = &H5&
+                refBuf(1) = &H1&
+                WriteUInt16LE refBuf, 2, 0
+
+                For oldByteIdx = 0 To bitmapBytes - 1
+                    If umapBuf(rStart + 5 + oldByteIdx) <> 0 Then
+                        For oldBitIdx = 0 To 7
+                            If (umapBuf(rStart + 5 + oldByteIdx) And CByte(2 ^ oldBitIdx)) <> 0 Then
+                                oldPageNum = basePage + (oldByteIdx * 8) + oldBitIdx
+                                If oldPageNum >= 0 And oldPageNum < bitsPerPage Then
+                                    refBuf(4 + (oldPageNum \ 8)) = refBuf(4 + (oldPageNum \ 8)) Or CByte(2 ^ (oldPageNum Mod 8))
+                                End If
+                            End If
+                        Next oldBitIdx
+                    End If
+                Next oldByteIdx
+
+                If dataPageNum < bitsPerPage Then
+                    refBuf(4 + (dataPageNum \ 8)) = refBuf(4 + (dataPageNum \ 8)) Or CByte(2 ^ (dataPageNum Mod 8))
+                End If
+                WritePageBytes fileNum, totalPages, newRefPage, refBuf, pageSize
+
+                umapBuf(rStart) = 1
+                For oldByteIdx = rStart + 1 To rEnd - 1
+                    umapBuf(oldByteIdx) = 0
+                Next oldByteIdx
+                WriteInt32LE umapBuf, rStart + 1, newRefPage
+                WritePageBytes fileNum, totalPages, umapPage, umapBuf, pageSize
+                Exit Sub
+            End If
+
+        ElseIf mapType = 1 Then
+            ptrSlots = (rEnd - (rStart + 1)) \ 4
+            chunkIdx = dataPageNum \ bitsPerPage
+            pageInChunk = dataPageNum Mod bitsPerPage
+            If chunkIdx >= 0 And chunkIdx < ptrSlots Then
+                ptrOffset = rStart + 1 + (chunkIdx * 4)
+                refMapPage = FormatProbe.ReadInt32LE(umapBuf, ptrOffset)
+                If refMapPage <= 0 And isAllocated Then
+                    refMapPage = AllocateNewPage(fileNum, totalPages, &H5&, 0, pageSize)
+                    refBuf = CatalogReader.ReadPageBytes(fileNum, totalPages, refMapPage, pageSize)
+                    refBuf(0) = &H5&
+                    refBuf(1) = &H1&
+                    WriteUInt16LE refBuf, 2, 0
+                    WritePageBytes fileNum, totalPages, refMapPage, refBuf, pageSize
+                    WriteInt32LE umapBuf, ptrOffset, refMapPage
+                    WritePageBytes fileNum, totalPages, umapPage, umapBuf, pageSize
+                End If
+                If refMapPage > 0 And refMapPage < totalPages Then
+                    refBuf = CatalogReader.ReadPageBytes(fileNum, totalPages, refMapPage, pageSize)
+                    byteIdx = 4 + (pageInChunk \ 8)
+                    bitIdx = pageInChunk Mod 8
+                    bitMask = CByte(2 ^ bitIdx)
+                    If byteIdx < pageSize Then
+                        If isAllocated Then
+                            refBuf(byteIdx) = refBuf(byteIdx) Or bitMask
+                        Else
+                            refBuf(byteIdx) = refBuf(byteIdx) And (Not bitMask)
+                        End If
+                        WritePageBytes fileNum, totalPages, refMapPage, refBuf, pageSize
+                    End If
+                End If
+            End If
+        End If
+    End Sub
+
+    Public Sub WriteInt32LE(ByRef buf() As Byte, ByVal idx As Long, ByVal value As Long)
+        #If Win64 Then
+            CopyMemory VarPtr(buf(idx)), VarPtr(value), 4^
+        #Else
+            CopyMemory VarPtr(buf(idx)), VarPtr(value), 4&
+        #End If
+    End Sub
+
+    Public Sub WriteUInt16LE(ByRef buf() As Byte, ByVal idx As Long, ByVal value As Long)
+        buf(idx) = CByte(value And &HFF&)
+        buf(idx + 1) = CByte((value \ &H100&) And &HFF&)
+    End Sub
+
+
+    Public Property Get LastError() As String
+        LastError = m_lastError
+    End Property
+
+    Public Property Let LastError(ByVal value As String)
+        m_lastError = value
+    End Property
+
+    Public Function CreateBlankJet4Database(ByVal filePath As String, Optional ByVal isAce As Boolean = False) As Boolean
+        m_lastError = vbNullString
+        If Len(Trim$(filePath)) = 0 Then
+            m_lastError = "Invalid target file path."
+            CreateBlankJet4Database = False
+            Exit Function
+        End If
+
+        Dim tplName As String
+        Dim ext As String
+        Dim dotPos As Long
+        dotPos = InStrRev(filePath, ".")
+        If dotPos > 0 Then ext = LCase$(Mid$(filePath, dotPos))
+
+        If isAce Or ext = ".accdb" Or ext = ".accde" Then
+            tplName = "blank.accdb"
+        Else
+            tplName = "blank.mdb"
+        End If
+
+        Dim foundPath As String
+        foundPath = ResolveTemplatePath(tplName)
+
+        If Len(foundPath) = 0 Then
+            m_lastError = "Cannot create database from scratch. Please open an existing MS Access file (.mdb/.accdb) or place a valid blank template in the templates folder."
+            CreateBlankJet4Database = False
+            Exit Function
+        End If
+
+        On Error Resume Next
+        If Len(Dir$(filePath)) > 0 Then
+            Kill filePath
+        End If
+        Err.Clear
+
+        FileCopy foundPath, filePath
+        If Err.Number <> 0 Then
+            m_lastError = "Failed to copy template file: " & Err.Description
+            CreateBlankJet4Database = False
+            Exit Function
+        End If
+        On Error GoTo 0
+
+        CreateBlankJet4Database = True
+    End Function
+
+    Private Function ResolveTemplatePath(ByVal tplName As String) As String
+        Dim appDir As String
+        appDir = GetAppDirectory()
+
+        Dim candidates(0 To 6) As String
+        candidates(0) = appDir & "\templates\" & tplName
+        candidates(1) = appDir & "\..\templates\" & tplName
+        candidates(2) = CurDir$() & "\templates\" & tplName
+        candidates(3) = CurDir$() & "\bin\templates\" & tplName
+        candidates(4) = ".\templates\" & tplName
+        candidates(5) = ".\bin\templates\" & tplName
+        If tplName = "blank.accdb" Then
+            candidates(6) = appDir & "\..\tests\fixtures\empty_fixture.accdb"
+        Else
+            candidates(6) = appDir & "\..\tests\fixtures\phase0\jet40_empty.mdb"
+        End If
+
+        Dim i As Long
+        For i = 0 To 6
+            Dim cPath As String
+            cPath = candidates(i)
+            If Len(cPath) > 0 Then
+                On Error Resume Next
+                If Len(Dir$(cPath)) > 0 Then
+                    On Error GoTo 0
+                    ResolveTemplatePath = cPath
+                    Exit Function
+                End If
+                On Error GoTo 0
+            End If
+        Next i
+
+        ResolveTemplatePath = vbNullString
+    End Function
+
+    Private Function GetAppDirectory() As String
+        On Error Resume Next
+        Dim p As String
+        Dim buf As String
+        Dim slen As Long
+        Dim lastSlash As Long
+        buf = Space$(1024)
+        slen = GetModuleFileNameW(0, StrPtr(buf), 1024)
+        If slen > 0 Then
+            p = Left$(buf, slen)
+            lastSlash = InStrRev(p, "\")
+            If lastSlash > 0 Then p = Left$(p, lastSlash - 1)
+        End If
+        If Len(p) = 0 Then p = CurDir$()
+        GetAppDirectory = p
+    End Function
+
+End Module

@@ -1,0 +1,10 @@
+' File: src/studio/pal/IDynamicCall.twin
+' Plan 7 WS7: Platform Abstraction Layer - Dynamic Calling Interface (WS5.7)
+Option Explicit
+
+Public Interface IDynamicCall
+    Function CallProcedure(ByVal dllName As String, ByVal procName As String, ByRef args() As Variant, ByVal returnType As Integer) As Variant
+    Function IsCallAllowed(ByVal dllName As String, ByVal procName As String) As Boolean
+    Sub SetUserApproved(ByVal approved As Boolean)
+    Sub AddAllowed(ByVal dllName As String, ByVal procName As String)
+End Interface

@@ -1,0 +1,1282 @@
+' File: src/studio/query/QueryDesignModel.twin
+' Query Design View parser and visual grid model (Plan 7 WS8 step 1)
+Option Explicit
+
+Public Module QueryDesignModel
+
+    ' Query Design View parser (task 10.1) - see ParseQueryDesignSql.
+    ' Token indexes are 0-based; TokStart/TokEnd are 1-based string positions (end exclusive).
+    Private Const QD_TOK_WORD As Long = 1
+    Private Const QD_TOK_NAME As Long = 2      ' [bracketed] identifier, text without brackets
+    Private Const QD_TOK_STRING As Long = 3    ' 'x' or "x", raw text with quotes
+    Private Const QD_TOK_DATE As Long = 4      ' #...#, raw text
+    Private Const QD_TOK_PUNCT As Long = 5
+    Private Const QD_MAX_DEPTH As Long = 64
+    Private Const QD_SPECIAL_CHARS As String = "()[],.;=<>+-*/&'""#!^\"
+    Private Const QD_RESERVED As String = "|SELECT|FROM|WHERE|GROUP|HAVING|ORDER|BY|UNION|INTO|INNER|LEFT|RIGHT|FULL|OUTER|JOIN|ON|AS|IN|WITH|AND|OR|NOT|NULL|TRUE|FALSE|LIKE|IS|BETWEEN|DISTINCT|DISTINCTROW|TOP|ASC|DESC|"
+
+    Private Type QdParseState
+        Sql As String
+        TokKind() As Long
+        TokText() As String
+        TokUp() As String
+        TokStart() As Long
+        TokEnd() As Long
+        TokCount As Long
+        TblKey() As String
+        TblSrc() As String
+        TblCount As Long
+        Joins() As String
+        JoinCount As Long
+        ColField() As String
+        ColTable() As String
+        ColBase() As String
+        ColAlias() As String
+        ColExpr() As String
+        ColSort() As String
+        ColShow() As String
+        ColCrit() As String
+        ColOr() As String
+        ColCount As Long
+        Reason As String
+    End Type
+
+    ' Set by GetQueryDesignModel: True when the query cannot be shown in Design View.
+    Private m_qdCannotRepresent As Boolean
+
+    ' Design View model of a saved query, parsed from QueryDef.SQL.
+    ' Returns True when the model is usable. Returns False with
+    ' QueryDesignCannotRepresent() = True when the query cannot be shown in
+    ' Design View (UNION, pass-through, DDL, subquery in FROM, ...); outErrorMsg
+    ' then holds "This query cannot be shown in Design View (<reason>)." A False
+    ' result with QueryDesignCannotRepresent() = False is a real error (no
+    ' database, query not found). Columns without a table fall back to
+    ' rs.Fields(i).SourceTable.
+    Public Function GetQueryDesignModel(ByVal queryName As String, ByRef outTables() As String, ByRef outJoins() As String, ByRef outCols() As String, ByRef outErrorMsg As String) As Boolean
+        Dim qDefObj As Object
+        Dim rs As Object
+        Dim sqlText As String
+        Dim qType As Long
+        Dim connectText As String
+        Dim reasonText As String
+        Dim isOk As Boolean
+        Dim parts() As String
+        Dim i As Long
+        Dim k As Long
+        Dim shownCount As Long
+        Dim needSource As Boolean
+        Dim hasStar As Boolean
+        Dim srcTbl As String
+
+        GetQueryDesignModel = False
+        m_qdCannotRepresent = False
+        outErrorMsg = vbNullString
+        outTables = Split(vbNullString, "|")
+        outJoins = Split(vbNullString, "|")
+        outCols = Split(vbNullString, "|")
+
+        If StudioController.ActiveDatabase Is Nothing Then
+            outErrorMsg = "No database open."
+            Exit Function
+        End If
+
+        On Error Resume Next
+        Set qDefObj = StudioController.ActiveDatabase.QueryDefs(queryName)
+        If Err.Number <> 0 Or qDefObj Is Nothing Then
+            Err.Clear
+            On Error GoTo 0
+            outErrorMsg = "Query not found: " & queryName
+            Exit Function
+        End If
+        sqlText = qDefObj.SQL
+        qType = 0
+        qType = qDefObj.Type
+        connectText = vbNullString
+        connectText = qDefObj.Connect
+        Err.Clear
+        On Error GoTo 0
+
+        reasonText = vbNullString
+        If qType = 112 Or UCase$(Left$(Trim$(connectText), 5)) = "ODBC;" Then
+            reasonText = "pass-through query"
+        ElseIf qType = 96 Then
+            reasonText = "data-definition query"
+        End If
+        isOk = False
+        If Len(reasonText) = 0 Then
+            isOk = ParseQueryDesignSql(sqlText, outTables, outJoins, outCols, reasonText)
+        End If
+        If Not isOk Then
+            m_qdCannotRepresent = True
+            outErrorMsg = "This query cannot be shown in Design View (" & reasonText & ")."
+            Exit Function
+        End If
+
+        ' Table row fallback: rs.Fields(i).SourceTable for shown columns without a table.
+        shownCount = 0
+        needSource = False
+        hasStar = False
+        For i = 0 To UBound(outCols)
+            parts = Split(outCols(i), "|")
+            If UBound(parts) >= 5 Then
+                If parts(3) = "1" Then
+                    shownCount = shownCount + 1
+                    If parts(0) = "*" Or Right$(parts(0), 2) = ".*" Then hasStar = True
+                    If Len(parts(1)) = 0 Then needSource = True
+                End If
+            End If
+        Next i
+
+        If needSource And Not hasStar And shownCount > 0 Then
+            On Error Resume Next
+            Set rs = StudioController.ActiveDatabase.OpenRecordset(queryName, 4)
+            If Err.Number = 0 And Not rs Is Nothing Then
+                If rs.Fields.Count = shownCount Then
+                    k = 0
+                    For i = 0 To UBound(outCols)
+                        parts = Split(outCols(i), "|")
+                        If UBound(parts) >= 5 Then
+                            If parts(3) = "1" Then
+                                If Len(parts(1)) = 0 Then
+                                    srcTbl = vbNullString
+                                    srcTbl = CStr(rs.Fields(k).SourceTable)
+                                    If Len(srcTbl) > 0 Then
+                                        parts(1) = QdTableKeyForSource(outTables, srcTbl)
+                                        outCols(i) = Join(parts, "|")
+                                    End If
+                                End If
+                                k = k + 1
+                            End If
+                        End If
+                    Next i
+                End If
+                rs.Close
+            End If
+            Err.Clear
+            Set rs = Nothing
+            On Error GoTo 0
+        End If
+
+        GetQueryDesignModel = True
+    End Function
+
+    ' True when the last GetQueryDesignModel call found a query that Design View cannot show.
+    Public Function QueryDesignCannotRepresent() As Boolean
+        QueryDesignCannotRepresent = m_qdCannotRepresent
+    End Function
+
+    ' Field names of a table (TableDefs) or saved query (QueryDefs), for the
+    ' Design View field-list boxes. Returns the count; outNames is 0-based
+    ' (UBound = -1 when the count is 0).
+    Public Function GetTableFieldNames(ByVal objName As String, ByRef outNames() As String) As Long
+        Dim obj As Object
+        Dim cnt As Long
+        Dim i As Long
+
+        GetTableFieldNames = 0
+        outNames = Split(vbNullString, "|")
+        If StudioController.ActiveDatabase Is Nothing Then Exit Function
+        Dim cleanObj As String
+        cleanObj = Trim$(Replace$(Replace$(objName, "[", ""), "]", ""))
+        If Len(cleanObj) = 0 Then Exit Function
+
+        cnt = 0
+        On Error Resume Next
+        Set obj = Nothing
+        Set obj = StudioController.ActiveDatabase.TableDefs(cleanObj)
+        If Err.Number <> 0 Or obj Is Nothing Then
+            Err.Clear
+            Set obj = Nothing
+            Set obj = StudioController.ActiveDatabase.QueryDefs(cleanObj)
+        End If
+        If Err.Number = 0 And Not obj Is Nothing Then
+            cnt = obj.Fields.Count
+            If Err.Number = 0 And cnt > 0 Then
+                ReDim outNames(0 To cnt - 1)
+                For i = 0 To cnt - 1
+                    outNames(i) = CStr(obj.Fields(i).Name)
+                Next i
+            Else
+                cnt = 0
+            End If
+        End If
+        Err.Clear
+        Set obj = Nothing
+        On Error GoTo 0
+        GetTableFieldNames = cnt
+    End Function
+
+    ' Key of the outTables entry whose source is srcTable (alias-aware), else srcTable.
+    Private Function QdTableKeyForSource(ByRef tables() As String, ByVal srcTable As String) As String
+        Dim i As Long
+        Dim parts() As String
+        Dim srcName As String
+
+        QdTableKeyForSource = srcTable
+        For i = 0 To UBound(tables)
+            parts = Split(tables(i), "|")
+            If UBound(parts) >= 0 Then
+                If UBound(parts) >= 1 Then
+                    srcName = parts(1)
+                Else
+                    srcName = parts(0)
+                End If
+                If UCase$(srcName) = UCase$(srcTable) Then
+                    QdTableKeyForSource = parts(0)
+                    Exit Function
+                End If
+            End If
+        Next i
+    End Function
+
+    ' Pure SQL -> Design View model (no database). Returns True when the query can
+    ' be represented; False with outReason (and empty arrays) otherwise.
+    ' Handles SELECT [DISTINCT|DISTINCTROW|ALL] [TOP n [PERCENT]] lists (T.F, [T].[F],
+    ' expr AS alias, T.*), FROM with nested (...) INNER|LEFT|RIGHT [OUTER] JOIN ... ON
+    ' a.b = c.d [AND ...], comma lists and aliases, WHERE conjuncts (up to two OR
+    ' alternatives -> criteria / or) and ORDER BY (-> sort). GROUP BY and HAVING are ignored.
+    Public Function ParseQueryDesignSql(ByVal sqlText As String, ByRef outTables() As String, ByRef outJoins() As String, ByRef outCols() As String, ByRef outReason As String) As Boolean
+        Dim st As QdParseState
+        Dim p As Long
+        Dim c As Long
+        Dim c2 As Long
+        Dim clStart(0 To 4) As Long
+        Dim clContent(0 To 4) As Long
+        Dim clEnd(0 To 4) As Long
+        Dim endPos As Long
+        Dim selEnd As Long
+        Dim q As Long
+        Dim selectCount As Long
+        Dim i As Long
+
+        ParseQueryDesignSql = False
+        outTables = Split(vbNullString, "|")
+        outJoins = Split(vbNullString, "|")
+        outCols = Split(vbNullString, "|")
+        outReason = vbNullString
+
+        QdInit st, sqlText
+        p = 0
+        If st.TokCount = 0 Then
+            QdFail st, "empty SQL"
+        ElseIf QdIsW(st, 0, "PARAMETERS") Then
+            Do While p < st.TokCount
+                If QdIsP(st, p, ";") Then Exit Do
+                p = p + 1
+            Loop
+            p = p + 1
+        End If
+        If Len(st.Reason) = 0 Then
+            If QdIsW(st, p, "TRANSFORM") Then
+                QdFail st, "crosstab query"
+            ElseIf Not QdIsW(st, p, "SELECT") Then
+                QdFail st, "not a SELECT query"
+            End If
+        End If
+
+        If Len(st.Reason) = 0 Then
+            p = p + 1
+            Do
+                If QdIsW(st, p, "DISTINCT") Or QdIsW(st, p, "DISTINCTROW") Or QdIsW(st, p, "ALL") Then
+                    p = p + 1
+                ElseIf QdIsW(st, p, "TOP") Then
+                    p = p + 2
+                    If QdIsW(st, p, "PERCENT") Then p = p + 1
+                Else
+                    Exit Do
+                End If
+            Loop
+
+            ' Depth-0 clause starts: 0 FROM, 1 WHERE, 2 HAVING, 3 GROUP BY, 4 ORDER BY.
+            endPos = QdFindClauses(st, p, clStart, clContent)
+            If Len(st.Reason) = 0 Then
+                selEnd = endPos
+                For c = 0 To 4
+                    If clStart(c) >= 0 Then
+                        If clStart(c) < selEnd Then selEnd = clStart(c)
+                        clEnd(c) = endPos
+                        For c2 = 0 To 4
+                            If clStart(c2) > clStart(c) And clStart(c2) < clEnd(c) Then clEnd(c) = clStart(c2)
+                        Next c2
+                    Else
+                        clEnd(c) = -1
+                    End If
+                Next c
+
+                If clStart(0) >= 0 Then
+                    q = QdParseSource(st, clContent(0), clEnd(0), 0)
+                    If Len(st.Reason) = 0 And q < clEnd(0) Then QdFail st, "unsupported FROM clause"
+                End If
+                If Len(st.Reason) = 0 Then QdParseSelectList st, p, selEnd
+                selectCount = st.ColCount
+                If Len(st.Reason) = 0 And clStart(1) >= 0 Then QdParseWhere st, clContent(1), clEnd(1)
+                If Len(st.Reason) = 0 And clStart(4) >= 0 Then QdParseOrderBy st, clContent(4), clEnd(4), selectCount
+            End If
+        End If
+
+        If Len(st.Reason) > 0 Then
+            outReason = st.Reason
+            Exit Function
+        End If
+
+        If st.TblCount > 0 Then
+            ReDim outTables(0 To st.TblCount - 1)
+            For i = 0 To st.TblCount - 1
+                If st.TblKey(i) = st.TblSrc(i) Then
+                    outTables(i) = st.TblKey(i)
+                Else
+                    outTables(i) = st.TblKey(i) & "|" & st.TblSrc(i)
+                End If
+            Next i
+        End If
+        If st.JoinCount > 0 Then
+            ReDim outJoins(0 To st.JoinCount - 1)
+            For i = 0 To st.JoinCount - 1
+                outJoins(i) = st.Joins(i)
+            Next i
+        End If
+        If st.ColCount > 0 Then
+            ReDim outCols(0 To st.ColCount - 1)
+            For i = 0 To st.ColCount - 1
+                outCols(i) = st.ColField(i) & "|" & st.ColTable(i) & "|" & st.ColSort(i) & "|" & st.ColShow(i) & "|" & st.ColCrit(i) & "|" & st.ColOr(i)
+            Next i
+        End If
+        ParseQueryDesignSql = True
+    End Function
+
+    Private Sub QdInit(ByRef st As QdParseState, ByVal sqlText As String)
+        st.Sql = sqlText
+        ReDim st.TokKind(0 To 31)
+        ReDim st.TokText(0 To 31)
+        ReDim st.TokUp(0 To 31)
+        ReDim st.TokStart(0 To 31)
+        ReDim st.TokEnd(0 To 31)
+        st.TokCount = 0
+        ReDim st.TblKey(0 To 7)
+        ReDim st.TblSrc(0 To 7)
+        st.TblCount = 0
+        ReDim st.Joins(0 To 7)
+        st.JoinCount = 0
+        ReDim st.ColField(0 To 7)
+        ReDim st.ColTable(0 To 7)
+        ReDim st.ColBase(0 To 7)
+        ReDim st.ColAlias(0 To 7)
+        ReDim st.ColExpr(0 To 7)
+        ReDim st.ColSort(0 To 7)
+        ReDim st.ColShow(0 To 7)
+        ReDim st.ColCrit(0 To 7)
+        ReDim st.ColOr(0 To 7)
+        st.ColCount = 0
+        st.Reason = vbNullString
+        QdTokenize st
+    End Sub
+
+    Private Sub QdFail(ByRef st As QdParseState, ByVal why As String)
+        If Len(st.Reason) = 0 Then st.Reason = why
+    End Sub
+
+    Private Function QdIsWsChar(ByVal ch As String) As Boolean
+        QdIsWsChar = (ch = " " Or ch = vbTab Or ch = vbCr Or ch = vbLf)
+    End Function
+
+    Private Sub QdAddTok(ByRef st As QdParseState, ByVal tokKind As Long, ByVal tokText As String, ByVal tokStart As Long, ByVal tokEnd As Long)
+        Dim newMax As Long
+        If st.TokCount > UBound(st.TokKind) Then
+            newMax = UBound(st.TokKind) * 2 + 1
+            ReDim Preserve st.TokKind(0 To newMax)
+            ReDim Preserve st.TokText(0 To newMax)
+            ReDim Preserve st.TokUp(0 To newMax)
+            ReDim Preserve st.TokStart(0 To newMax)
+            ReDim Preserve st.TokEnd(0 To newMax)
+        End If
+        st.TokKind(st.TokCount) = tokKind
+        st.TokText(st.TokCount) = tokText
+        st.TokUp(st.TokCount) = UCase$(tokText)
+        st.TokStart(st.TokCount) = tokStart
+        st.TokEnd(st.TokCount) = tokEnd
+        st.TokCount = st.TokCount + 1
+    End Sub
+
+    ' Whitespace separates tokens; [names], 'strings' / "strings" ('' / "" escapes)
+    ' and #dates# are single tokens; <>, <= and >= are single punctuation tokens.
+    Private Sub QdTokenize(ByRef st As QdParseState)
+        Dim s As String
+        Dim n As Long
+        Dim i As Long
+        Dim j As Long
+        Dim tokEnd As Long
+        Dim ch As String
+        Dim twoCh As String
+
+        s = st.Sql
+        n = Len(s)
+        i = 1
+        Do While i <= n
+            ch = Mid$(s, i, 1)
+            If QdIsWsChar(ch) Then
+                i = i + 1
+            ElseIf ch = "[" Then
+                j = InStr(i + 1, s, "]")
+                If j = 0 Then
+                    QdAddTok st, QD_TOK_NAME, Mid$(s, i + 1), i, n + 1
+                    i = n + 1
+                Else
+                    QdAddTok st, QD_TOK_NAME, Mid$(s, i + 1, j - i - 1), i, j + 1
+                    i = j + 1
+                End If
+            ElseIf ch = "'" Or ch = """" Then
+                j = i + 1
+                Do While j <= n
+                    If Mid$(s, j, 1) = ch Then
+                        If Mid$(s, j + 1, 1) = ch Then
+                            j = j + 2
+                        Else
+                            Exit Do
+                        End If
+                    Else
+                        j = j + 1
+                    End If
+                Loop
+                tokEnd = j + 1
+                If tokEnd > n + 1 Then tokEnd = n + 1
+                QdAddTok st, QD_TOK_STRING, Mid$(s, i, tokEnd - i), i, tokEnd
+                i = tokEnd
+            ElseIf ch = "#" Then
+                j = InStr(i + 1, s, "#")
+                If j = 0 Then
+                    tokEnd = n + 1
+                Else
+                    tokEnd = j + 1
+                End If
+                QdAddTok st, QD_TOK_DATE, Mid$(s, i, tokEnd - i), i, tokEnd
+                i = tokEnd
+            ElseIf InStr(1, QD_SPECIAL_CHARS, ch) > 0 Then
+                twoCh = Mid$(s, i, 2)
+                If twoCh = "<>" Or twoCh = "<=" Or twoCh = ">=" Then
+                    QdAddTok st, QD_TOK_PUNCT, twoCh, i, i + 2
+                    i = i + 2
+                Else
+                    QdAddTok st, QD_TOK_PUNCT, ch, i, i + 1
+                    i = i + 1
+                End If
+            Else
+                j = i
+                Do While j <= n
+                    ch = Mid$(s, j, 1)
+                    If QdIsWsChar(ch) Then Exit Do
+                    If InStr(1, QD_SPECIAL_CHARS, ch) > 0 Then Exit Do
+                    j = j + 1
+                Loop
+                QdAddTok st, QD_TOK_WORD, Mid$(s, i, j - i), i, j
+                i = j
+            End If
+        Loop
+    End Sub
+
+    Private Function QdKind(ByRef st As QdParseState, ByVal i As Long) As Long
+        QdKind = 0
+        If i >= 0 And i < st.TokCount Then QdKind = st.TokKind(i)
+    End Function
+
+    Private Function QdText(ByRef st As QdParseState, ByVal i As Long) As String
+        QdText = vbNullString
+        If i >= 0 And i < st.TokCount Then QdText = st.TokText(i)
+    End Function
+
+    Private Function QdIsW(ByRef st As QdParseState, ByVal i As Long, ByVal upperWord As String) As Boolean
+        QdIsW = False
+        If i >= 0 And i < st.TokCount Then
+            If st.TokKind(i) = QD_TOK_WORD Then QdIsW = (st.TokUp(i) = upperWord)
+        End If
+    End Function
+
+    Private Function QdIsP(ByRef st As QdParseState, ByVal i As Long, ByVal punct As String) As Boolean
+        QdIsP = False
+        If i >= 0 And i < st.TokCount Then
+            If st.TokKind(i) = QD_TOK_PUNCT Then QdIsP = (st.TokText(i) = punct)
+        End If
+    End Function
+
+    Private Function QdIsCompareOp(ByRef st As QdParseState, ByVal i As Long) As Boolean
+        Dim t As String
+        QdIsCompareOp = False
+        If QdKind(st, i) = QD_TOK_PUNCT Then
+            t = st.TokText(i)
+            QdIsCompareOp = (t = "=" Or t = "<" Or t = ">" Or t = "<=" Or t = ">=" Or t = "<>")
+        End If
+    End Function
+
+    ' [name], or a word that does not start with a digit and is not a reserved word.
+    Private Function QdIsName(ByRef st As QdParseState, ByVal i As Long) As Boolean
+        Dim firstCh As String
+        QdIsName = False
+        If i < 0 Or i >= st.TokCount Then Exit Function
+        If st.TokKind(i) = QD_TOK_NAME Then
+            QdIsName = True
+        ElseIf st.TokKind(i) = QD_TOK_WORD Then
+            firstCh = Left$(st.TokText(i), 1)
+            If firstCh >= "0" And firstCh <= "9" Then Exit Function
+            QdIsName = (InStr(1, QD_RESERVED, "|" & st.TokUp(i) & "|") = 0)
+        End If
+    End Function
+
+    Private Function QdAllDigits(ByVal t As String) As Boolean
+        Dim k As Long
+        Dim ch As String
+        QdAllDigits = False
+        If Len(t) = 0 Then Exit Function
+        For k = 1 To Len(t)
+            ch = Mid$(t, k, 1)
+            If ch < "0" Or ch > "9" Then Exit Function
+        Next k
+        QdAllDigits = True
+    End Function
+
+    ' Source text of tokens [a, b), line breaks and tabs as spaces, trimmed.
+    Private Function QdRaw(ByRef st As QdParseState, ByVal a As Long, ByVal b As Long) As String
+        Dim t As String
+        QdRaw = vbNullString
+        If a >= b Then Exit Function
+        t = Mid$(st.Sql, st.TokStart(a), st.TokEnd(b - 1) - st.TokStart(a))
+        t = Replace$(Replace$(Replace$(t, vbCr, " "), vbLf, " "), vbTab, " ")
+        QdRaw = Trim$(t)
+    End Function
+
+    Private Function QdMatchParen(ByRef st As QdParseState, ByVal i As Long, ByVal b As Long) As Long
+        Dim d As Long
+        Dim q As Long
+        QdMatchParen = -1
+        d = 0
+        For q = i To b - 1
+            If QdIsP(st, q, "(") Then
+                d = d + 1
+            ElseIf QdIsP(st, q, ")") Then
+                d = d - 1
+                If d = 0 Then
+                    QdMatchParen = q
+                    Exit Function
+                End If
+            End If
+        Next q
+    End Function
+
+    ' Strips parentheses that enclose the whole range [a, b).
+    Private Sub QdPeel(ByRef st As QdParseState, ByRef a As Long, ByRef b As Long)
+        Do While b - a >= 2
+            If Not QdIsP(st, a, "(") Then Exit Do
+            If QdMatchParen(st, a, b) <> b - 1 Then Exit Do
+            a = a + 1
+            b = b - 1
+        Loop
+    End Sub
+
+    Private Sub QdPushRange(ByRef outA() As Long, ByRef outB() As Long, ByRef cnt As Long, ByVal x As Long, ByVal y As Long)
+        Dim newMax As Long
+        If cnt > UBound(outA) Then
+            newMax = UBound(outA) * 2 + 1
+            ReDim Preserve outA(0 To newMax)
+            ReDim Preserve outB(0 To newMax)
+        End If
+        outA(cnt) = x
+        outB(cnt) = y
+        cnt = cnt + 1
+    End Sub
+
+    ' Splits [a, b) on depth-0 sep ("," or an upper-case keyword). For AND, the AND
+    ' of BETWEEN x AND y is not a separator. Returns the range count (>= 1).
+    Private Function QdSplitTop(ByRef st As QdParseState, ByVal a As Long, ByVal b As Long, ByVal sep As String, ByRef outA() As Long, ByRef outB() As Long) As Long
+        Dim cnt As Long
+        Dim d As Long
+        Dim q As Long
+        Dim startPos As Long
+        Dim pendingBetween As Boolean
+        Dim isSep As Boolean
+
+        ReDim outA(0 To 7)
+        ReDim outB(0 To 7)
+        cnt = 0
+        d = 0
+        startPos = a
+        pendingBetween = False
+        For q = a To b - 1
+            isSep = False
+            If QdIsP(st, q, "(") Then
+                d = d + 1
+            ElseIf QdIsP(st, q, ")") Then
+                d = d - 1
+            ElseIf d = 0 Then
+                If sep = "," Then
+                    isSep = QdIsP(st, q, ",")
+                ElseIf QdIsW(st, q, "BETWEEN") Then
+                    pendingBetween = True
+                ElseIf QdIsW(st, q, sep) Then
+                    If sep = "AND" And pendingBetween Then
+                        pendingBetween = False
+                    Else
+                        isSep = True
+                    End If
+                End If
+            End If
+            If isSep Then
+                QdPushRange outA, outB, cnt, startPos, q
+                startPos = q + 1
+            End If
+        Next q
+        QdPushRange outA, outB, cnt, startPos, b
+        QdSplitTop = cnt
+    End Function
+
+    ' True when [a, b) is exactly *, F, T.F, T!F or T.*.
+    Private Function QdColRef(ByRef st As QdParseState, ByVal a As Long, ByVal b As Long, ByRef outTable As String, ByRef outField As String, ByRef outStar As Boolean) As Boolean
+        QdColRef = False
+        outTable = vbNullString
+        outField = vbNullString
+        outStar = False
+        If b - a = 1 Then
+            If QdIsP(st, a, "*") Then
+                outField = "*"
+                outStar = True
+                QdColRef = True
+            ElseIf QdIsName(st, a) Then
+                outField = st.TokText(a)
+                QdColRef = True
+            End If
+        ElseIf b - a = 3 Then
+            If QdIsName(st, a) And (QdIsP(st, a + 1, ".") Or QdIsP(st, a + 1, "!")) Then
+                If QdIsP(st, a + 2, "*") Then
+                    outTable = st.TokText(a)
+                    outField = "*"
+                    outStar = True
+                    QdColRef = True
+                ElseIf QdKind(st, a + 2) = QD_TOK_WORD Or QdKind(st, a + 2) = QD_TOK_NAME Then
+                    outTable = st.TokText(a)
+                    outField = st.TokText(a + 2)
+                    QdColRef = True
+                End If
+            End If
+        End If
+    End Function
+
+    Private Function QdTableIndex(ByRef st As QdParseState, ByVal tableKey As String, ByVal lo As Long, ByVal hi As Long) As Long
+        Dim i As Long
+        QdTableIndex = -1
+        For i = lo To hi - 1
+            If UCase$(st.TblKey(i)) = UCase$(tableKey) Then
+                QdTableIndex = i
+                Exit Function
+            End If
+        Next i
+    End Function
+
+    ' An unqualified field belongs to the only table of the FROM clause.
+    Private Function QdResolveTable(ByRef st As QdParseState, ByVal tableKey As String) As String
+        QdResolveTable = tableKey
+        If Len(tableKey) = 0 And st.TblCount = 1 Then QdResolveTable = st.TblKey(0)
+    End Function
+
+    Private Function QdFindCol(ByRef st As QdParseState, ByVal tableKey As String, ByVal baseField As String) As Long
+        Dim i As Long
+        QdFindCol = -1
+        For i = 0 To st.ColCount - 1
+            If Len(st.ColBase(i)) > 0 And st.ColBase(i) <> "*" Then
+                If UCase$(st.ColBase(i)) = UCase$(baseField) Then
+                    If Len(tableKey) = 0 Or Len(st.ColTable(i)) = 0 Or UCase$(st.ColTable(i)) = UCase$(tableKey) Then
+                        QdFindCol = i
+                        Exit Function
+                    End If
+                End If
+            End If
+        Next i
+    End Function
+
+    Private Function QdFindExprCol(ByRef st As QdParseState, ByVal exprText As String) As Long
+        Dim i As Long
+        QdFindExprCol = -1
+        For i = 0 To st.ColCount - 1
+            If Len(st.ColBase(i)) = 0 And UCase$(st.ColExpr(i)) = UCase$(exprText) Then
+                QdFindExprCol = i
+                Exit Function
+            End If
+        Next i
+    End Function
+
+    Private Function QdAddCol(ByRef st As QdParseState, ByVal fieldText As String, ByVal tableKey As String, ByVal baseField As String, ByVal aliasName As String, ByVal exprText As String, ByVal showFlag As String) As Long
+        Dim newMax As Long
+        If st.ColCount > UBound(st.ColField) Then
+            newMax = UBound(st.ColField) * 2 + 1
+            ReDim Preserve st.ColField(0 To newMax)
+            ReDim Preserve st.ColTable(0 To newMax)
+            ReDim Preserve st.ColBase(0 To newMax)
+            ReDim Preserve st.ColAlias(0 To newMax)
+            ReDim Preserve st.ColExpr(0 To newMax)
+            ReDim Preserve st.ColSort(0 To newMax)
+            ReDim Preserve st.ColShow(0 To newMax)
+            ReDim Preserve st.ColCrit(0 To newMax)
+            ReDim Preserve st.ColOr(0 To newMax)
+        End If
+        st.ColField(st.ColCount) = fieldText
+        st.ColTable(st.ColCount) = tableKey
+        st.ColBase(st.ColCount) = baseField
+        st.ColAlias(st.ColCount) = aliasName
+        st.ColExpr(st.ColCount) = exprText
+        st.ColSort(st.ColCount) = vbNullString
+        st.ColShow(st.ColCount) = showFlag
+        st.ColCrit(st.ColCount) = vbNullString
+        st.ColOr(st.ColCount) = vbNullString
+        QdAddCol = st.ColCount
+        st.ColCount = st.ColCount + 1
+    End Function
+
+    Private Sub QdAddTable(ByRef st As QdParseState, ByVal tableKey As String, ByVal sourceName As String)
+        Dim newMax As Long
+        If st.TblCount > UBound(st.TblKey) Then
+            newMax = UBound(st.TblKey) * 2 + 1
+            ReDim Preserve st.TblKey(0 To newMax)
+            ReDim Preserve st.TblSrc(0 To newMax)
+        End If
+        st.TblKey(st.TblCount) = tableKey
+        st.TblSrc(st.TblCount) = sourceName
+        st.TblCount = st.TblCount + 1
+    End Sub
+
+    Private Sub QdAddJoin(ByRef st As QdParseState, ByVal joinText As String)
+        Dim newMax As Long
+        If st.JoinCount > UBound(st.Joins) Then
+            newMax = UBound(st.Joins) * 2 + 1
+            ReDim Preserve st.Joins(0 To newMax)
+        End If
+        st.Joins(st.JoinCount) = joinText
+        st.JoinCount = st.JoinCount + 1
+    End Sub
+
+    ' FROM item: ( source ) or name [[AS] alias]. Returns the next token index.
+    Private Function QdParsePrimary(ByRef st As QdParseState, ByVal p As Long, ByVal b As Long, ByVal depth As Long) As Long
+        Dim srcName As String
+        Dim aliasName As String
+
+        QdParsePrimary = b
+        If Len(st.Reason) > 0 Then Exit Function
+        If p >= b Then
+            QdFail st, "missing table name"
+            Exit Function
+        End If
+        If QdIsP(st, p, "(") Then
+            If QdIsW(st, p + 1, "SELECT") Then
+                QdFail st, "subquery in FROM"
+                Exit Function
+            End If
+            p = QdParseSource(st, p + 1, b, depth + 1)
+            If Len(st.Reason) > 0 Then Exit Function
+            If p >= b Or Not QdIsP(st, p, ")") Then
+                QdFail st, "unbalanced parentheses in FROM"
+                Exit Function
+            End If
+            QdParsePrimary = p + 1
+            Exit Function
+        End If
+        If Not QdIsName(st, p) Then
+            QdFail st, "unsupported FROM clause"
+            Exit Function
+        End If
+        srcName = st.TokText(p)
+        p = p + 1
+        aliasName = vbNullString
+        If p < b And QdIsW(st, p, "AS") Then
+            If p + 1 >= b Or Not QdIsName(st, p + 1) Then
+                QdFail st, "missing alias"
+                Exit Function
+            End If
+            aliasName = st.TokText(p + 1)
+            p = p + 2
+        ElseIf p < b And QdIsName(st, p) Then
+            aliasName = st.TokText(p)
+            p = p + 1
+        End If
+        If p < b And QdIsW(st, p, "IN") Then
+            QdFail st, "table in an external database"
+            Exit Function
+        End If
+        If Len(aliasName) > 0 Then
+            QdAddTable st, aliasName, srcName
+        Else
+            QdAddTable st, srcName, srcName
+        End If
+        QdParsePrimary = p
+    End Function
+
+    Private Function QdIsJoinWord(ByRef st As QdParseState, ByVal q As Long) As Boolean
+        QdIsJoinWord = False
+        If QdIsW(st, q, "INNER") Or QdIsW(st, q, "LEFT") Or QdIsW(st, q, "RIGHT") Or QdIsW(st, q, "JOIN") Or QdIsW(st, q, "FULL") Then
+            QdIsJoinWord = Not QdIsP(st, q + 1, "(")
+        End If
+    End Function
+
+    ' ON condition [a, b): equalities joined by AND (any parentheses). Left/right
+    ' table ranges orient each equality so the left field belongs to the left side.
+    Private Sub QdParseJoinCondition(ByRef st As QdParseState, ByVal a As Long, ByVal b As Long, ByVal joinType As String, ByVal lStart As Long, ByVal lEnd As Long, ByVal rStart As Long, ByVal rEnd As Long, ByVal depth As Long)
+        Dim partA() As Long
+        Dim partB() As Long
+        Dim cnt As Long
+        Dim k As Long
+        Dim q As Long
+        Dim d As Long
+        Dim opPos As Long
+        Dim la As Long
+        Dim lb As Long
+        Dim ra As Long
+        Dim rb As Long
+        Dim lt As String
+        Dim lf As String
+        Dim rt As String
+        Dim rf As String
+        Dim tmp As String
+        Dim star1 As Boolean
+        Dim star2 As Boolean
+        Dim ok1 As Boolean
+        Dim ok2 As Boolean
+
+        If Len(st.Reason) > 0 Then Exit Sub
+        If depth > QD_MAX_DEPTH Then
+            QdFail st, "join condition nested too deeply"
+            Exit Sub
+        End If
+        QdPeel st, a, b
+        If a >= b Then
+            QdFail st, "empty join condition"
+            Exit Sub
+        End If
+        If QdSplitTop(st, a, b, "OR", partA, partB) > 1 Then
+            QdFail st, "OR in a join condition"
+            Exit Sub
+        End If
+        cnt = QdSplitTop(st, a, b, "AND", partA, partB)
+        If cnt > 1 Then
+            For k = 0 To cnt - 1
+                QdParseJoinCondition st, partA(k), partB(k), joinType, lStart, lEnd, rStart, rEnd, depth + 1
+            Next k
+            Exit Sub
+        End If
+
+        opPos = -1
+        d = 0
+        For q = a To b - 1
+            If QdIsP(st, q, "(") Then
+                d = d + 1
+            ElseIf QdIsP(st, q, ")") Then
+                d = d - 1
+            ElseIf d = 0 And QdIsCompareOp(st, q) Then
+                If opPos >= 0 Then
+                    QdFail st, "unsupported join expression"
+                    Exit Sub
+                End If
+                opPos = q
+            End If
+        Next q
+        If opPos < 0 Then
+            QdFail st, "unsupported join expression"
+            Exit Sub
+        End If
+        If st.TokText(opPos) <> "=" Then
+            QdFail st, "join that is not an equality"
+            Exit Sub
+        End If
+        la = a
+        lb = opPos
+        QdPeel st, la, lb
+        ra = opPos + 1
+        rb = b
+        QdPeel st, ra, rb
+        ok1 = QdColRef(st, la, lb, lt, lf, star1)
+        ok2 = QdColRef(st, ra, rb, rt, rf, star2)
+        If Not ok1 Or Not ok2 Or star1 Or star2 Then
+            QdFail st, "unsupported join expression"
+            Exit Sub
+        End If
+        lt = QdResolveTable(st, lt)
+        rt = QdResolveTable(st, rt)
+        If Len(lt) = 0 Or Len(rt) = 0 Then
+            QdFail st, "unqualified field in a join"
+            Exit Sub
+        End If
+        If QdTableIndex(st, lt, rStart, rEnd) >= 0 And QdTableIndex(st, rt, lStart, lEnd) >= 0 Then
+            tmp = lt
+            lt = rt
+            rt = tmp
+            tmp = lf
+            lf = rf
+            rf = tmp
+        End If
+        QdAddJoin st, lt & "|" & lf & "|" & rt & "|" & rf & "|" & joinType
+    End Sub
+
+    ' FROM source: primary { , primary | [INNER|LEFT|RIGHT [OUTER]] JOIN primary ON cond }.
+    ' Stops at b or at a ")" that closes the enclosing group; returns that index.
+    Private Function QdParseSource(ByRef st As QdParseState, ByVal p As Long, ByVal b As Long, ByVal depth As Long) As Long
+        Dim startTbl As Long
+        Dim leftEnd As Long
+        Dim rightEnd As Long
+        Dim joinType As String
+        Dim q As Long
+        Dim d As Long
+
+        If depth > QD_MAX_DEPTH Then
+            QdFail st, "FROM clause nested too deeply"
+            QdParseSource = b
+            Exit Function
+        End If
+        startTbl = st.TblCount
+        p = QdParsePrimary(st, p, b, depth)
+        Do While Len(st.Reason) = 0 And p < b
+            If QdIsP(st, p, ")") Then Exit Do
+            If QdIsP(st, p, ",") Then
+                p = QdParsePrimary(st, p + 1, b, depth)
+            Else
+                joinType = vbNullString
+                If QdIsW(st, p, "INNER") Then
+                    joinType = "INNER"
+                    p = p + 1
+                ElseIf QdIsW(st, p, "LEFT") Then
+                    joinType = "LEFT"
+                    p = p + 1
+                ElseIf QdIsW(st, p, "RIGHT") Then
+                    joinType = "RIGHT"
+                    p = p + 1
+                ElseIf QdIsW(st, p, "JOIN") Then
+                    joinType = "INNER"
+                Else
+                    QdFail st, "unsupported FROM clause"
+                    Exit Do
+                End If
+                If joinType <> "INNER" And QdIsW(st, p, "OUTER") Then p = p + 1
+                If Not QdIsW(st, p, "JOIN") Then
+                    QdFail st, "unsupported join type"
+                    Exit Do
+                End If
+                leftEnd = st.TblCount
+                p = QdParsePrimary(st, p + 1, b, depth)
+                If Len(st.Reason) > 0 Then Exit Do
+                rightEnd = st.TblCount
+                If p >= b Or Not QdIsW(st, p, "ON") Then
+                    QdFail st, "join without ON"
+                    Exit Do
+                End If
+                p = p + 1
+                q = p
+                d = 0
+                Do While q < b
+                    If QdIsP(st, q, "(") Then
+                        d = d + 1
+                    ElseIf QdIsP(st, q, ")") Then
+                        If d = 0 Then Exit Do
+                        d = d - 1
+                    ElseIf d = 0 And (QdIsP(st, q, ",") Or QdIsJoinWord(st, q)) Then
+                        Exit Do
+                    End If
+                    q = q + 1
+                Loop
+                QdParseJoinCondition st, p, q, joinType, startTbl, leftEnd, leftEnd, rightEnd, 0
+                p = q
+            End If
+        Loop
+        QdParseSource = p
+    End Function
+
+    Private Sub QdParseSelectList(ByRef st As QdParseState, ByVal a As Long, ByVal b As Long)
+        Dim itemA() As Long
+        Dim itemB() As Long
+        Dim cnt As Long
+        Dim k As Long
+        Dim x As Long
+        Dim y As Long
+        Dim px As Long
+        Dim py As Long
+        Dim aliasName As String
+        Dim tbl As String
+        Dim fld As String
+        Dim isStar As Boolean
+        Dim isRef As Boolean
+        Dim exprText As String
+        Dim shown As String
+
+        cnt = QdSplitTop(st, a, b, ",", itemA, itemB)
+        For k = 0 To cnt - 1
+            x = itemA(k)
+            y = itemB(k)
+            If x >= y Then
+                QdFail st, "empty SELECT item"
+                Exit Sub
+            End If
+            aliasName = vbNullString
+            If y - x >= 3 Then
+                If QdIsW(st, y - 2, "AS") And (QdKind(st, y - 1) = QD_TOK_WORD Or QdKind(st, y - 1) = QD_TOK_NAME) Then
+                    aliasName = st.TokText(y - 1)
+                    y = y - 2
+                End If
+            End If
+            px = x
+            py = y
+            QdPeel st, px, py
+            isRef = QdColRef(st, px, py, tbl, fld, isStar)
+            exprText = QdRaw(st, x, y)
+            If isRef And isStar Then
+                If Len(tbl) > 0 Then
+                    QdAddCol st, tbl & ".*", tbl, "*", vbNullString, exprText, "1"
+                Else
+                    QdAddCol st, "*", vbNullString, "*", vbNullString, exprText, "1"
+                End If
+            ElseIf isRef Then
+                tbl = QdResolveTable(st, tbl)
+                shown = fld
+                If Len(aliasName) > 0 And UCase$(aliasName) <> UCase$(fld) Then shown = aliasName & ": " & fld
+                QdAddCol st, shown, tbl, fld, aliasName, exprText, "1"
+            ElseIf Len(aliasName) > 0 Then
+                QdAddCol st, aliasName & ": " & exprText, vbNullString, vbNullString, aliasName, exprText, "1"
+            Else
+                QdAddCol st, exprText, vbNullString, vbNullString, vbNullString, exprText, "1"
+            End If
+        Next k
+    End Sub
+
+    ' One WHERE conjunct -> criteria (slot 0) or "or" (slot 1) of its column.
+    ' "[(]T.F[)] op rest" puts rest (without a leading "=") on column T.F, adding a
+    ' hidden column when needed; other conditions become a hidden expression
+    ' column with criteria True.
+    Private Sub QdApplyCondition(ByRef st As QdParseState, ByVal a As Long, ByVal b As Long, ByVal slot As Long)
+        Dim k As Long
+        Dim p As Long
+        Dim q As Long
+        Dim ln As Long
+        Dim pass As Long
+        Dim closes As Long
+        Dim found As Boolean
+        Dim isStar As Boolean
+        Dim t As String
+        Dim f As String
+        Dim tbl As String
+        Dim fld As String
+        Dim crit As String
+        Dim exprText As String
+        Dim idx As Long
+
+        QdPeel st, a, b
+        If a >= b Then Exit Sub
+        k = 0
+        p = a
+        Do While p < b
+            If Not QdIsP(st, p, "(") Then Exit Do
+            k = k + 1
+            p = p + 1
+        Loop
+        found = False
+        q = p
+        For pass = 0 To 1
+            ln = 3 - 2 * pass
+            If p + ln <= b Then
+                If QdColRef(st, p, p + ln, t, f, isStar) Then
+                    If Not isStar Then
+                        q = p + ln
+                        closes = 0
+                        Do While closes < k And q < b
+                            If Not QdIsP(st, q, ")") Then Exit Do
+                            closes = closes + 1
+                            q = q + 1
+                        Loop
+                        If closes = k And q < b Then
+                            If QdIsCompareOp(st, q) Then
+                                found = True
+                            ElseIf QdIsW(st, q, "LIKE") Or QdIsW(st, q, "IS") Or QdIsW(st, q, "IN") Or QdIsW(st, q, "BETWEEN") Or QdIsW(st, q, "NOT") Then
+                                found = True
+                            End If
+                            If found Then
+                                tbl = t
+                                fld = f
+                                Exit For
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        Next pass
+
+        crit = vbNullString
+        If found Then
+            If QdIsP(st, q, "=") Then
+                crit = QdRaw(st, q + 1, b)
+            Else
+                crit = QdRaw(st, q, b)
+            End If
+            If Len(crit) = 0 Then found = False
+        End If
+        If found Then
+            tbl = QdResolveTable(st, tbl)
+            idx = QdFindCol(st, tbl, fld)
+            If idx < 0 Then idx = QdAddCol(st, fld, tbl, fld, vbNullString, fld, "0")
+        Else
+            crit = "True"
+            exprText = QdRaw(st, a, b)
+            idx = QdFindExprCol(st, exprText)
+            If idx < 0 Then idx = QdAddCol(st, exprText, vbNullString, vbNullString, vbNullString, exprText, "0")
+        End If
+        If slot = 0 Then
+            If Len(st.ColCrit(idx)) > 0 Then
+                st.ColCrit(idx) = st.ColCrit(idx) & " And " & crit
+            Else
+                st.ColCrit(idx) = crit
+            End If
+        Else
+            If Len(st.ColOr(idx)) > 0 Then
+                st.ColOr(idx) = st.ColOr(idx) & " And " & crit
+            Else
+                st.ColOr(idx) = crit
+            End If
+        End If
+    End Sub
+
+    Private Sub QdParseWhere(ByRef st As QdParseState, ByVal a As Long, ByVal b As Long)
+        Dim altA() As Long
+        Dim altB() As Long
+        Dim conA() As Long
+        Dim conB() As Long
+        Dim altCount As Long
+        Dim conCount As Long
+        Dim n As Long
+        Dim k As Long
+        Dim x As Long
+        Dim y As Long
+
+        QdPeel st, a, b
+        If a >= b Then Exit Sub
+        altCount = QdSplitTop(st, a, b, "OR", altA, altB)
+        If altCount > 2 Then
+            QdFail st, "more than two OR alternatives in WHERE"
+            Exit Sub
+        End If
+        For n = 0 To altCount - 1
+            x = altA(n)
+            y = altB(n)
+            QdPeel st, x, y
+            conCount = QdSplitTop(st, x, y, "AND", conA, conB)
+            For k = 0 To conCount - 1
+                QdApplyCondition st, conA(k), conB(k), n
+            Next k
+        Next n
+    End Sub
+
+    Private Sub QdParseOrderBy(ByRef st As QdParseState, ByVal a As Long, ByVal b As Long, ByVal selectCount As Long)
+        Dim itemA() As Long
+        Dim itemB() As Long
+        Dim cnt As Long
+        Dim k As Long
+        Dim i As Long
+        Dim x As Long
+        Dim y As Long
+        Dim idx As Long
+        Dim ordinal As Long
+        Dim sortText As String
+        Dim t As String
+        Dim f As String
+        Dim isStar As Boolean
+        Dim exprText As String
+
+        cnt = QdSplitTop(st, a, b, ",", itemA, itemB)
+        For k = 0 To cnt - 1
+            x = itemA(k)
+            y = itemB(k)
+            sortText = "Ascending"
+            If y > x And QdIsW(st, y - 1, "DESC") Then
+                sortText = "Descending"
+                y = y - 1
+            ElseIf y > x And QdIsW(st, y - 1, "ASC") Then
+                y = y - 1
+            End If
+            QdPeel st, x, y
+            If x < y Then
+                idx = -1
+                If y - x = 1 And QdKind(st, x) = QD_TOK_WORD Then
+                    If QdAllDigits(st.TokText(x)) And Len(st.TokText(x)) <= 9 Then
+                        ordinal = CLng(st.TokText(x))
+                        If ordinal >= 1 And ordinal <= selectCount Then idx = ordinal - 1
+                    End If
+                End If
+                If idx < 0 Then
+                    If QdColRef(st, x, y, t, f, isStar) And Not isStar Then
+                        t = QdResolveTable(st, t)
+                        idx = QdFindCol(st, t, f)
+                        If idx < 0 And Len(t) = 0 Then
+                            For i = 0 To st.ColCount - 1
+                                If Len(st.ColAlias(i)) > 0 And UCase$(st.ColAlias(i)) = UCase$(f) Then
+                                    idx = i
+                                    Exit For
+                                End If
+                            Next i
+                        End If
+                        If idx < 0 Then idx = QdAddCol(st, f, t, f, vbNullString, f, "0")
+                    Else
+                        exprText = QdRaw(st, x, y)
+                        idx = QdFindExprCol(st, exprText)
+                        If idx < 0 Then idx = QdAddCol(st, exprText, vbNullString, vbNullString, vbNullString, exprText, "0")
+                    End If
+                End If
+                st.ColSort(idx) = sortText
+            End If
+        Next k
+    End Sub
+
+    ' Records depth-0 clause starts after SELECT (index 0 FROM, 1 WHERE, 2 HAVING,
+    ' 3 GROUP BY, 4 ORDER BY; -1 = absent) and returns the statement end
+    ' (";", WITH OWNERACCESS or the last token). UNION and SELECT ... INTO fail.
+    Private Function QdFindClauses(ByRef st As QdParseState, ByVal p0 As Long, ByRef clStart() As Long, ByRef clContent() As Long) As Long
+        Dim c As Long
+        Dim d As Long
+        Dim p As Long
+
+        For c = 0 To 4
+            clStart(c) = -1
+            clContent(c) = -1
+        Next c
+        d = 0
+        p = p0
+        Do While p < st.TokCount
+            If QdIsP(st, p, "(") Then
+                d = d + 1
+            ElseIf QdIsP(st, p, ")") Then
+                d = d - 1
+            ElseIf d = 0 Then
+                If QdIsP(st, p, ";") Then Exit Do
+                If QdIsW(st, p, "WITH") And QdIsW(st, p + 1, "OWNERACCESS") Then Exit Do
+                If QdIsW(st, p, "UNION") Then
+                    QdFail st, "UNION query"
+                    Exit Do
+                End If
+                If QdIsW(st, p, "FROM") And clStart(0) < 0 Then
+                    clStart(0) = p
+                    clContent(0) = p + 1
+                End If
+                If QdIsW(st, p, "WHERE") And clStart(1) < 0 Then
+                    clStart(1) = p
+                    clContent(1) = p + 1
+                End If
+                If QdIsW(st, p, "HAVING") And clStart(2) < 0 Then
+                    clStart(2) = p
+                    clContent(2) = p + 1
+                End If
+                If QdIsW(st, p, "GROUP") And QdIsW(st, p + 1, "BY") And clStart(3) < 0 Then
+                    clStart(3) = p
+                    clContent(3) = p + 2
+                End If
+                If QdIsW(st, p, "ORDER") And QdIsW(st, p + 1, "BY") And clStart(4) < 0 Then
+                    clStart(4) = p
+                    clContent(4) = p + 2
+                End If
+                If QdIsW(st, p, "INTO") And clStart(0) < 0 Then
+                    QdFail st, "make-table query"
+                    Exit Do
+                End If
+            End If
+            p = p + 1
+        Loop
+        QdFindClauses = p
+    End Function
+
+
+End Module

@@ -1,0 +1,364 @@
+' File: src/studio/vba/MacroRunner.twin
+' Plan 7 WS5.8: Access Macro Engine and Playback over AccessObjectModel
+Option Explicit
+
+Public Module MacroRunner
+    Public Function ExecuteMacro(ByVal db As Object, ByVal macroName As String) As Boolean
+        On Error GoTo ErrHandler
+        Dim macroXml As String
+        macroXml = LoadMacroXml(db, macroName)
+
+        If Len(macroXml) = 0 Then
+            ' If not found in storage, check if macroName is an action directly
+            Dim directParts() As String
+            directParts = Split(Trim$(macroName), " ")
+            If UBound(directParts) >= 0 Then
+                Dim act As String
+                act = directParts(0)
+                If IsValidActionName(act) Then
+                    Dim restArgs As String
+                    If Len(Trim$(macroName)) > Len(act) Then
+                        restArgs = Trim$(Mid$(Trim$(macroName), Len(act) + 1))
+                    Else
+                        restArgs = vbNullString
+                    End If
+                    ExecuteSingleAction act, restArgs
+                    ExecuteMacro = True
+                    Exit Function
+                End If
+            End If
+            ExecuteMacro = False
+            Exit Function
+        End If
+
+        ExecuteMacro = ExecuteMacroXml(macroXml)
+        Exit Function
+
+ErrHandler:
+        ExecuteMacro = False
+    End Function
+
+    Public Function LoadMacroXml(ByVal db As Object, ByVal macroName As String) As String
+        On Error Resume Next
+        If db Is Nothing Then Exit Function
+
+        Dim rsScripts As Object
+        Set rsScripts = db.OpenRecordset("SELECT [Id] FROM [MSysAccessStorage] WHERE [Name] = 'Scripts';")
+        If Err.Number <> 0 Or rsScripts Is Nothing Then Exit Function
+        If rsScripts.EOF Then
+            rsScripts.Close
+            Exit Function
+        End If
+        Dim scriptsId As Long
+        scriptsId = CLng(rsScripts.Fields(0).Value)
+        rsScripts.Close
+
+        Dim rsDir As Object
+        Set rsDir = db.OpenRecordset("SELECT [Name], [Lv] FROM [MSysAccessStorage] WHERE [ParentId] = " & CStr(scriptsId) & ";")
+        If Err.Number <> 0 Or rsDir Is Nothing Then Exit Function
+
+        Dim folderIdx As Long
+        folderIdx = -1
+
+        Do Until rsDir.EOF
+            If InStr(1, CStr(rsDir.Fields(0).Value), "DirData", vbTextCompare) > 0 Then
+                Dim vVal As Variant
+                vVal = rsDir.Fields(1).Value
+                If Not IsNull(vVal) Then
+                    Dim dirBytes() As Byte
+                    dirBytes = vVal
+                    folderIdx = ParseDirDataForName(dirBytes, macroName)
+                    If folderIdx >= 0 Then Exit Do
+                End If
+            End If
+            rsDir.MoveNext
+        Loop
+        rsDir.Close
+
+        If folderIdx < 0 Then Exit Function
+
+        ' Find Blob for this folder index
+        Dim rsBlob As Object
+        Set rsBlob = db.OpenRecordset("SELECT b.[Lv] FROM [MSysAccessStorage] f INNER JOIN [MSysAccessStorage] b ON f.[Id] = b.[ParentId] WHERE f.[ParentId] = " & CStr(scriptsId) & " AND f.[Name] = '" & CStr(folderIdx) & "' AND b.[Name] = 'Blob';")
+        If Err.Number <> 0 Or rsBlob Is Nothing Then Exit Function
+        If rsBlob.EOF Then
+            rsBlob.Close
+            Exit Function
+        End If
+
+        Dim blobBytes() As Byte
+        blobBytes = rsBlob.Fields(0).Value
+        rsBlob.Close
+
+        LoadMacroXml = ExtractXmlFromMacroBlob(blobBytes)
+    End Function
+
+    Private Function ParseDirDataForName(ByRef dirBytes() As Byte, ByVal targetName As String) As Long
+        ParseDirDataForName = -1
+        On Error Resume Next
+        Dim dMax As Long
+        dMax = UBound(dirBytes)
+        Dim dPos As Long
+        dPos = 4
+
+        Do While (dPos + 5) <= dMax
+            Dim recLen As Long
+            recLen = CLng(dirBytes(dPos + 1))
+            If recLen <= 4 Or (dPos + 1 + recLen) > dMax Then Exit Do
+
+            Dim nameBytesLen As Long
+            nameBytesLen = recLen - 4
+            Dim entryName As String
+            entryName = vbNullString
+
+            Dim chIdx As Long
+            For chIdx = 0 To (nameBytesLen \ 2) - 1
+                entryName = entryName & ChrW$(CLng(dirBytes(dPos + 2 + (chIdx * 2))) Or (CLng(dirBytes(dPos + 3 + (chIdx * 2))) * 256))
+            Next chIdx
+
+            If StrComp(Trim$(entryName), Trim$(targetName), vbTextCompare) = 0 Then
+                ParseDirDataForName = CLng(dirBytes(dPos + 2 + nameBytesLen))
+                Exit Function
+            End If
+            dPos = dPos + 2 + recLen
+        Loop
+    End Function
+
+    Private Function ExtractXmlFromMacroBlob(ByRef b() As Byte) As String
+        On Error Resume Next
+        Dim n As Long
+        n = UBound(b) - LBound(b) + 1
+        If n < 16 Then Exit Function
+
+        Dim k As Long
+        Dim s As String
+        s = vbNullString
+        For k = 0 To (n \ 2) - 1
+            Dim code As Long
+            code = CLng(b(2 * k)) Or (CLng(b(2 * k + 1)) * 256)
+            If code >= 32 And code <= 126 Then
+                s = s & Chr$(code)
+            ElseIf code = 10 Or code = 13 Or code = 9 Then
+                s = s & Chr$(code)
+            ElseIf code = 0 Then
+                ' skip or space
+            End If
+        Next k
+
+        Dim xmlPos As Long
+        xmlPos = InStr(1, s, "<?xml", vbTextCompare)
+        If xmlPos = 0 Then xmlPos = InStr(1, s, "<UserInterfaceMacro", vbTextCompare)
+
+        If xmlPos > 0 Then
+            Dim endPos As Long
+            endPos = InStr(xmlPos, s, "</UserInterfaceMacro>", vbTextCompare)
+            If endPos > 0 Then
+                ExtractXmlFromMacroBlob = Mid$(s, xmlPos, (endPos + 21) - xmlPos)
+                Exit Function
+            Else
+                ExtractXmlFromMacroBlob = Mid$(s, xmlPos)
+                Exit Function
+            End If
+        End If
+    End Function
+
+    Public Function ExecuteMacroXml(ByVal xmlText As String) As Boolean
+        On Error GoTo ErrHandler
+        Dim p As Long
+        p = 1
+        Do While p <= Len(xmlText)
+            Dim actionStart As Long
+            actionStart = InStr(p, xmlText, "<Action", vbTextCompare)
+            If actionStart = 0 Then Exit Do
+
+            Dim tagClose As Long
+            tagClose = InStr(actionStart, xmlText, ">")
+            If tagClose = 0 Then Exit Do
+
+            Dim nameIdx As Long
+            nameIdx = InStr(actionStart, xmlText, "Name=""", vbTextCompare)
+            If nameIdx = 0 Or nameIdx > tagClose Then
+                p = tagClose + 1
+                GoTo ContinueLoop
+            End If
+            nameIdx = nameIdx + 6
+            Dim nameEnd As Long
+            nameEnd = InStr(nameIdx, xmlText, """")
+            If nameEnd = 0 Or nameEnd > tagClose Then
+                p = tagClose + 1
+                GoTo ContinueLoop
+            End If
+
+            Dim actName As String
+            actName = Mid$(xmlText, nameIdx, nameEnd - nameIdx)
+
+            Dim isSelfClosing As Boolean
+            isSelfClosing = (Mid$(xmlText, tagClose - 1, 1) = "/")
+
+            Dim actBody As String
+            If isSelfClosing Then
+                actBody = ""
+                p = tagClose + 1
+            Else
+                Dim endActionTag As Long
+                endActionTag = InStr(tagClose, xmlText, "</Action>", vbTextCompare)
+                If endActionTag > 0 Then
+                    actBody = Mid$(xmlText, tagClose + 1, endActionTag - (tagClose + 1))
+                    p = endActionTag + 9
+                Else
+                    actBody = Mid$(xmlText, tagClose + 1)
+                    p = Len(xmlText) + 1
+                End If
+            End If
+
+            ExecuteParsedAction actName, actBody
+ContinueLoop:
+        Loop
+        ExecuteMacroXml = True
+        Exit Function
+
+ErrHandler:
+        ExecuteMacroXml = False
+    End Function
+
+    Private Sub ExecuteParsedAction(ByVal actName As String, ByVal actBody As String)
+        On Error Resume Next
+        Dim cmd As AccessDoCmd
+        Set cmd = AccessObjectModel.DoCmd
+
+        Select Case LCase$(Trim$(actName))
+            Case "closewindow", "close"
+                Dim objType As Long
+                objType = acDefault
+                Dim objName As String
+                objName = ExtractXmlArgument(actBody, "ObjectName")
+                If Len(objName) = 0 Then objName = ExtractXmlArgument(actBody, "WindowName")
+                cmd.Close objType, objName, acSavePrompt
+
+            Case "openform"
+                Dim formName As String
+                formName = ExtractXmlArgument(actBody, "FormName")
+                Dim whereCond As String
+                whereCond = ExtractXmlArgument(actBody, "WhereCondition")
+                Dim openArgs As String
+                openArgs = ExtractXmlArgument(actBody, "OpenArgs")
+                cmd.OpenForm formName, acNormal, "", whereCond, acFormPropertySettings, acWindowNormal, openArgs
+
+            Case "openquery"
+                Dim qName As String
+                qName = ExtractXmlArgument(actBody, "QueryName")
+                cmd.OpenQuery qName, acViewNormal, acEdit
+
+            Case "openreport"
+                Dim rptName As String
+                rptName = ExtractXmlArgument(actBody, "ReportName")
+                cmd.OpenReport rptName, acViewPreview
+
+            Case "runsql"
+                Dim sqlStr As String
+                sqlStr = ExtractXmlArgument(actBody, "SQLStatement")
+                cmd.RunSQL sqlStr
+
+            Case "msgbox"
+                Dim msgStr As String
+                msgStr = ExtractXmlArgument(actBody, "Message")
+                Dim msgTitle As String
+                msgTitle = ExtractXmlArgument(actBody, "Title")
+                VbaStdLib.ShowMsgBox msgStr, 0, msgTitle
+
+            Case "gotorecord"
+                cmd.GoToRecord acDefault, "", acNext
+
+            Case "gotocontrol"
+                Dim ctlName As String
+                ctlName = ExtractXmlArgument(actBody, "ControlName")
+                cmd.GoToControl ctlName
+
+            Case "requery"
+                Dim reqCtl As String
+                reqCtl = ExtractXmlArgument(actBody, "ControlName")
+                cmd.Requery reqCtl
+
+            Case "setwarnings"
+                Dim warns As String
+                warns = ExtractXmlArgument(actBody, "WarningsOn")
+                cmd.SetWarnings (StrComp(warns, "true", vbTextCompare) = 0 Or StrComp(warns, "yes", vbTextCompare) = 0 Or StrComp(warns, "-1", vbTextCompare) = 0)
+
+            Case "runcode"
+                Dim fnCall As String
+                fnCall = ExtractXmlArgument(actBody, "FunctionName")
+                If Len(fnCall) > 0 Then
+                    VbaInterpreter.ExecuteProcedure fnCall
+                End If
+
+            Case "searchforrecord"
+                Dim searchWhere As String
+                searchWhere = ExtractXmlArgument(actBody, "WhereCondition")
+                Dim frm As AccessForm
+                Set frm = AccessObjectModel.Screen.ActiveForm
+                If Not frm Is Nothing And Len(searchWhere) > 0 Then
+                    frm.Filter = searchWhere
+                    frm.FilterOn = True
+                End If
+        End Select
+    End Sub
+
+    Private Sub ExecuteSingleAction(ByVal actName As String, ByVal argsStr As String)
+        On Error Resume Next
+        Dim cmd As AccessDoCmd
+        Set cmd = AccessObjectModel.DoCmd
+
+        Select Case LCase$(Trim$(actName))
+            Case "closewindow", "close"
+                cmd.Close acDefault, "", acSavePrompt
+            Case "openform"
+                cmd.OpenForm Trim$(argsStr)
+            Case "openquery"
+                cmd.OpenQuery Trim$(argsStr)
+            Case "openreport"
+                cmd.OpenReport Trim$(argsStr)
+            Case "runsql"
+                cmd.RunSQL Trim$(argsStr)
+            Case "msgbox"
+                VbaStdLib.ShowMsgBox Trim$(argsStr), 0, "OpenAccess Studio"
+            Case "requery"
+                cmd.Requery Trim$(argsStr)
+            Case "gotocontrol"
+                cmd.GoToControl Trim$(argsStr)
+        End Select
+    End Sub
+
+    Private Function IsValidActionName(ByVal name As String) As Boolean
+        Select Case LCase$(Trim$(name))
+            Case "closewindow", "close", "openform", "openquery", "openreport", _
+                 "runsql", "msgbox", "requery", "gotocontrol", "setwarnings", "runcode", "gotorecord"
+                IsValidActionName = True
+            Case Else
+                IsValidActionName = False
+        End Select
+    End Function
+
+    Private Function ExtractXmlArgument(ByVal xmlText As String, ByVal argName As String) As String
+        On Error Resume Next
+        Dim tagStart As String
+        tagStart = "<Argument Name=""" & argName & """"
+        Dim p As Long
+        p = InStr(1, xmlText, tagStart, vbTextCompare)
+        If p = 0 Then Exit Function
+
+        Dim closeTag As Long
+        closeTag = InStr(p, xmlText, ">")
+        If closeTag = 0 Then Exit Function
+
+        If Mid$(xmlText, closeTag - 1, 1) = "/" Then
+            ' Self closing argument
+            Exit Function
+        End If
+
+        Dim endTag As Long
+        endTag = InStr(closeTag, xmlText, "</Argument>", vbTextCompare)
+        If endTag = 0 Then Exit Function
+
+        ExtractXmlArgument = Trim$(Mid$(xmlText, closeTag + 1, endTag - (closeTag + 1)))
+    End Function
+End Module

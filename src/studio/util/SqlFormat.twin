@@ -1,0 +1,166 @@
+' File: src/studio/util/SqlFormat.twin
+' SQL display formatter (extracted from StudioController, Plan 7 WS8 step 1)
+Option Explicit
+
+Public Module SqlFormat
+
+    Private Function SqlFmtIsWordChar(ByVal ch As String) As Boolean
+        If Len(ch) = 0 Then
+            SqlFmtIsWordChar = False
+        Else
+            SqlFmtIsWordChar = (ch Like "[A-Za-z0-9_]")
+        End If
+    End Function
+
+    Private Function SqlFmtIsWs(ByVal ch As String) As Boolean
+        SqlFmtIsWs = (ch = " " Or ch = vbTab Or ch = vbLf)
+    End Function
+
+    Private Function SqlFmtWordAt(ByRef u As String, ByVal p As Long, ByRef outEnd As Long) As String
+        Dim n As Long
+        Dim q As Long
+        n = Len(u)
+        q = p
+        Do While q <= n
+            If Not SqlFmtIsWordChar(Mid$(u, q, 1)) Then Exit Do
+            q = q + 1
+        Loop
+        outEnd = q
+        If q > p Then
+            SqlFmtWordAt = Mid$(u, p, q - p)
+        Else
+            SqlFmtWordAt = ""
+        End If
+    End Function
+
+    Private Function SqlFmtSkipWs(ByRef u As String, ByVal p As Long) As Long
+        Dim n As Long
+        n = Len(u)
+        Do While p <= n
+            If Not SqlFmtIsWs(Mid$(u, p, 1)) Then Exit Do
+            p = p + 1
+        Loop
+        SqlFmtSkipWs = p
+    End Function
+
+    Private Function SqlFmtStartsClause(ByRef u As String, ByVal p As Long) As Boolean
+        Dim w As String
+        Dim w2 As String
+        Dim q As Long
+        Dim q2 As Long
+        Dim r As Long
+        Dim r2 As Long
+        Dim dummy As Long
+
+        SqlFmtStartsClause = False
+        w = SqlFmtWordAt(u, p, q)
+        Select Case w
+            Case "FROM", "WHERE", "HAVING", "ON", "UNION", "JOIN"
+                SqlFmtStartsClause = True
+            Case "GROUP", "ORDER"
+                r = SqlFmtSkipWs(u, q)
+                If r > q Then
+                    If SqlFmtWordAt(u, r, dummy) = "BY" Then SqlFmtStartsClause = True
+                End If
+            Case "INNER", "LEFT", "RIGHT"
+                r = SqlFmtSkipWs(u, q)
+                If r > q Then
+                    w2 = SqlFmtWordAt(u, r, q2)
+                    If w2 = "JOIN" Then
+                        SqlFmtStartsClause = True
+                    ElseIf w2 = "OUTER" Then
+                        r2 = SqlFmtSkipWs(u, q2)
+                        If r2 > q2 Then
+                            If SqlFmtWordAt(u, r2, dummy) = "JOIN" Then SqlFmtStartsClause = True
+                        End If
+                    End If
+                End If
+        End Select
+    End Function
+
+    Public Function FormatSqlForDisplay(ByVal sqlText As String, ByVal singleLine As Boolean) As String
+        Dim s As String
+        Dim u As String
+        Dim outStr As String
+        Dim ch As String
+        Dim closeCh As String
+        Dim lastCh As String
+        Dim runStr As String
+        Dim n As Long
+        Dim i As Long
+        Dim j As Long
+        Dim a As Long
+        Dim b As Long
+
+        s = Replace$(sqlText, vbCrLf, vbLf)
+        s = Replace$(s, vbCr, vbLf)
+        u = UCase$(s)
+        n = Len(s)
+        outStr = ""
+        closeCh = ""
+        i = 1
+
+        Do While i <= n
+            ch = Mid$(s, i, 1)
+            If Len(closeCh) > 0 Then
+                ' Inside a quoted literal or bracketed identifier: copy as-is.
+                If ch = vbLf And singleLine Then
+                    outStr = outStr & " "
+                Else
+                    outStr = outStr & ch
+                End If
+                If ch = closeCh Then closeCh = ""
+                i = i + 1
+            ElseIf SqlFmtIsWs(ch) Then
+                j = i
+                Do While j <= n
+                    If Not SqlFmtIsWs(Mid$(s, j, 1)) Then Exit Do
+                    j = j + 1
+                Loop
+                runStr = Mid$(s, i, j - i)
+                If singleLine And (InStr(1, runStr, vbLf) > 0 Or InStr(1, runStr, vbTab) > 0) Then
+                    outStr = outStr & " "
+                Else
+                    outStr = outStr & runStr
+                End If
+                i = j
+            Else
+                If ch = "'" Or ch = """" Then
+                    closeCh = ch
+                ElseIf ch = "[" Then
+                    closeCh = "]"
+                ElseIf SqlFmtIsWordChar(ch) And Len(outStr) > 0 Then
+                    lastCh = Right$(outStr, 1)
+                    If lastCh = ")" Or lastCh = "]" Or lastCh = "'" Or lastCh = """" Then
+                        If SqlFmtStartsClause(u, i) Then outStr = outStr & " "
+                    End If
+                End If
+                outStr = outStr & ch
+                i = i + 1
+            End If
+        Loop
+
+        ' Trim trailing whitespace (and leading whitespace in single-line mode).
+        b = Len(outStr)
+        Do While b > 0
+            If Not SqlFmtIsWs(Mid$(outStr, b, 1)) Then Exit Do
+            b = b - 1
+        Loop
+        a = 1
+        If singleLine Then
+            Do While a <= b
+                If Not SqlFmtIsWs(Mid$(outStr, a, 1)) Then Exit Do
+                a = a + 1
+            Loop
+        End If
+        If b >= a Then
+            outStr = Mid$(outStr, a, b - a + 1)
+        Else
+            outStr = ""
+        End If
+
+        If Not singleLine Then outStr = Replace$(outStr, vbLf, vbCrLf)
+        FormatSqlForDisplay = outStr
+    End Function
+
+End Module

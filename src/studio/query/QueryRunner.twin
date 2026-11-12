@@ -1,0 +1,342 @@
+[ Description ("Microsoft Access Parameter Query Engine and Runner") ]
+Module QueryRunner
+    Option Explicit
+    ' =========================================================================
+    ' Plan 7 WS2: Parameter Queries (Fig. 4)
+    ' Resolves declared PARAMETERS and implicit references ([Forms]!..., [TempVars]!...)
+    ' and binds parameters directly to QueryDef without string substitution.
+    ' =========================================================================
+
+    Private m_tempVars As Collection
+
+    Public Sub SetTempVar(ByVal varName As String, ByVal varVal As Variant)
+        If m_tempVars Is Nothing Then Set m_tempVars = New Collection
+        On Error Resume Next
+        m_tempVars.Remove UCase$(Trim$(varName))
+        On Error GoTo 0
+        m_tempVars.Add varVal, UCase$(Trim$(varName))
+    End Sub
+
+    Public Function GetTempVar(ByVal varName As String) As Variant
+        GetTempVar = Empty
+        If m_tempVars Is Nothing Then Exit Function
+        On Error Resume Next
+        GetTempVar = m_tempVars(UCase$(Trim$(varName)))
+        On Error GoTo 0
+    End Function
+
+    Public Sub ClearTempVars()
+        Set m_tempVars = New Collection
+    End Sub
+
+    ' Parses a parameter identifier:
+    ' Examples:
+    '   [Forms]![frmAddProducts]![CategoryID] -> kind="FORM", form="frmAddProducts", ctl="CategoryID"
+    '   Forms!frmAddProducts!CategoryID       -> kind="FORM", form="frmAddProducts", ctl="CategoryID"
+    '   [TempVars]![CurrentUserID]             -> kind="TEMPVAR", form="", ctl="CurrentUserID"
+    '   [Enter Start Date:]                    -> kind="PROMPT", form="", ctl="Enter Start Date:"
+    Public Function ParseParameterName(ByVal paramName As String, ByRef outKind As String, ByRef outForm As String, ByRef outControl As String, ByRef outSubform As String) As Boolean
+        Dim s As String
+        Dim tokens() As String
+        Dim tCount As Long
+        Dim i As Long
+
+        outKind = "PROMPT"
+        outForm = vbNullString
+        outControl = vbNullString
+        outSubform = vbNullString
+        ParseParameterName = False
+
+        s = Trim$(paramName)
+        If Len(s) = 0 Then Exit Function
+
+        ' Remove brackets around individual components: [Forms]![Form1]![Ctl] -> Forms!Form1!Ctl
+        s = Replace$(s, "[", "")
+        s = Replace$(s, "]", "")
+
+        ' Check if syntax uses Forms(...) or Controls(...)
+        s = Replace$(s, "Forms(", "Forms!")
+        s = Replace$(s, "Controls(", "")
+        s = Replace$(s, ")", "")
+        s = Replace$(s, """", "")
+        s = Replace$(s, "'", "")
+
+        ' Normalize Forms.frm.ctl or Forms!frm.ctl dot syntax to Forms!frm!ctl
+        If InStr(1, s, "Forms.", vbTextCompare) = 1 Then
+            s = "Forms!" & Mid$(s, 7)
+        End If
+        If InStr(1, s, "Forms!", vbTextCompare) = 1 Then
+            s = Replace$(s, ".", "!")
+        End If
+
+        ' Split by exclamation mark
+        tokens = Split(s, "!")
+        tCount = UBound(tokens) - LBound(tokens) + 1
+
+        If tCount >= 3 And UCase$(Trim$(tokens(0))) = "FORMS" Then
+            outKind = "FORM"
+            outForm = Trim$(tokens(1))
+            If tCount >= 4 Then
+                outSubform = Trim$(tokens(2))
+                outControl = Trim$(tokens(3))
+            Else
+                outControl = Trim$(tokens(2))
+            End If
+            ParseParameterName = True
+            Exit Function
+        ElseIf tCount >= 2 And UCase$(Trim$(tokens(0))) = "TEMPVARS" Then
+            outKind = "TEMPVAR"
+            outControl = Trim$(tokens(1))
+            ParseParameterName = True
+            Exit Function
+        End If
+
+        outKind = "PROMPT"
+        outControl = s
+        ParseParameterName = True
+    End Function
+
+    ' Resolves a parameter in order:
+    '   1. Forms!<form>!<control>: value from open form
+    '   2. TempVars!x
+    '   3. Otherwise: prompt user with Enter Parameter Value dialog
+    Public Function ResolveParameterValue(ByVal db As Object, ByVal paramName As String, ByVal paramType As Long, ByRef outCancelled As Boolean) As Variant
+        Dim pKind As String
+        Dim pForm As String
+        Dim pControl As String
+        Dim pSubform As String
+        Dim formVal As Variant
+        Dim hasFormVal As Boolean
+        Dim promptLabel As String
+        Dim inputStr As String
+        Dim cleanName As String
+
+        outCancelled = False
+        ResolveParameterValue = Empty
+
+        ParseParameterName paramName, pKind, pForm, pControl, pSubform
+
+        ' 1. Check open form
+        If pKind = "FORM" Then
+            hasFormVal = False
+            formVal = MainForm.GetOpenFormControlValue(pForm, pControl, pSubform)
+            If IsEmpty(formVal) Then
+                formVal = AccessObjectModel.GetFormControlValue(pForm, pControl)
+            End If
+            If Not IsEmpty(formVal) Then
+                ResolveParameterValue = formVal
+                Exit Function
+            End If
+        End If
+
+        ' 2. Check TempVars
+        If pKind = "TEMPVAR" Then
+            Dim tvVal As Variant
+            tvVal = GetTempVar(pControl)
+            If IsEmpty(tvVal) Then
+                tvVal = AccessObjectModel.GetTempVarValue(pControl)
+            End If
+            If Not IsEmpty(tvVal) Then
+                ResolveParameterValue = tvVal
+                Exit Function
+            End If
+        End If
+
+        ' 3. Enter Parameter Value dialog (modal prompt, Cancel aborts silently)
+        cleanName = paramName
+        If Left$(cleanName, 1) = "[" And Right$(cleanName, 1) = "]" And InStr(2, cleanName, "[") = 0 Then
+            cleanName = Mid$(cleanName, 2, Len(cleanName) - 2)
+        End If
+
+        promptLabel = cleanName
+        inputStr = InputBox(promptLabel, "Enter Parameter Value")
+
+        ' In twinBASIC / VB, Cancel returns empty string or null pointer
+        If StrPtr(inputStr) = 0 Then
+            outCancelled = True
+            ResolveParameterValue = Empty
+            Exit Function
+        End If
+
+        If Len(inputStr) = 0 Then
+            ' Check if type allows empty / null
+            If paramType = 10 Or paramType = 12 Then
+                ResolveParameterValue = vbNullString
+            Else
+                outCancelled = True
+                ResolveParameterValue = Empty
+            End If
+            Exit Function
+        End If
+
+        ' Coerce input according to DAO parameter type
+        On Error Resume Next
+        Select Case paramType
+            Case 1  ' dbBoolean
+                If UCase$(inputStr) = "TRUE" Or inputStr = "-1" Or inputStr = "1" Or UCase$(inputStr) = "YES" Then
+                    ResolveParameterValue = True
+                Else
+                    ResolveParameterValue = False
+                End If
+
+            Case 2, 3  ' dbByte, dbInteger
+                ResolveParameterValue = CInt(inputStr)
+
+            Case 4  ' dbLong
+                ResolveParameterValue = CLng(inputStr)
+
+            Case 5  ' dbCurrency
+                ResolveParameterValue = CCur(inputStr)
+
+            Case 6  ' dbSingle
+                ResolveParameterValue = CSng(inputStr)
+
+            Case 7  ' dbDouble
+                ResolveParameterValue = CDbl(inputStr)
+
+            Case 8  ' dbDate
+                ResolveParameterValue = CDate(inputStr)
+
+            Case Else  ' dbText, dbMemo, or unspecified
+                ResolveParameterValue = inputStr
+        End Select
+
+        If Err.Number <> 0 Then
+            Err.Clear
+            ResolveParameterValue = inputStr
+        End If
+        On Error GoTo 0
+    End Function
+
+    ' Primary entry point: opens any query (saved QueryDef name or raw SQL),
+    ' resolves all declared or implicit parameters, binds them and returns the Recordset.
+    Public Function OpenQueryRecordset(ByVal db As Object, ByVal queryNameOrSql As String, Optional ByRef outCancelled As Boolean = False, Optional ByRef outErrorMsg As String = "") As Object
+        Dim qdf As Object
+        Dim isTempQdf As Boolean
+        Dim i As Long
+        Dim pName As String
+        Dim pType As Long
+        Dim pVal As Variant
+        Dim rs As Object
+
+        outCancelled = False
+        outErrorMsg = vbNullString
+        Set OpenQueryRecordset = Nothing
+
+        If db Is Nothing Then
+            outErrorMsg = "No database open."
+            Exit Function
+        End If
+
+        isTempQdf = False
+        On Error Resume Next
+        Set qdf = db.QueryDefs(queryNameOrSql)
+        If Err.Number <> 0 Or qdf Is Nothing Then
+            Err.Clear
+            Set qdf = db.CreateQueryDef("", queryNameOrSql)
+            If Err.Number <> 0 Or qdf Is Nothing Then
+                outErrorMsg = "Query error: " & Err.Description
+                Err.Clear
+                On Error GoTo 0
+                Exit Function
+            End If
+            isTempQdf = True
+        End If
+        On Error GoTo 0
+
+        ' Bind parameters
+        On Error Resume Next
+        If qdf.Parameters.Count > 0 Then
+            For i = 0 To qdf.Parameters.Count - 1
+                pName = qdf.Parameters(i).Name
+                pType = qdf.Parameters(i).Type
+                pVal = ResolveParameterValue(db, pName, pType, outCancelled)
+                If outCancelled Then
+                    If isTempQdf Then
+                        On Error Resume Next
+                        qdf.Close
+                        Set qdf = Nothing
+                        On Error GoTo 0
+                    End If
+                    Exit Function
+                End If
+                qdf.Parameters(i).Value = pVal
+            Next i
+        End If
+        Err.Clear
+
+        Set rs = qdf.OpenRecordset()
+        If Err.Number <> 0 Then
+            outErrorMsg = "Cannot open query: " & Err.Description
+            Set rs = Nothing
+        End If
+        Err.Clear
+        On Error GoTo 0
+
+        Set OpenQueryRecordset = rs
+
+        If isTempQdf And Not qdf Is Nothing Then
+            On Error Resume Next
+            qdf.Close
+            Set qdf = Nothing
+            On Error GoTo 0
+        End If
+    End Function
+
+    ' Executes parameterized action SQL queries (INSERT, UPDATE, DELETE)
+    Public Function ExecuteActionQuery(ByVal db As Object, ByVal actionSql As String, ByRef outRowsAffected As Long, ByRef outCancelled As Boolean, ByRef outErrorMsg As String) As Boolean
+        Dim qdf As Object
+        Dim i As Long
+        Dim pName As String
+        Dim pType As Long
+        Dim pVal As Variant
+
+        outRowsAffected = 0
+        outCancelled = False
+        outErrorMsg = vbNullString
+        ExecuteActionQuery = False
+
+        If db Is Nothing Then
+            outErrorMsg = "No database open."
+            Exit Function
+        End If
+
+        On Error Resume Next
+        Set qdf = db.CreateQueryDef("", actionSql)
+        If Err.Number <> 0 Or qdf Is Nothing Then
+            outErrorMsg = "Action query error: " & Err.Description
+            Err.Clear
+            On Error GoTo 0
+            Exit Function
+        End If
+
+        If qdf.Parameters.Count > 0 Then
+            For i = 0 To qdf.Parameters.Count - 1
+                pName = qdf.Parameters(i).Name
+                pType = qdf.Parameters(i).Type
+                pVal = ResolveParameterValue(db, pName, pType, outCancelled)
+                If outCancelled Then
+                    qdf.Close
+                    Set qdf = Nothing
+                    Exit Function
+                End If
+                qdf.Parameters(i).Value = pVal
+            Next i
+        End If
+
+        qdf.Execute &H80&
+        If Err.Number <> 0 Then
+            outErrorMsg = "Action execution error: " & Err.Description
+            ExecuteActionQuery = False
+        Else
+            outRowsAffected = qdf.RecordsAffected
+            ExecuteActionQuery = True
+        End If
+
+        qdf.Close
+        Set qdf = Nothing
+        Err.Clear
+        On Error GoTo 0
+    End Function
+
+End Module

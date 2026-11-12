@@ -1,0 +1,703 @@
+' File: src/catalog/CatalogReader.twin
+' Bounds-Checked Page Reader, Fast In-Memory Page Directory Cache, and Jet 4 / ACE TDEF Parser
+Module CatalogReader
+
+    Option Explicit
+
+    Public Enum JetColumnType
+        ColBoolean = &H1&
+        ColByte = &H2&
+        ColInteger = &H3&
+        ColLong = &H4&
+        ColCurrency = &H5&
+        ColSingle = &H6&
+        ColDouble = &H7&
+        ColDateTime = &H8&
+        ColBinary = &H9&
+        ColText = &HA&
+        ColLongBinary = &HB&
+        ColMemo = &HC&
+        ColGUID = &HF&
+        ColDecimal = &H10&          ' Jet4/ACE NUMERIC (17 bytes fixed, or 16 bytes legacy)
+        ColComplex = &H12&          ' ACE Complex / Attachment / Multi-Value (4 bytes Long ID)
+        ColBigInt = &H13&           ' ACE BigInt / Large Number (8 bytes Int64)
+        ColDateTimeExtended = &H14& ' ACE DateTimeExtended
+    End Enum
+
+    Public Type ColumnDescriptor
+        Name As String
+        ColType As JetColumnType
+        ColNumber As Integer
+        VarOffsetIndex As Integer
+        ColId As Integer
+        IsFixed As Boolean
+        IsAutoNumber As Boolean
+        CompressedUnicode As Boolean
+        FixedOffset As Integer
+        ByteLength As Integer
+        SourceTable As String
+    End Type
+
+    Public Type IndexDescriptor
+        Name As String
+        IndexNumber As Integer
+        RootPageNumber As Long
+        IsPrimary As Boolean
+        IsUnique As Boolean
+        ColumnCount As Integer
+        ColumnNames() As String
+        RealIdxNum As Long
+        IndexType As Byte
+        RelTblType As Byte
+        RelIdxNum As Long
+        RelTblPage As Long
+        CascadeUpdates As Byte
+        CascadeDeletes As Byte
+        RealIdxFlags As Byte
+    End Type
+
+    Public Type TableDefDescriptor
+        TableName As String
+        TdefPageNumber As Long
+        TableTypeByte As Byte
+        RowCount As Long
+        AutoNumberNext As Long
+        PrimaryDataPage As Long
+        ColumnCount As Integer
+        VariableColumnCount As Integer
+        Columns() As ColumnDescriptor
+        IndexCount As Integer
+        Indexes() As IndexDescriptor
+    End Type
+
+    Private Const PAGE_SIZE_JET4 As Long = 4096
+    Private Const PAGE_TYPE_DATA As Byte = &H1&
+    Private Const PAGE_TYPE_TDEF As Byte = &H2&
+
+    Private Const CACHE_SLOTS As Long = 2048
+
+    #If Win64 Then
+        Private Declare PtrSafe Sub CopyMemory Lib "kernel32" Alias "RtlMoveMemory" (ByVal Destination As LongPtr, ByVal Source As LongPtr, ByVal Length As LongLong)
+    #Else
+        Private Declare Sub CopyMemory Lib "kernel32" Alias "RtlMoveMemory" (ByVal Destination As LongPtr, ByVal Source As LongPtr, ByVal Length As Long)
+    #End If
+
+    Private m_cacheData() As Byte
+    Private m_cacheFileNum() As Integer
+    Private m_cachePageNum() As Long
+    Private m_cacheReady As Boolean
+
+    ' Fast Page Directory Cache per FileNum
+    Private m_cachedFileNum As Integer
+    Private m_cachedTotalPages As Long
+    Private m_dataPageOwners() As Long
+
+    Private Sub EnsurePageCacheInit()
+        Dim i As Long
+        If m_cacheReady Then Exit Sub
+        ReDim m_cacheData(0 To PAGE_SIZE_JET4 - 1, 0 To CACHE_SLOTS - 1)
+        ReDim m_cacheFileNum(0 To CACHE_SLOTS - 1)
+        ReDim m_cachePageNum(0 To CACHE_SLOTS - 1)
+        For i = 0 To CACHE_SLOTS - 1
+            m_cachePageNum(i) = -1
+        Next i
+        m_cacheReady = True
+    End Sub
+
+    Public Function TryGetCachedPage(ByVal fileNum As Integer, ByVal pageNumber As Long, ByRef outBuf() As Byte) As Boolean
+        Dim slot As Long
+        EnsurePageCacheInit
+        slot = ((pageNumber And &H7FFFFFFF) + CLng(fileNum)) Mod CACHE_SLOTS
+        If m_cachePageNum(slot) = pageNumber And m_cacheFileNum(slot) = fileNum Then
+            ReDim outBuf(0 To PAGE_SIZE_JET4 - 1)
+            #If Win64 Then
+                CopyMemory VarPtr(outBuf(0)), VarPtr(m_cacheData(0, slot)), 4096^
+            #Else
+                CopyMemory VarPtr(outBuf(0)), VarPtr(m_cacheData(0, slot)), 4096&
+            #End If
+            TryGetCachedPage = True
+        Else
+            TryGetCachedPage = False
+        End If
+    End Function
+
+    Public Sub PutCachedPage(ByVal fileNum As Integer, ByVal pageNumber As Long, ByRef pageBuf() As Byte)
+        Dim slot As Long
+        If pageNumber < 0 Then Exit Sub
+        If (UBound(pageBuf) - LBound(pageBuf) + 1) <> PAGE_SIZE_JET4 Then Exit Sub
+        EnsurePageCacheInit
+        slot = ((pageNumber And &H7FFFFFFF) + CLng(fileNum)) Mod CACHE_SLOTS
+        #If Win64 Then
+            CopyMemory VarPtr(m_cacheData(0, slot)), VarPtr(pageBuf(LBound(pageBuf))), 4096^
+        #Else
+            CopyMemory VarPtr(m_cacheData(0, slot)), VarPtr(pageBuf(LBound(pageBuf))), 4096&
+        #End If
+        m_cacheFileNum(slot) = fileNum
+        m_cachePageNum(slot) = pageNumber
+    End Sub
+
+    Public Sub DropFilePageCache(Optional ByVal fileNum As Integer = 0)
+        Dim i As Long
+        If Not m_cacheReady Then Exit Sub
+        For i = 0 To CACHE_SLOTS - 1
+            If fileNum = 0 Or m_cacheFileNum(i) = fileNum Then
+                m_cachePageNum(i) = -1
+                m_cacheFileNum(i) = 0
+            End If
+        Next i
+    End Sub
+
+    Public Sub InvalidatePageDirectory()
+        m_cachedFileNum = 0
+        m_cachedTotalPages = 0
+        Erase m_dataPageOwners
+        DropFilePageCache 0
+    End Sub
+
+    Public Sub EnsurePageDirectory(ByVal fileNum As Integer, ByVal totalPages As Long)
+        If m_cachedFileNum = fileNum And m_cachedTotalPages = totalPages And totalPages > 0 Then
+            Exit Sub
+        End If
+        If totalPages <= 0 Then Exit Sub
+
+        ReDim m_dataPageOwners(0 To totalPages - 1)
+        Dim p As Long
+        Dim buf(0 To 7) As Byte
+        Dim byteOffset As LongLong
+
+        For p = 0 To totalPages - 1
+            byteOffset = (CLngLng(p) * 4096^) + 1^
+            Get #fileNum, CLng(byteOffset), buf
+            If buf(0) = PAGE_TYPE_DATA Then
+                Dim pageOwner As Long
+                pageOwner = FormatProbe.ReadInt32LE(buf, 4)
+                If pageOwner <= 0 Or pageOwner = &H4C56414C Then
+                    m_dataPageOwners(p) = -1
+                Else
+                    m_dataPageOwners(p) = pageOwner
+                End If
+            Else
+                m_dataPageOwners(p) = -1
+            End If
+        Next p
+
+        m_cachedFileNum = fileNum
+        m_cachedTotalPages = totalPages
+    End Sub
+
+    Public Sub RegisterDataPage(ByVal fileNum As Integer, ByVal tdefPage As Long, ByVal newDataPage As Long)
+        If m_cachedFileNum = fileNum And newDataPage >= 0 Then
+            If newDataPage >= m_cachedTotalPages Then
+                ReDim Preserve m_dataPageOwners(0 To newDataPage)
+                m_cachedTotalPages = newDataPage + 1
+            End If
+            m_dataPageOwners(newDataPage) = tdefPage
+        End If
+    End Sub
+
+    Public Function ReadPageBytes(ByVal fileNum As Integer, ByVal totalPages As Long, ByVal pageNumber As Long, Optional ByVal pageSize As Long = PAGE_SIZE_JET4) As Byte()
+        Dim pageBuf() As Byte
+        Dim byteOffset As LongLong
+
+        If pageNumber < 0 Or pageNumber >= totalPages Then
+            Err.Raise vbObjectError + 3101, "CatalogReader.ReadPageBytes", "Page number " & CStr(pageNumber) & " is out of bounds (TotalPages=" & CStr(totalPages) & ")."
+        End If
+
+        If pageSize = PAGE_SIZE_JET4 Then
+            If TryGetCachedPage(fileNum, pageNumber, pageBuf) Then
+                ReadPageBytes = pageBuf
+                Exit Function
+            End If
+        End If
+
+        ReDim pageBuf(0 To pageSize - 1)
+        byteOffset = (CLngLng(pageNumber) * CLngLng(pageSize)) + 1^
+        Get #fileNum, CLng(byteOffset), pageBuf
+
+        If pageSize = PAGE_SIZE_JET4 Then
+            PutCachedPage fileNum, pageNumber, pageBuf
+        End If
+        ReadPageBytes = pageBuf
+    End Function
+
+    Public Function FindAllDataPages(ByVal fileNum As Integer, ByVal totalPages As Long, ByVal tdefPage As Long) As Collection
+        Dim coll As New Collection
+        If totalPages <= 0 Or tdefPage <= 0 Then
+            Set FindAllDataPages = coll
+            Exit Function
+        End If
+
+        ' 1. Try reading Usage Map at TDEF offset 55 first
+        On Error Resume Next
+        Dim uPages As Collection
+        Set uPages = ReadUsageMapPages(fileNum, totalPages, tdefPage)
+        If Err.Number = 0 And Not uPages Is Nothing Then
+            If uPages.Count > 0 Then
+                Set FindAllDataPages = uPages
+                Exit Function
+            End If
+        End If
+        Err.Clear
+        On Error GoTo 0
+
+        ' 2. Fallback to EnsurePageDirectory (safe fallback for all in-memory or locally created tables)
+        EnsurePageDirectory fileNum, totalPages
+        Dim p As Long
+        For p = 0 To m_cachedTotalPages - 1
+            If m_dataPageOwners(p) = tdefPage Then
+                coll.Add p
+            End If
+        Next p
+        Set FindAllDataPages = coll
+    End Function
+
+    Public Function ReadUsageMapPages(ByVal fileNum As Integer, ByVal totalPages As Long, ByVal tdefPage As Long) As Collection
+        Dim coll As New Collection
+        Dim tp() As Byte
+        Dim ptr As Long
+        Dim slot As Long
+        Dim uPage As Long
+        Dim up() As Byte
+        Dim numRows As Long
+        Dim rawEntry As Long
+        Dim rowStart As Long
+        Dim rowEnd As Long
+        Dim prevEntry As Long
+        Dim mapType As Byte
+        Dim basePage As Long
+        Dim bLen As Long
+        Dim bIdx As Long
+        Dim bit As Long
+        Dim bVal As Byte
+        Dim targetPg As Long
+        Dim ptrSlots As Long
+        Dim bitsPerPage As Long
+        Dim chunk As Long
+        Dim refPg As Long
+        Dim refBuf() As Byte
+        Dim bOff As Long
+        Dim bVal2 As Byte
+        Dim bit2 As Long
+        Dim targetPg2 As Long
+
+        If fileNum <= 0 Or totalPages <= 0 Or tdefPage <= 0 Then
+            Set ReadUsageMapPages = coll
+            Exit Function
+        End If
+
+        tp = ReadPageBytes(fileNum, totalPages, tdefPage)
+        If tp(0) <> PAGE_TYPE_TDEF Then
+            Set ReadUsageMapPages = coll
+            Exit Function
+        End If
+
+        ptr = FormatProbe.ReadInt32LE(tp, 55)
+        If ptr <= 0 Then
+            Set ReadUsageMapPages = coll
+            Exit Function
+        End If
+
+        slot = ptr And &HFF&
+        uPage = (ptr \ 256&) And &HFFFFFF&
+        If uPage <= 0 Or uPage >= totalPages Then
+            Set ReadUsageMapPages = coll
+            Exit Function
+        End If
+
+        up = ReadPageBytes(fileNum, totalPages, uPage)
+        If up(0) <> PAGE_TYPE_DATA Then
+            Set ReadUsageMapPages = coll
+            Exit Function
+        End If
+
+        numRows = CLng(up(12)) Or (CLng(up(13)) * 256&)
+        If slot < 0 Or slot >= numRows Then
+            Set ReadUsageMapPages = coll
+            Exit Function
+        End If
+
+        rawEntry = CLng(up(14 + (slot * 2))) Or (CLng(up(15 + (slot * 2))) * 256&)
+        If (rawEntry And &H8000&) <> 0 Then
+            Set ReadUsageMapPages = coll
+            Exit Function
+        End If
+
+        rowStart = rawEntry And &H1FFF&
+        rowEnd = PAGE_SIZE_JET4
+        Dim sScan As Long
+        For sScan = 0 To numRows - 1
+            If sScan <> slot Then
+                prevEntry = CLng(up(14 + (sScan * 2))) Or (CLng(up(15 + (sScan * 2))) * 256&)
+                If (prevEntry And &H1FFF&) > rowStart And (prevEntry And &H1FFF&) < rowEnd Then
+                    rowEnd = prevEntry And &H1FFF&
+                End If
+            End If
+        Next sScan
+
+        If rowStart <= 0 Or rowEnd > PAGE_SIZE_JET4 Or rowStart >= rowEnd Then
+            Set ReadUsageMapPages = coll
+            Exit Function
+        End If
+
+        mapType = up(rowStart)
+
+        If mapType = 0 Then
+            ' Type 0: Inline bitmap
+            basePage = FormatProbe.ReadInt32LE(up, rowStart + 1)
+            bLen = rowEnd - (rowStart + 5)
+            For bIdx = 0 To bLen - 1
+                bVal = up(rowStart + 5 + bIdx)
+                If bVal <> 0 Then
+                    For bit = 0 To 7
+                        If (bVal And CByte(2 ^ bit)) <> 0 Then
+                            targetPg = basePage + (bIdx * 8) + bit
+                            If targetPg > 0 And targetPg < totalPages Then
+                                coll.Add targetPg
+                            End If
+                        End If
+                    Next bit
+                End If
+            Next bIdx
+        ElseIf mapType = 1 Then
+            ' Type 1: Reference map pointers
+            ptrSlots = (rowEnd - (rowStart + 1)) \ 4
+            bitsPerPage = (PAGE_SIZE_JET4 - 4) * 8
+            For chunk = 0 To ptrSlots - 1
+                refPg = FormatProbe.ReadInt32LE(up, rowStart + 1 + (chunk * 4))
+                If refPg > 0 And refPg < totalPages Then
+                    refBuf = ReadPageBytes(fileNum, totalPages, refPg)
+                    If refBuf(0) = &H5& Then
+                        For bOff = 4 To PAGE_SIZE_JET4 - 1
+                            bVal2 = refBuf(bOff)
+                            If bVal2 <> 0 Then
+                                For bit2 = 0 To 7
+                                    If (bVal2 And CByte(2 ^ bit2)) <> 0 Then
+                                        targetPg2 = (chunk * bitsPerPage) + ((bOff - 4) * 8) + bit2
+                                        If targetPg2 > 0 And targetPg2 < totalPages Then
+                                            coll.Add targetPg2
+                                        End If
+                                    End If
+                                Next bit2
+                            End If
+                        Next bOff
+                    End If
+                End If
+            Next chunk
+        End If
+
+        Set ReadUsageMapPages = coll
+    End Function
+
+    Public Function ParseTableDef(ByVal fileNum As Integer, ByVal totalPages As Long, ByVal tdefPage As Long, Optional ByVal tableName As String = "") As TableDefDescriptor
+        Dim stepId As Long
+        stepId = 1
+        On Error GoTo StepErr
+        Dim p() As Byte
+        p = ReadPageBytes(fileNum, totalPages, tdefPage)
+
+        If p(0) <> PAGE_TYPE_TDEF Then
+            Err.Raise vbObjectError + 3102, "CatalogReader.ParseTableDef", "Page " & CStr(tdefPage) & " is not a valid TDEF page (type=&H" & Hex$(p(0)) & ")."
+        End If
+
+        ' Concatenate chained TDEF pages if NextTdefPagePtr (at offset 4) is non-zero
+        Dim nextTdef As Long
+        nextTdef = FormatProbe.ReadInt32LE(p, 4)
+        Dim chainGuard As Long
+        chainGuard = 0
+        Do While nextTdef > 0 And nextTdef < totalPages And chainGuard < 16
+            Dim nextBuf() As Byte
+            nextBuf = ReadPageBytes(fileNum, totalPages, nextTdef)
+            If nextBuf(0) <> PAGE_TYPE_TDEF Then Exit Do
+            nextTdef = FormatProbe.ReadInt32LE(nextBuf, 4)
+            Dim oldUBound As Long
+            oldUBound = UBound(p)
+            Dim payloadLen As Long
+            payloadLen = PAGE_SIZE_JET4 - 8
+            ReDim Preserve p(0 To oldUBound + payloadLen)
+            Dim k As Long
+            For k = 0 To payloadLen - 1
+                p(oldUBound + 1 + k) = nextBuf(8 + k)
+            Next k
+            chainGuard = chainGuard + 1
+        Loop
+
+        Dim maxBufLen As Long
+        maxBufLen = UBound(p) + 1
+
+        stepId = 2
+        Dim tdef As TableDefDescriptor
+        tdef.TableName = tableName
+        tdef.TdefPageNumber = tdefPage
+        tdef.RowCount = FormatProbe.ReadInt32LE(p, 16)
+        tdef.AutoNumberNext = FormatProbe.ReadInt32LE(p, 20)
+        tdef.TableTypeByte = p(40)
+        tdef.VariableColumnCount = CInt(FormatProbe.ReadUInt16LE(p, 43))
+        tdef.ColumnCount = CInt(FormatProbe.ReadUInt16LE(p, 45))
+        Dim numRealIdx As Long
+        numRealIdx = FormatProbe.ReadInt32LE(p, 51)
+
+        Dim dPages As Collection
+        stepId = 3
+        Set dPages = FindAllDataPages(fileNum, totalPages, tdefPage)
+        If dPages.Count > 0 Then
+            tdef.PrimaryDataPage = CLng(dPages(1))
+        Else
+            ' Offset 55 in Jet4/ACE TDEF is the Usage Map pointer ((uPage * 256) + slot), NOT a data page!
+            ' Only accept a candidate page if it is an actual 0x01 Data Page owned by tdefPage.
+            Dim candPrimary As Long
+            candPrimary = FormatProbe.ReadInt32LE(p, 55)
+            If candPrimary > 0 And candPrimary < totalPages Then
+                Dim candBuf() As Byte
+                candBuf = ReadPageBytes(fileNum, totalPages, candPrimary)
+                If candBuf(0) = PAGE_TYPE_DATA And FormatProbe.ReadInt32LE(candBuf, 4) = tdefPage Then
+                    tdef.PrimaryDataPage = candPrimary
+                Else
+                    tdef.PrimaryDataPage = 0
+                End If
+            Else
+                tdef.PrimaryDataPage = 0
+            End If
+        End If
+
+        If tdef.ColumnCount <= 0 Then
+            ParseTableDef = tdef
+            Exit Function
+        End If
+        stepId = 4
+        ReDim tdef.Columns(0 To tdef.ColumnCount - 1)
+
+        Dim off As Long
+        Dim i As Integer
+        off = 63 + (12 * numRealIdx)
+
+        For i = 0 To tdef.ColumnCount - 1
+            If off + 25 > maxBufLen Then
+                Err.Raise vbObjectError + 3103, "CatalogReader.ParseTableDef", "Corrupt TDEF column block offset."
+            End If
+            ' NOTE: Freshly created (never compacted) MS Access .accdb files leave uninitialized
+            ' garbage in unused column descriptor fields (e.g. the fixed offset of variable-length
+            ' columns in MSysObjects holds 0xFFFF / 0xE000 / 0x8BDA ...). A plain CInt() on those
+            ' UInt16 values raised Overflow (error 6), so ParseTableDef failed for MSysObjects and
+            ' new tables never got their catalog row. Compact & Repair zeroes these bytes.
+            tdef.Columns(i).ColType = CInt(p(off))
+            tdef.Columns(i).ColNumber = SafeUInt16ToInt(FormatProbe.ReadUInt16LE(p, off + 5))
+            tdef.Columns(i).VarOffsetIndex = SafeUInt16ToInt(FormatProbe.ReadUInt16LE(p, off + 7))
+            tdef.Columns(i).ColId = SafeUInt16ToInt(FormatProbe.ReadUInt16LE(p, off + 9))
+            tdef.Columns(i).IsFixed = ((p(off + 15) And &H1&) <> 0)
+            tdef.Columns(i).IsAutoNumber = ((p(off + 15) And &H4&) <> 0)
+            tdef.Columns(i).CompressedUnicode = ((p(off + 16) And &H1&) <> 0)
+            If tdef.Columns(i).IsFixed Then
+                tdef.Columns(i).FixedOffset = SafeUInt16ToInt(FormatProbe.ReadUInt16LE(p, off + 21))
+                If tdef.Columns(i).FixedOffset < 0 Or tdef.Columns(i).FixedOffset >= PAGE_SIZE_JET4 Then
+                    tdef.Columns(i).FixedOffset = 0
+                End If
+            Else
+                ' Fixed offset is meaningless for variable-length columns and may hold garbage
+                tdef.Columns(i).FixedOffset = 0
+            End If
+            tdef.Columns(i).ByteLength = SafeUInt16ToInt(FormatProbe.ReadUInt16LE(p, off + 23))
+            off = off + 25
+        Next i
+
+        stepId = 5
+        For i = 0 To tdef.ColumnCount - 1
+            If off + 2 > maxBufLen Then
+                Err.Raise vbObjectError + 3104, "CatalogReader.ParseTableDef", "Corrupt TDEF column name length."
+            End If
+            Dim nameLen As Integer
+            nameLen = CInt(FormatProbe.ReadUInt16LE(p, off))
+            off = off + 2
+            If off + nameLen > maxBufLen Then
+                Err.Raise vbObjectError + 3105, "CatalogReader.ParseTableDef", "Truncated UCS-2 column name in TDEF."
+            End If
+            tdef.Columns(i).Name = FormatProbe.DecodeUcs2LE(p, off, nameLen)
+            tdef.Columns(i).SourceTable = tableName
+            off = off + nameLen
+        Next i
+
+        ' Parse index metadata if numIdx > 0
+        stepId = 6
+        Dim numIdx As Long
+        numIdx = FormatProbe.ReadInt32LE(p, 47)
+        If numIdx > 0 Then
+            tdef.IndexCount = CInt(numIdx)
+            ReDim tdef.Indexes(0 To numIdx - 1)
+            Dim customOk As Boolean
+            customOk = False
+            If numRealIdx = 0 And off + 2 <= maxBufLen Then
+                Dim testNameLen As Long
+                testNameLen = FormatProbe.ReadUInt16LE(p, off)
+                If testNameLen > 0 And testNameLen <= 128 And (off + 2 + testNameLen) <= maxBufLen Then
+                    customOk = True
+                End If
+            End If
+
+            If customOk Then
+                Dim readIdxI As Integer
+                For readIdxI = 0 To CInt(numIdx - 1)
+                    If off + 2 <= maxBufLen Then
+                        Dim curIdxNameLen As Long
+                        curIdxNameLen = FormatProbe.ReadUInt16LE(p, off)
+                        off = off + 2
+                        If curIdxNameLen > 0 And off + curIdxNameLen <= maxBufLen Then
+                            tdef.Indexes(readIdxI).Name = FormatProbe.DecodeUcs2LE(p, off, CInt(curIdxNameLen))
+                            off = off + curIdxNameLen
+                        End If
+                        If off + 2 <= maxBufLen Then
+                            tdef.Indexes(readIdxI).IsUnique = (p(off) <> 0)
+                            tdef.Indexes(readIdxI).IsPrimary = (p(off + 1) <> 0)
+                            off = off + 2
+                        End If
+                        If off + 2 <= maxBufLen Then
+                            Dim curIdxColCount As Long
+                            curIdxColCount = FormatProbe.ReadUInt16LE(p, off)
+                            off = off + 2
+                            tdef.Indexes(readIdxI).ColumnCount = CInt(curIdxColCount)
+                            If curIdxColCount > 0 Then
+                                ReDim tdef.Indexes(readIdxI).ColumnNames(0 To curIdxColCount - 1)
+                                Dim curCIdx As Integer
+                                For curCIdx = 0 To CInt(curIdxColCount - 1)
+                                    If off + 2 <= maxBufLen Then
+                                        Dim curCNameLen As Long
+                                        curCNameLen = FormatProbe.ReadUInt16LE(p, off)
+                                        off = off + 2
+                                        If curCNameLen > 0 And off + curCNameLen <= maxBufLen Then
+                                            tdef.Indexes(readIdxI).ColumnNames(curCIdx) = FormatProbe.DecodeUcs2LE(p, off, CInt(curCNameLen))
+                                            off = off + curCNameLen
+                                        End If
+                                    End If
+                                Next curCIdx
+                            End If
+                        End If
+                    End If
+                Next readIdxI
+            Else
+                Dim offIdxDefs As Long
+                offIdxDefs = off + (52 * numRealIdx)
+                Dim offIdxNames As Long
+                offIdxNames = offIdxDefs + (28 * numIdx)
+
+                Dim startNameOff As Long
+                startNameOff = offIdxNames
+                Dim testTry As Long
+                For testTry = 0 To 8 Step 4
+                    Dim curTryOff As Long
+                    curTryOff = offIdxNames + testTry
+                    If curTryOff + 4 < maxBufLen Then
+                        Dim tryLen As Long
+                        tryLen = FormatProbe.ReadUInt16LE(p, curTryOff)
+                        If tryLen > 0 And tryLen <= 128 And (curTryOff + 2 + tryLen) <= maxBufLen Then
+                            If p(curTryOff + 3) = 0 And p(curTryOff + 2) >= 32 And p(curTryOff + 2) <= 126 Then
+                                startNameOff = curTryOff
+                                Exit For
+                            End If
+                        End If
+                    End If
+                Next testTry
+
+                Dim idxScanOff As Long
+                idxScanOff = startNameOff
+                Dim idxI As Integer
+                For idxI = 0 To CInt(numIdx - 1)
+                    If idxScanOff + 2 <= maxBufLen Then
+                        Dim idxNameLen As Long
+                        idxNameLen = FormatProbe.ReadUInt16LE(p, idxScanOff)
+                        idxScanOff = idxScanOff + 2
+                        If idxScanOff + idxNameLen <= maxBufLen And idxNameLen > 0 Then
+                            tdef.Indexes(idxI).Name = FormatProbe.DecodeUcs2LE(p, idxScanOff, CInt(idxNameLen))
+                            idxScanOff = idxScanOff + idxNameLen
+                        End If
+                    End If
+
+                    Dim defEntryOff As Long
+                    defEntryOff = offIdxDefs + (idxI * 28)
+                    Dim realIdxNum As Long
+                    realIdxNum = idxI
+                    tdef.Indexes(idxI).IndexNumber = idxI
+                    tdef.Indexes(idxI).RealIdxNum = idxI
+                    tdef.Indexes(idxI).RelIdxNum = -1&
+                    If defEntryOff + 28 <= maxBufLen Then
+                        realIdxNum = FormatProbe.ReadInt32LE(p, defEntryOff + 8)
+                        If realIdxNum < 0 Or realIdxNum >= numRealIdx Then realIdxNum = 0
+                        tdef.Indexes(idxI).RealIdxNum = realIdxNum
+                        tdef.Indexes(idxI).RelTblType = p(defEntryOff + 12)
+                        tdef.Indexes(idxI).RelIdxNum = FormatProbe.ReadInt32LE(p, defEntryOff + 13)
+                        tdef.Indexes(idxI).RelTblPage = FormatProbe.ReadInt32LE(p, defEntryOff + 17)
+                        tdef.Indexes(idxI).CascadeUpdates = p(defEntryOff + 21)
+                        tdef.Indexes(idxI).CascadeDeletes = p(defEntryOff + 22)
+                        Dim flagByte23 As Byte
+                        flagByte23 = p(defEntryOff + 23)
+                        tdef.Indexes(idxI).IndexType = flagByte23
+                        tdef.Indexes(idxI).IsPrimary = (flagByte23 = 1) Or (UCase$(tdef.Indexes(idxI).Name) = "PRIMARYKEY")
+                        tdef.Indexes(idxI).IsUnique = tdef.Indexes(idxI).IsPrimary
+                    End If
+                    Dim realEntryOff As Long
+                    realEntryOff = off + (realIdxNum * 52)
+                    If realEntryOff + 52 <= maxBufLen Then
+                        tdef.Indexes(idxI).RealIdxFlags = p(realEntryOff + 46)
+                        If (p(realEntryOff + 46) And &H1&) <> 0 And tdef.Indexes(idxI).IndexType <> 2 Then
+                            tdef.Indexes(idxI).IsUnique = True
+                        End If
+                    End If
+
+                    If Len(tdef.Indexes(idxI).Name) > 0 Then
+                        Dim matchCol As String
+                        matchCol = vbNullString
+                        Dim cIdx As Integer
+                        If realEntryOff + 52 <= maxBufLen Then
+                            Dim keyColNum0 As Long
+                            keyColNum0 = FormatProbe.ReadUInt16LE(p, realEntryOff + 4)
+                            If keyColNum0 >= 0 And keyColNum0 < 256 Then
+                                For cIdx = 0 To tdef.ColumnCount - 1
+                                    If tdef.Columns(cIdx).ColNumber = keyColNum0 Then
+                                        matchCol = tdef.Columns(cIdx).Name
+                                        Exit For
+                                    End If
+                                Next cIdx
+                            End If
+                        End If
+                        If Len(matchCol) = 0 Then
+                            For cIdx = 0 To tdef.ColumnCount - 1
+                                If StrComp(tdef.Columns(cIdx).Name, tdef.Indexes(idxI).Name, vbTextCompare) = 0 Then
+                                    matchCol = tdef.Columns(cIdx).Name
+                                    Exit For
+                                End If
+                            Next cIdx
+                        End If
+                        If Len(matchCol) = 0 And tdef.Indexes(idxI).IsPrimary Then
+                            For cIdx = 0 To tdef.ColumnCount - 1
+                                If tdef.Columns(cIdx).IsAutoNumber Then
+                                    matchCol = tdef.Columns(cIdx).Name
+                                    Exit For
+                                End If
+                            Next cIdx
+                            If Len(matchCol) = 0 And tdef.ColumnCount > 0 Then matchCol = tdef.Columns(0).Name
+                        End If
+                        If Len(matchCol) > 0 Then
+                            tdef.Indexes(idxI).ColumnCount = 1
+                            ReDim tdef.Indexes(idxI).ColumnNames(0 To 0)
+                            tdef.Indexes(idxI).ColumnNames(0) = matchCol
+                        End If
+                    End If
+                Next idxI
+            End If
+        End If
+
+        ParseTableDef = tdef
+        Exit Function
+StepErr:
+        Err.Raise Err.Number, "CatalogReader.ParseTableDef", Err.Description
+    End Function
+
+    ' Converts an unsigned 16-bit value (0..65535) to a VBA Integer without raising Overflow.
+    ' Values above 32767 are reinterpreted as their signed two's-complement equivalent.
+    Private Function SafeUInt16ToInt(ByVal v As Long) As Integer
+        v = v And &HFFFF&
+        If v > 32767& Then
+            SafeUInt16ToInt = CInt(v - 65536&)
+        Else
+            SafeUInt16ToInt = CInt(v)
+        End If
+    End Function
+
+End Module

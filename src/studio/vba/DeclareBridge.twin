@@ -1,0 +1,345 @@
+' File: src/studio/vba/DeclareBridge.twin
+' Plan 7 WS5.7: Declare Bridge for VBA External API Invocation
+Option Explicit
+
+Public Module DeclareBridge
+    Private Type DeclareEntry
+        FuncName As String
+        DllName As String
+        AliasName As String
+        ReturnType As String
+        ParamTypes() As String
+        ParamCount As Long
+        IsPtrSafe As Boolean
+        IsSub As Boolean
+    End Type
+
+    Private m_declares() As DeclareEntry
+    Private m_declareCount As Long
+    Private m_allowedDllProcs As Object
+    Private m_userApproved As Boolean
+
+    Public Sub InitializeBridge()
+        m_declareCount = 0
+        ReDim m_declares(0 To 31)
+        m_userApproved = False
+        Set m_allowedDllProcs = PalManager.Pal.CreateDictionary()
+        PopulateDefaultAllowList()
+    End Sub
+
+    Private Sub PopulateDefaultAllowList()
+        AddAllowed "kernel32.dll", "Sleep"
+        AddAllowed "kernel32.dll", "GetTickCount"
+        AddAllowed "kernel32.dll", "GetTickCount64"
+        AddAllowed "kernel32.dll", "GetSystemTime"
+        AddAllowed "kernel32.dll", "GetLocalTime"
+        AddAllowed "kernel32.dll", "Beep"
+        AddAllowed "user32.dll", "FindWindowEx"
+        AddAllowed "user32.dll", "FindWindowExA"
+        AddAllowed "user32.dll", "FindWindowExW"
+        AddAllowed "user32.dll", "GetFocus"
+        AddAllowed "user32.dll", "GetWindow"
+        AddAllowed "user32.dll", "GetWindowLong"
+        AddAllowed "user32.dll", "GetWindowLongA"
+        AddAllowed "user32.dll", "GetWindowLongW"
+        AddAllowed "user32.dll", "InvalidateRect"
+        AddAllowed "user32.dll", "SetActiveWindow"
+        AddAllowed "user32.dll", "SetForegroundWindow"
+        AddAllowed "user32.dll", "SetWindowLong"
+        AddAllowed "user32.dll", "SetWindowLongA"
+        AddAllowed "user32.dll", "SetWindowLongW"
+        AddAllowed "user32.dll", "ShowWindow"
+        AddAllowed "user32.dll", "VkKeyScan"
+        AddAllowed "user32.dll", "VkKeyScanA"
+        AddAllowed "user32.dll", "VkKeyScanW"
+        AddAllowed "user32.dll", "apiSetFocus"
+        AddAllowed "user32.dll", "keybd_event"
+        AddAllowed "user32.dll", "MessageBoxA"
+        AddAllowed "user32.dll", "MessageBoxW"
+        AddAllowed "user32.dll", "GetSystemMetrics"
+        AddAllowed "user32.dll", "GetCursorPos"
+        AddAllowed "ole32.dll", "CoCreateGuid"
+        AddAllowed "advapi32.dll", "RegOpenKeyEx"
+        AddAllowed "advapi32.dll", "RegOpenKeyExA"
+        AddAllowed "advapi32.dll", "RegOpenKeyExW"
+        AddAllowed "advapi32.dll", "RegQueryValueEx"
+        AddAllowed "advapi32.dll", "RegQueryValueExA"
+        AddAllowed "advapi32.dll", "RegQueryValueExW"
+        AddAllowed "advapi32.dll", "RegCloseKey"
+        AddAllowed "advapi32.dll", "RegQueryValueExLong"
+        AddAllowed "advapi32.dll", "RegQueryValueExNULL"
+    End Sub
+
+    Public Sub AddAllowed(ByVal dllName As String, ByVal procName As String)
+        If m_allowedDllProcs Is Nothing Then
+            Set m_allowedDllProcs = PalManager.Pal.CreateDictionary()
+        End If
+        Dim safeDll As String
+        safeDll = NormalizeDllName(dllName)
+        Dim key As String
+        key = LCase$(safeDll) & "!" & LCase$(procName)
+        If Not m_allowedDllProcs.Exists(key) Then
+            m_allowedDllProcs.Add key, True
+        End If
+        On Error Resume Next
+        PalManager.DynamicCall.AddAllowed safeDll, procName
+        On Error GoTo 0
+    End Sub
+
+    Public Function IsAllowed(ByVal dllName As String, ByVal procName As String) As Boolean
+        If m_userApproved Then
+            IsAllowed = True
+            Exit Function
+        End If
+        If m_allowedDllProcs Is Nothing Then
+            InitializeBridge()
+        End If
+        Dim safeDll As String
+        safeDll = NormalizeDllName(dllName)
+        Dim key As String
+        key = LCase$(safeDll) & "!" & LCase$(procName)
+        If m_allowedDllProcs.Exists(key) Then
+            IsAllowed = True
+            Exit Function
+        End If
+        IsAllowed = PalManager.DynamicCall.IsCallAllowed(safeDll, procName)
+    End Function
+
+    Public Sub SetUserApproved(ByVal approved As Boolean)
+        m_userApproved = approved
+        On Error Resume Next
+        PalManager.DynamicCall.SetUserApproved approved
+        On Error GoTo 0
+    End Sub
+
+    Public Function NormalizeDllName(ByVal dllName As String) As String
+        Dim s As String
+        s = dllName
+        Dim slashPos As Long
+        slashPos = InStrRev(s, "\")
+        If slashPos > 0 Then s = Mid$(s, slashPos + 1)
+        slashPos = InStrRev(s, "/")
+        If slashPos > 0 Then s = Mid$(s, slashPos + 1)
+        If InStr(s, ".") = 0 Then
+            s = s & ".dll"
+        End If
+        NormalizeDllName = s
+    End Function
+
+    Public Function ParseAndRegisterDeclare(ByVal codeLine As String) As Boolean
+        Dim s As String
+        s = Trim$(codeLine)
+        If InStr(1, s, "Declare", vbTextCompare) = 0 Then Exit Function
+
+        Dim isPtrSafe As Boolean
+        isPtrSafe = (InStr(1, s, "PtrSafe", vbTextCompare) > 0)
+
+        Dim isSub As Boolean
+        Dim isFunc As Boolean
+        isSub = (InStr(1, s, " Sub ", vbTextCompare) > 0)
+        isFunc = (InStr(1, s, " Function ", vbTextCompare) > 0)
+        If Not isSub And Not isFunc Then Exit Function
+
+        Dim libIdx As Long
+        libIdx = InStr(1, s, " Lib ", vbTextCompare)
+        If libIdx = 0 Then Exit Function
+
+        Dim nameStart As Long
+        If isSub Then
+            nameStart = InStr(1, s, " Sub ", vbTextCompare) + 5
+        Else
+            nameStart = InStr(1, s, " Function ", vbTextCompare) + 10
+        End If
+        Dim funcName As String
+        funcName = Trim$(Mid$(s, nameStart, libIdx - nameStart))
+
+        Dim quote1 As Long
+        quote1 = InStr(libIdx + 4, s, """")
+        If quote1 = 0 Then Exit Function
+        Dim quote2 As Long
+        quote2 = InStr(quote1 + 1, s, """")
+        If quote2 = 0 Then Exit Function
+        Dim dllName As String
+        dllName = Mid$(s, quote1 + 1, quote2 - quote1 - 1)
+
+        Dim aliasName As String
+        aliasName = funcName
+        Dim afterLib As String
+        afterLib = Mid$(s, quote2 + 1)
+        Dim aliasIdx As Long
+        aliasIdx = InStr(1, afterLib, "Alias", vbTextCompare)
+        Dim parenIdx As Long
+        parenIdx = InStr(1, afterLib, "(")
+
+        If aliasIdx > 0 And (parenIdx = 0 Or aliasIdx < parenIdx) Then
+            Dim aQ1 As Long
+            aQ1 = InStr(aliasIdx + 5, afterLib, """")
+            If aQ1 > 0 Then
+                Dim aQ2 As Long
+                aQ2 = InStr(aQ1 + 1, afterLib, """")
+                If aQ2 > 0 Then
+                    aliasName = Mid$(afterLib, aQ1 + 1, aQ2 - aQ1 - 1)
+                End If
+            End If
+        End If
+
+        Dim retType As String
+        retType = "Variant"
+        Dim asIdx As Long
+        asIdx = InStrRev(afterLib, " As ", , vbTextCompare)
+        If asIdx > 0 And (parenIdx = 0 Or asIdx > InStrRev(afterLib, ")")) Then
+            retType = Trim$(Mid$(afterLib, asIdx + 4))
+        End If
+
+        Dim paramTypes() As String
+        ReDim paramTypes(0 To 0)
+        Dim paramCount As Long
+        paramCount = 0
+
+        If parenIdx > 0 Then
+            Dim closeParen As Long
+            closeParen = InStrRev(afterLib, ")")
+            If closeParen > parenIdx + 1 Then
+                Dim paramStr As String
+                paramStr = Mid$(afterLib, parenIdx + 1, closeParen - parenIdx - 1)
+                Dim parts() As String
+                parts = Split(paramStr, ",")
+                paramCount = UBound(parts) - LBound(parts) + 1
+                ReDim paramTypes(0 To paramCount - 1)
+                Dim i As Long
+                For i = 0 To paramCount - 1
+                    Dim pDecl As String
+                    pDecl = Trim$(parts(i))
+                    Dim pAsIdx As Long
+                    pAsIdx = InStr(1, pDecl, " As ", vbTextCompare)
+                    If pAsIdx > 0 Then
+                        paramTypes(i) = Trim$(Mid$(pDecl, pAsIdx + 4))
+                    Else
+                        paramTypes(i) = "Variant"
+                    End If
+                Next i
+            End If
+        End If
+
+        RegisterDeclare funcName, dllName, aliasName, retType, paramTypes, isPtrSafe, isSub
+        ParseAndRegisterDeclare = True
+    End Function
+
+    Public Sub RegisterDeclare(ByVal funcName As String, ByVal dllName As String, ByVal aliasName As String, ByVal retType As String, ByRef paramTypes() As String, ByVal isPtrSafe As Boolean, ByVal isSub As Boolean)
+        If m_declareCount = 0 Then
+            ReDim m_declares(0 To 31)
+        End If
+
+        Dim safeDll As String
+        safeDll = NormalizeDllName(dllName)
+
+        Dim i As Long
+        For i = 0 To m_declareCount - 1
+            If StrComp(m_declares(i).FuncName, funcName, vbTextCompare) = 0 Then
+                m_declares(i).DllName = safeDll
+                m_declares(i).AliasName = aliasName
+                m_declares(i).ReturnType = retType
+                m_declares(i).ParamTypes = paramTypes
+                m_declares(i).ParamCount = UBound(paramTypes) - LBound(paramTypes) + 1
+                m_declares(i).IsPtrSafe = isPtrSafe
+                m_declares(i).IsSub = isSub
+                Exit Sub
+            End If
+        Next i
+
+        If m_declareCount > UBound(m_declares) Then
+            ReDim Preserve m_declares(0 To UBound(m_declares) * 2 + 1)
+        End If
+
+        m_declares(m_declareCount).FuncName = funcName
+        m_declares(m_declareCount).DllName = safeDll
+        m_declares(m_declareCount).AliasName = aliasName
+        m_declares(m_declareCount).ReturnType = retType
+        m_declares(m_declareCount).ParamTypes = paramTypes
+        On Error Resume Next
+        m_declares(m_declareCount).ParamCount = UBound(paramTypes) - LBound(paramTypes) + 1
+        On Error GoTo 0
+        m_declares(m_declareCount).IsPtrSafe = isPtrSafe
+        m_declares(m_declareCount).IsSub = isSub
+        m_declareCount = m_declareCount + 1
+    End Sub
+
+    Public Function HasDeclare(ByVal funcName As String) As Boolean
+        Dim i As Long
+        For i = 0 To m_declareCount - 1
+            If StrComp(m_declares(i).FuncName, funcName, vbTextCompare) = 0 Then
+                HasDeclare = True
+                Exit Function
+            End If
+        Next i
+        HasDeclare = False
+    End Function
+
+    Public Function InvokeDeclare(ByVal funcName As String, ByRef args() As Variant) As Variant
+        Dim i As Long
+        Dim idx As Long
+        idx = -1
+        For i = 0 To m_declareCount - 1
+            If StrComp(m_declares(i).FuncName, funcName, vbTextCompare) = 0 Then
+                idx = i
+                Exit For
+            End If
+        Next i
+
+        If idx = -1 Then
+            Err.Raise 453, "DeclareBridge.InvokeDeclare", "Specified DLL function not declared: " & funcName
+            Exit Function
+        End If
+
+        Dim dEntry As DeclareEntry
+        dEntry = m_declares(idx)
+
+        If Not IsAllowed(dEntry.DllName, dEntry.AliasName) Then
+            Err.Raise 453, "DeclareBridge.InvokeDeclare", "Calling procedure '" & dEntry.AliasName & "' in '" & dEntry.DllName & "' is restricted by security policy."
+            Exit Function
+        End If
+
+        Dim retCode As Integer
+        retCode = MapVbaTypeToVarType(dEntry.ReturnType)
+
+        InvokeDeclare = PalManager.DynamicCall.CallProcedure(dEntry.DllName, dEntry.AliasName, args, retCode)
+    End Function
+
+    Private Function MapVbaTypeToVarType(ByVal typeName As String) As Integer
+        Select Case LCase$(Trim$(typeName))
+            Case "long"
+                MapVbaTypeToVarType = vbLong
+            Case "longptr"
+                #If Win64 Then
+                    MapVbaTypeToVarType = 20 ' vbLongLong
+                #Else
+                    MapVbaTypeToVarType = vbLong
+                #End If
+            Case "integer"
+                MapVbaTypeToVarType = vbInteger
+            Case "string"
+                MapVbaTypeToVarType = vbString
+            Case "boolean"
+                MapVbaTypeToVarType = vbBoolean
+            Case "double"
+                MapVbaTypeToVarType = vbDouble
+            Case "single"
+                MapVbaTypeToVarType = vbSingle
+            Case "byte"
+                MapVbaTypeToVarType = vbByte
+            Case "currency"
+                MapVbaTypeToVarType = vbCurrency
+            Case "date"
+                MapVbaTypeToVarType = vbDate
+            Case "object"
+                MapVbaTypeToVarType = vbObject
+            Case Else
+                MapVbaTypeToVarType = vbVariant
+        End Select
+    End Function
+
+    Public Sub ClearDeclares()
+        m_declareCount = 0
+        ReDim m_declares(0 To 31)
+    End Sub
+End Module

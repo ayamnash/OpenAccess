@@ -1,0 +1,18 @@
+' File: src/studio/pal/IPal.twin
+' Plan 7 WS7: Platform Abstraction Layer - Root Interface
+Option Explicit
+
+Public Interface IPal
+    Function GetFileSystem() As IFileSystem
+    Function GetSettings() As ISettings
+    Function GetDialogs() As IDialogs
+    Function GetClipboard() As IClipboard
+    Function GetShell() As IShell
+    Function GetFonts() As IFonts
+    Function GetDynamicCall() As IDynamicCall
+    Function CreateTextEditor(ByVal targetControl As Object) As ITextEditor
+    Function CreateDictionary() As Object
+    Function TruncateFile(ByVal filePath As String, ByVal newByteLength As LongLong) As Boolean
+    Function NormalizeCrLf(ByVal text As String) As String
+    Function GetPlatformName() As String
+End Interface

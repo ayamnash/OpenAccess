@@ -1,0 +1,720 @@
+' File: src/studio/vba/AccessObjectModel.twin
+' Plan 7 WS5.5: Complete Microsoft Access Application & UI Object Model
+Option Explicit
+
+' =============================================================================
+' Access Control Class
+' =============================================================================
+[ Description ("Access Form Control Object") ]
+[ ClassId ("A1B2C3D4-E5F6-4A5B-8C7D-000000000001") ]
+[ InterfaceId ("A1B2C3D4-E5F6-4A5B-8C7D-000000000002") ]
+[ ComCreatable (False) ]
+Public Class AccessControl
+    Public Name As String
+    Public ControlType As Long
+    Public Caption As String
+    Public Visible As Boolean
+    Public Enabled As Boolean
+    Public Locked As Boolean
+
+    Private m_left As Long
+    Private m_top As Long
+    Private m_width As Long
+    Private m_height As Long
+
+    Public Property Get Left() As Long: Left = m_left: End Property
+    Public Property Let Left(ByVal newVal As Long): m_left = newVal: End Property
+
+    Public Property Get Top() As Long: Top = m_top: End Property
+    Public Property Let Top(ByVal newVal As Long): m_top = newVal: End Property
+
+    Public Property Get Width() As Long: Width = m_width: End Property
+    Public Property Let Width(ByVal newVal As Long): m_width = newVal: End Property
+
+    Public Property Get Height() As Long: Height = m_height: End Property
+    Public Property Let Height(ByVal newVal As Long): m_height = newVal: End Property
+
+    Public BackColor As Long
+    Public ForeColor As Long
+    Public FontName As String
+    Public FontSize As Single
+    Public FontWeight As Long
+    Public RowSource As String
+    Public RowSourceType As String
+    Public Tag As String
+
+    Private m_value As Variant
+    Private m_text As String
+    Private m_listItems As Collection
+    Private m_itemDataList As Collection
+    Private m_listIndex As Long
+
+    Public Sub New()
+        Visible = True
+        Enabled = True
+        Locked = False
+        m_value = Null
+        m_text = vbNullString
+        Set m_listItems = New Collection
+        Set m_itemDataList = New Collection
+        m_listIndex = -1
+        RowSource = vbNullString
+        RowSourceType = "Table/Query"
+    End Sub
+
+    [ DefaultMember ]
+    Public Property Get Value() As Variant
+        If IsObject(m_value) Then
+            Set Value = m_value
+        Else
+            Value = m_value
+        End If
+    End Property
+
+    Public Property Let Value(ByVal newVal As Variant)
+        m_value = newVal
+        If Not IsNull(newVal) And Not IsEmpty(newVal) Then
+            m_text = CStr(newVal)
+        Else
+            m_text = vbNullString
+        End If
+    End Property
+
+    Public Property Set Value(ByVal newObj As Object)
+        Set m_value = newObj
+    End Property
+
+    Public Property Get Text() As String
+        Text = m_text
+    End Property
+
+    Public Property Let Text(ByVal s As String)
+        m_text = s
+        m_value = s
+    End Property
+
+    Public Property Get ListIndex() As Long
+        ListIndex = m_listIndex
+    End Property
+
+    Public Property Let ListIndex(ByVal idx As Long)
+        m_listIndex = idx
+        If idx >= 0 And idx < m_listItems.Count Then
+            m_value = m_listItems(idx + 1)
+            m_text = CStr(m_value)
+        End If
+    End Property
+
+    Public Property Get ListCount() As Long
+        ListCount = m_listItems.Count
+    End Property
+
+    Public Function ItemData(ByVal index As Long) As Variant
+        If index >= 0 And index < m_itemDataList.Count Then
+            ItemData = m_itemDataList(index + 1)
+        ElseIf index >= 0 And index < m_listItems.Count Then
+            ItemData = m_listItems(index + 1)
+        Else
+            ItemData = Null
+        End If
+    End Function
+
+    Public Function Column(ByVal col As Long, Optional ByVal row As Variant = -1) As Variant
+        Dim r As Long
+        If IsMissing(row) Or CLng(row) = -1 Then
+            r = m_listIndex
+        Else
+            r = CLng(row)
+        End If
+
+        If r >= 0 And r < m_listItems.Count Then
+            Dim rowStr As String
+            rowStr = CStr(m_listItems(r + 1))
+            Dim parts() As String
+            parts = Split(rowStr, ";")
+            If col >= 0 And col <= UBound(parts) Then
+                Column = Trim$(parts(col))
+            Else
+                Column = Null
+            End If
+        Else
+            Column = Null
+        End If
+    End Function
+
+    Public Sub AddItem(ByVal itemString As String, Optional ByVal index As Variant)
+        If IsMissing(index) Then
+            m_listItems.Add itemString
+            m_itemDataList.Add itemString
+        Else
+            Dim targetIdx As Long
+            targetIdx = CLng(index) + 1
+            If targetIdx > m_listItems.Count Then
+                m_listItems.Add itemString
+                m_itemDataList.Add itemString
+            Else
+                m_listItems.Add itemString, , targetIdx
+                m_itemDataList.Add itemString, , targetIdx
+            End If
+        End If
+    End Sub
+
+    Public Sub RemoveItem(ByVal index As Long)
+        If index >= 0 And index < m_listItems.Count Then
+            m_listItems.Remove index + 1
+            If m_itemDataList.Count >= index + 1 Then
+                m_itemDataList.Remove index + 1
+            End If
+            If m_listIndex = index Then
+                m_listIndex = -1
+                m_value = Null
+                m_text = vbNullString
+            ElseIf m_listIndex > index Then
+                m_listIndex = m_listIndex - 1
+            End If
+        End If
+    End Sub
+
+    Public Sub ClearItems()
+        Set m_listItems = New Collection
+        Set m_itemDataList = New Collection
+        m_listIndex = -1
+        m_value = Null
+        m_text = vbNullString
+    End Sub
+
+    Public Sub SetFocus()
+        ' Focus notification
+    End Sub
+
+    Public Sub Requery()
+        If Len(RowSource) > 0 Then
+            ' If RowSourceType is Table/Query, execute through active engine OpenRecordset
+            If UCase$(RowSourceType) = "TABLE/QUERY" Or InStr(1, RowSource, "SELECT ", vbTextCompare) > 0 Then
+                Dim activeEng As IDataEngine
+                Set activeEng = EngineManager.ActiveEngine
+                If Not activeEng Is Nothing Then
+                    On Error Resume Next
+                    Dim rs As Object
+                    Set rs = activeEng.OpenRecordset(RowSource)
+                    If Err.Number = 0 And Not rs Is Nothing Then
+                        ClearItems
+                        Do While Not rs.EOF And m_listItems.Count < 500
+                            Dim rowVal As String
+                            rowVal = vbNullString
+                            Dim fldIdx As Long
+                            For fldIdx = 0 To rs.Fields.Count - 1
+                                If fldIdx > 0 Then rowVal = rowVal & ";"
+                                rowVal = rowVal & Nz(rs.Fields(fldIdx).Value, "")
+                            Next fldIdx
+                            AddItem rowVal
+                            rs.MoveNext
+                        Loop
+                        rs.Close
+                    End If
+                    On Error GoTo 0
+                End If
+            End If
+        End If
+    End Sub
+End Class
+
+' =============================================================================
+' Access Controls Collection
+' =============================================================================
+[ Description ("Access Form Controls Collection") ]
+[ ClassId ("A1B2C3D4-E5F6-4A5B-8C7D-000000000003") ]
+[ InterfaceId ("A1B2C3D4-E5F6-4A5B-8C7D-000000000004") ]
+[ ComCreatable (False) ]
+Public Class AccessControls
+    Private m_controls As Collection
+
+    Public Sub New()
+        Set m_controls = New Collection
+    End Sub
+
+    [ DefaultMember ]
+    Public Function Item(ByVal keyOrIndex As Variant) As AccessControl
+        On Error Resume Next
+        ' If keyOrIndex is a string, always look up by control name key
+        If VarType(keyOrIndex) = vbString Then
+            Dim keyStr As String
+            keyStr = LCase$(Trim$(CStr(keyOrIndex)))
+            Set Item = m_controls(keyStr)
+            Exit Function
+        End If
+
+        ' Numeric 0-based ordinal indexing
+        If IsNumeric(keyOrIndex) Then
+            Dim idx As Long
+            idx = CLng(keyOrIndex)
+            If idx >= 0 And idx < m_controls.Count Then
+                Set Item = m_controls(idx + 1)
+            End If
+        End If
+        On Error GoTo 0
+    End Function
+
+    Public Function Count() As Long
+        Count = m_controls.Count
+    End Function
+
+    Public Sub AddControl(ByVal ctl As AccessControl)
+        If ctl Is Nothing Then Exit Sub
+        Dim k As String
+        k = LCase$(Trim$(ctl.Name))
+        On Error Resume Next
+        m_controls.Remove k
+        Err.Clear
+        m_controls.Add ctl, k
+        On Error GoTo 0
+    End Sub
+
+    Public Function Exists(ByVal ctlName As String) As Boolean
+        On Error Resume Next
+        Dim c As AccessControl
+        Set c = m_controls(LCase$(Trim$(ctlName)))
+        Exists = (Not c Is Nothing)
+        On Error GoTo 0
+    End Function
+End Class
+
+' =============================================================================
+' Access Form Class
+' =============================================================================
+[ Description ("Access Form Object") ]
+[ ClassId ("A1B2C3D4-E5F6-4A5B-8C7D-000000000005") ]
+[ InterfaceId ("A1B2C3D4-E5F6-4A5B-8C7D-000000000006") ]
+[ ComCreatable (False) ]
+Public Class AccessForm
+    Public Name As String
+    Public Caption As String
+    Public Visible As Boolean
+    Public RecordSource As String
+    Public Filter As String
+    Public FilterOn As Boolean
+    Public OrderBy As String
+    Public OrderByOn As Boolean
+    Public Recordset As Object
+    Public RecordsetClone As Object
+    Public Bookmark As Variant
+    Public Dirty As Boolean
+    Public NewRecord As Boolean
+    Public AllowEdits As Boolean
+    Public AllowAdditions As Boolean
+    Public AllowDeletions As Boolean
+    Public OpenArgs As Variant
+    Public Hwnd As LongPtr
+    Public Controls As AccessControls
+    Public Tag As String
+
+    Public Sub New(Optional ByVal formName As String = "Form1")
+        Name = formName
+        Caption = formName
+        Visible = True
+        FilterOn = False
+        OrderByOn = False
+        Dirty = False
+        NewRecord = False
+        AllowEdits = True
+        AllowAdditions = True
+        AllowDeletions = True
+        OpenArgs = Null
+        Set Controls = New AccessControls
+    End Sub
+
+    Public Function Control(ByVal ctlName As String) As AccessControl
+        Set Control = Controls.Item(ctlName)
+    End Function
+
+    Public Sub Requery()
+        If Len(RecordSource) > 0 Then
+            Dim activeEng As IDataEngine
+            Set activeEng = EngineManager.ActiveEngine
+            If Not activeEng Is Nothing Then
+                Dim sql As String
+                sql = RecordSource
+                If FilterOn And Len(Filter) > 0 Then
+                    If InStr(1, sql, " WHERE ", vbTextCompare) > 0 Then
+                        sql = sql & " AND (" & Filter & ")"
+                    Else
+                        sql = sql & " WHERE " & Filter
+                    End If
+                End If
+                If OrderByOn And Len(OrderBy) > 0 Then
+                    sql = sql & " ORDER BY " & OrderBy
+                End If
+                On Error Resume Next
+                Set Recordset = activeEng.OpenRecordset(sql)
+                If Not Recordset Is Nothing Then
+                    Set RecordsetClone = Recordset
+                End If
+                On Error GoTo 0
+            End If
+        End If
+    End Sub
+
+    Public Sub Refresh()
+        ' Refreshes currently visible records
+    End Sub
+
+    Public Sub Repaint()
+        ' Repaints window
+    End Sub
+
+    Public Sub SetFocus()
+        ' Brings form to top
+    End Sub
+
+    Public Sub Undo()
+        Dirty = False
+    End Sub
+End Class
+
+' =============================================================================
+' Access Forms Collection
+' =============================================================================
+[ Description ("Access Forms Collection") ]
+[ ClassId ("A1B2C3D4-E5F6-4A5B-8C7D-000000000007") ]
+[ InterfaceId ("A1B2C3D4-E5F6-4A5B-8C7D-000000000008") ]
+[ ComCreatable (False) ]
+Public Class AccessForms
+    Private m_forms As Collection
+
+    Public Sub New()
+        Set m_forms = New Collection
+    End Sub
+
+    [ DefaultMember ]
+    Public Function Item(ByVal keyOrIndex As Variant) As AccessForm
+        On Error Resume Next
+        If VarType(keyOrIndex) = vbString Then
+            Dim keyStr As String
+            keyStr = LCase$(Trim$(CStr(keyOrIndex)))
+            Set Item = m_forms(keyStr)
+            Exit Function
+        End If
+
+        If IsNumeric(keyOrIndex) Then
+            Dim idx As Long
+            idx = CLng(keyOrIndex)
+            If idx >= 0 And idx < m_forms.Count Then
+                Set Item = m_forms(idx + 1)
+            End If
+        End If
+        On Error GoTo 0
+    End Function
+
+    Public Function Count() As Long
+        Count = m_forms.Count
+    End Function
+
+    Public Sub AddForm(ByVal frm As AccessForm)
+        If frm Is Nothing Then Exit Sub
+        Dim k As String
+        k = LCase$(Trim$(frm.Name))
+        On Error Resume Next
+        m_forms.Remove k
+        Err.Clear
+        m_forms.Add frm, k
+        On Error GoTo 0
+    End Sub
+
+    Public Sub RemoveForm(ByVal formName As String)
+        On Error Resume Next
+        m_forms.Remove LCase$(Trim$(formName))
+        On Error GoTo 0
+    End Sub
+
+    Public Function IsLoaded(ByVal formName As String) As Boolean
+        On Error Resume Next
+        Dim f As AccessForm
+        Set f = m_forms(LCase$(Trim$(formName)))
+        IsLoaded = (Not f Is Nothing)
+        On Error GoTo 0
+    End Function
+End Class
+
+' =============================================================================
+' Access TempVars Object
+' =============================================================================
+[ Description ("Access TempVars Collection") ]
+[ ClassId ("A1B2C3D4-E5F6-4A5B-8C7D-000000000009") ]
+[ InterfaceId ("A1B2C3D4-E5F6-4A5B-8C7D-000000000010") ]
+[ ComCreatable (False) ]
+Public Class AccessTempVars
+    Private m_vars As Collection
+
+    Public Sub New()
+        Set m_vars = New Collection
+    End Sub
+
+    [ DefaultMember ]
+    Public Property Get Item(ByVal varName As String) As Variant
+        On Error Resume Next
+        Item = m_vars(LCase$(Trim$(varName)))
+        If Err.Number <> 0 Then Item = Null
+        On Error GoTo 0
+    End Property
+
+    Public Property Let Item(ByVal varName As String, ByVal newVal As Variant)
+        Add varName, newVal
+    End Property
+
+    Public Sub Add(ByVal varName As String, ByVal varValue As Variant)
+        Dim k As String
+        k = LCase$(Trim$(varName))
+        On Error Resume Next
+        m_vars.Remove k
+        Err.Clear
+        m_vars.Add varValue, k
+        On Error GoTo 0
+    End Sub
+
+    Public Sub Remove(ByVal varName As String)
+        On Error Resume Next
+        m_vars.Remove LCase$(Trim$(varName))
+        On Error GoTo 0
+    End Sub
+
+    Public Sub RemoveAll()
+        Set m_vars = New Collection
+    End Sub
+
+    Public Property Get Count() As Long
+        Count = m_vars.Count
+    End Property
+End Class
+
+' =============================================================================
+' Access DoCmd Class
+' =============================================================================
+[ Description ("Access DoCmd Object") ]
+[ ClassId ("A1B2C3D4-E5F6-4A5B-8C7D-000000000011") ]
+[ InterfaceId ("A1B2C3D4-E5F6-4A5B-8C7D-000000000012") ]
+[ ComCreatable (False) ]
+Public Class AccessDoCmd
+    Public Warnings As Boolean
+
+    Public Sub New()
+        Warnings = True
+    End Sub
+
+    Public Sub SetWarnings(ByVal warningsOn As Boolean)
+        Warnings = warningsOn
+    End Sub
+
+    Public Sub OpenForm(ByVal formName As String, Optional ByVal view As Long = 0, Optional ByVal filterName As String = "", Optional ByVal whereCondition As String = "", Optional ByVal dataMode As Long = -1, Optional ByVal windowMode As Long = 0, Optional ByVal openArgs As Variant)
+        Dim frm As AccessForm
+        Set frm = AccessObjectModel.Forms.Item(formName)
+        If frm Is Nothing Then
+            Set frm = New AccessForm(formName)
+            AccessObjectModel.Forms.AddForm frm
+        End If
+        frm.Visible = True
+        If Len(whereCondition) > 0 Then
+            frm.Filter = whereCondition
+            frm.FilterOn = True
+        End If
+        If Not IsMissing(openArgs) Then
+            frm.OpenArgs = openArgs
+        End If
+        frm.Requery
+        AccessObjectModel.Screen.ActiveForm = frm
+        StudioController.RequestOpenForm formName, whereCondition
+    End Sub
+
+    Public Sub Close(Optional ByVal objectType As Long = 2, Optional ByVal objectName As String = "", Optional ByVal savePrompt As Long = 0)
+        Dim targetName As String
+        targetName = objectName
+        If Len(targetName) = 0 Then
+            If Not AccessObjectModel.Screen.ActiveForm Is Nothing Then
+                targetName = AccessObjectModel.Screen.ActiveForm.Name
+            End If
+        End If
+        If Len(targetName) > 0 Then
+            AccessObjectModel.Forms.RemoveForm targetName
+        End If
+        StudioController.RequestCloseForm
+    End Sub
+
+    Public Sub OpenQuery(ByVal queryName As String, Optional ByVal view As Long = 0, Optional ByVal dataMode As Long = 0)
+        Dim activeEng As IDataEngine
+        Set activeEng = EngineManager.ActiveEngine
+        If Not activeEng Is Nothing Then
+            activeEng.OpenRecordset queryName
+        End If
+        StudioController.RequestOpenQuery queryName
+    End Sub
+
+    Public Sub RunSQL(ByVal sqlStatement As String, Optional ByVal useTransaction As Boolean = True)
+        Dim activeEng As IDataEngine
+        Set activeEng = EngineManager.ActiveEngine
+        If Not activeEng Is Nothing Then
+            activeEng.ExecuteCommandSql sqlStatement
+        End If
+    End Sub
+
+    Public Sub Requery(Optional ByVal controlName As String = "")
+        ' Global or control requery
+    End Sub
+
+    Public Sub Hourglass(ByVal hourglassOn As Boolean)
+        ' Mouse cursor
+    End Sub
+
+    Public Sub GoToRecord(Optional ByVal objectType As Long = 2, Optional ByVal objectName As String = "", Optional ByVal record As Long = 2, Optional ByVal offset As Long = 1)
+        ' Record navigation
+    End Sub
+
+    Public Sub GoToControl(ByVal controlName As String)
+        ' Control focus
+    End Sub
+
+    Public Sub Quit(Optional ByVal savePrompt As Long = 1)
+        ' Application quit
+    End Sub
+
+    Public Sub OpenReport(ByVal reportName As String, Optional ByVal view As Long = 0, Optional ByVal filterName As String = "", Optional ByVal whereCondition As String = "", Optional ByVal windowMode As Long = 0, Optional ByVal openArgs As Variant)
+        ' Report preview / print stub
+    End Sub
+
+    Public Sub Beep()
+        On Error Resume Next
+        Interaction.Beep
+    End Sub
+End Class
+
+' =============================================================================
+' Access Screen Class
+' =============================================================================
+[ Description ("Access Screen Object") ]
+[ ClassId ("A1B2C3D4-E5F6-4A5B-8C7D-000000000013") ]
+[ InterfaceId ("A1B2C3D4-E5F6-4A5B-8C7D-000000000014") ]
+[ ComCreatable (False) ]
+Public Class AccessScreen
+    Public MousePointer As Long
+    Public ActiveForm As AccessForm
+    Public ActiveControl As AccessControl
+
+    Public Sub New()
+        MousePointer = 0
+    End Sub
+
+    Public Property Get TwipsPerPixelX() As Single: TwipsPerPixelX = 15!: End Property
+    Public Property Get TwipsPerPixelY() As Single: TwipsPerPixelY = 15!: End Property
+End Class
+
+' =============================================================================
+' Access Object Model Root Module
+' =============================================================================
+Public Module AccessObjectModel
+    Public Const acDefault As Long = -1&
+    Public Const acSavePrompt As Long = 0&
+    Public Const acSaveYes As Long = 1&
+    Public Const acSaveNo As Long = 2&
+    Public Const acNormal As Long = 0&
+    Public Const acDesign As Long = 1&
+    Public Const acFormPropertySettings As Long = -1&
+    Public Const acWindowNormal As Long = 0&
+    Public Const acViewNormal As Long = 0&
+    Public Const acViewDesign As Long = 1&
+    Public Const acViewPreview As Long = 2&
+    Public Const acEdit As Long = 1&
+    Public Const acNext As Long = 1&
+
+    Private m_forms As AccessForms
+    Private m_doCmd As AccessDoCmd
+    Private m_tempVars As AccessTempVars
+    Private m_screen As AccessScreen
+
+    Public Function Forms() As AccessForms
+        If m_forms Is Nothing Then Set m_forms = New AccessForms
+        Set Forms = m_forms
+    End Function
+
+    Public Function DoCmd() As AccessDoCmd
+        If m_doCmd Is Nothing Then Set m_doCmd = New AccessDoCmd
+        Set DoCmd = m_doCmd
+    End Function
+
+    Public Function TempVars() As AccessTempVars
+        If m_tempVars Is Nothing Then Set m_tempVars = New AccessTempVars
+        Set TempVars = m_tempVars
+    End Function
+
+    Public Function Screen() As AccessScreen
+        If m_screen Is Nothing Then Set m_screen = New AccessScreen
+        Set Screen = m_screen
+    End Function
+
+    Public Function CurrentDb() As Object
+        Dim activeEng As IDataEngine
+        Set activeEng = EngineManager.ActiveEngine
+        If Not activeEng Is Nothing Then
+            Set CurrentDb = activeEng.RawDatabase
+        Else
+            Set CurrentDb = Nothing
+        End If
+    End Function
+
+    Public Function DBEngine() As Object
+        Dim activeEng As IDataEngine
+        Set activeEng = EngineManager.ActiveEngine
+        If Not activeEng Is Nothing Then
+            Set DBEngine = activeEng.RawDBEngine
+        Else
+            Set DBEngine = Nothing
+        End If
+    End Function
+
+    ' Resolves [Forms]![formName]![controlName] parameter
+    ' Returns Empty if form is not open or control does not exist (triggering parameter prompt)
+    ' Returns the actual value (which may be Null) if the control exists on an open form
+    Public Function GetFormControlValue(ByVal formName As String, ByVal controlName As String) As Variant
+        Dim f As AccessForm
+        Set f = Forms.Item(formName)
+        If Not f Is Nothing Then
+            Dim c As AccessControl
+            Set c = f.Controls.Item(controlName)
+            If Not c Is Nothing Then
+                GetFormControlValue = c.Value
+                Exit Function
+            End If
+        End If
+        GetFormControlValue = Empty
+    End Function
+
+    Public Function SetFormControlValue(ByVal formName As String, ByVal controlName As String, ByVal newVal As Variant) As Boolean
+        Dim f As AccessForm
+        Set f = Forms.Item(formName)
+        If f Is Nothing Then
+            Set f = New AccessForm(formName)
+            Forms.AddForm f
+        End If
+        Dim c As AccessControl
+        Set c = f.Controls.Item(controlName)
+        If c Is Nothing Then
+            Set c = New AccessControl
+            c.Name = controlName
+            f.Controls.AddControl c
+        End If
+        c.Value = newVal
+        SetFormControlValue = True
+    End Function
+
+    Public Function GetTempVarValue(ByVal varName As String) As Variant
+        GetTempVarValue = TempVars.Item(varName)
+    End Function
+
+    Public Sub SetTempVarValue(ByVal varName As String, ByVal newVal As Variant)
+        TempVars.Add varName, newVal
+    End Sub
+
+    Public Sub ResetSession()
+        Set m_forms = New AccessForms
+        Set m_doCmd = New AccessDoCmd
+        Set m_tempVars = New AccessTempVars
+        Set m_screen = New AccessScreen
+    End Sub
+End Module

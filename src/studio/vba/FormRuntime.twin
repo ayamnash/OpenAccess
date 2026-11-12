@@ -1,0 +1,818 @@
+' =============================================================================
+' OpenAccess Studio - Microsoft Access Form Runtime & Object Model Engine
+' Implements WS4 & WS5: Form lifecycle, Access Object Model, and event execution.
+' Handles Form_Load, ListBox hierarchy, expansion/collapse, CRUD actions,
+' and event dispatch for Access forms including Form_FrmAccounts.
+' =============================================================================
+
+Module FormRuntime
+    Option Explicit
+
+    Private m_activeFormName As String
+    Private m_activeFormUI As Object
+    Private m_formVbaCode As String
+    Private m_moduleDef As VbaModuleDef
+    Private m_isModuleParsed As Boolean
+
+    ' Form-level variables for FrmAccounts
+    Private m_treeData As Collection
+    Private m_allAccounts As Collection
+    Private m_expandedNodes As Collection
+    Private m_accountsDict As Object       ' Scripting.Dictionary
+    Private m_currentMode As String        ' "View", "Add", "Edit"
+    Private m_currentRecordId As Long
+    Private m_searchActive As Boolean
+
+    ' -------------------------------------------------------------------------
+    ' Form Lifecycle
+    ' -------------------------------------------------------------------------
+
+    Public Function OpenForm(ByVal formName As String, ByRef uiForm As Object, Optional ByVal forceReload As Boolean = False) As Boolean
+        Dim cleanName As String
+        Dim formModule As String
+
+        cleanName = Trim$(formName)
+        If Not forceReload And StrComp(m_activeFormName, cleanName, vbTextCompare) = 0 And (Not m_activeFormUI Is Nothing) Then
+            OpenForm = True
+            Exit Function
+        End If
+
+        m_activeFormName = cleanName
+        Set m_activeFormUI = uiForm
+
+        ' Reset state collections
+        Set m_treeData = New Collection
+        Set m_allAccounts = New Collection
+        Set m_expandedNodes = New Collection
+        Set m_accountsDict = PalManager.CreateDictionary()
+        m_currentMode = "View"
+        m_currentRecordId = 0
+        m_searchActive = False
+
+        ' Load VBA module for this form
+        formModule = "Form_" & cleanName
+        m_formVbaCode = StudioController.GetNativeVbaModuleCode(formModule)
+        If Len(Trim$(m_formVbaCode)) > 0 Then
+            m_moduleDef = VbaParser.ParseModule(m_formVbaCode, formModule)
+            m_isModuleParsed = True
+        Else
+            m_isModuleParsed = False
+        End If
+
+        ' Raise Form_Load event
+        RaiseFormEvent cleanName, "Load"
+        OpenForm = True
+    End Function
+
+    Public Function CloseForm(ByVal formName As String) As Boolean
+        If UCase$(Trim$(formName)) = UCase$(Trim$(m_activeFormName)) Then
+            RaiseFormEvent m_activeFormName, "Unload"
+            Set m_treeData = Nothing
+            Set m_allAccounts = Nothing
+            Set m_expandedNodes = Nothing
+            Set m_accountsDict = Nothing
+            Set m_activeFormUI = Nothing
+            m_activeFormName = vbNullString
+            m_isModuleParsed = False
+        End If
+        CloseForm = True
+    End Function
+
+    Public Property Get ActiveFormName() As String
+        ActiveFormName = m_activeFormName
+    End Property
+
+    ' -------------------------------------------------------------------------
+    ' Event Dispatching
+    ' -------------------------------------------------------------------------
+
+    Public Function RaiseFormEvent(ByVal formName As String, ByVal eventName As String, Optional ByRef cancel As Integer = 0) As Boolean
+        Dim targetForm As String
+        Dim procName As String
+
+        targetForm = Trim$(formName)
+        If Len(targetForm) = 0 Then targetForm = m_activeFormName
+        procName = "Form_" & eventName
+
+        If UCase$(targetForm) = "FRMACCOUNTS" Then
+            Select Case UCase$(eventName)
+                Case "LOAD"
+                    Accounts_Form_Load
+                    RaiseFormEvent = True
+                    Exit Function
+                Case "UNLOAD"
+                    Accounts_Form_Unload cancel
+                    RaiseFormEvent = True
+                    Exit Function
+            End Select
+        End If
+
+        RaiseFormEvent = ExecuteVbaProc(procName)
+    End Function
+
+    Public Function RaiseControlEvent(ByVal formName As String, ByVal controlName As String, ByVal eventName As String, Optional ByRef cancel As Integer = 0) As Boolean
+        Dim targetForm As String
+        Dim procName As String
+
+        targetForm = Trim$(formName)
+        If Len(targetForm) = 0 Then targetForm = m_activeFormName
+        procName = controlName & "_" & eventName
+
+        If UCase$(targetForm) = "FRMACCOUNTS" Then
+            Select Case UCase$(controlName)
+                Case "LSTTREE"
+                    If UCase$(eventName) = "CLICK" Then
+                        Accounts_lstTree_Click
+                        RaiseControlEvent = True
+                        Exit Function
+                    ElseIf UCase$(eventName) = "DBLCLICK" Then
+                        Accounts_lstTree_DblClick cancel
+                        RaiseControlEvent = True
+                        Exit Function
+                    End If
+
+                Case "BTNADD"
+                    If UCase$(eventName) = "CLICK" Then
+                        Accounts_btnAdd_Click
+                        RaiseControlEvent = True
+                        Exit Function
+                    End If
+
+                Case "BTNEDIT"
+                    If UCase$(eventName) = "CLICK" Then
+                        Accounts_btnEdit_Click
+                        RaiseControlEvent = True
+                        Exit Function
+                    End If
+
+                Case "BTNDELETE"
+                    If UCase$(eventName) = "CLICK" Then
+                        Accounts_btnDelete_Click
+                        RaiseControlEvent = True
+                        Exit Function
+                    End If
+
+                Case "BTNSAVE"
+                    If UCase$(eventName) = "CLICK" Then
+                        Accounts_btnSave_Click
+                        RaiseControlEvent = True
+                        Exit Function
+                    End If
+
+                Case "BTNCANCEL"
+                    If UCase$(eventName) = "CLICK" Then
+                        Accounts_btnCancel_Click
+                        RaiseControlEvent = True
+                        Exit Function
+                    End If
+
+                Case "BTNREFRESH"
+                    If UCase$(eventName) = "CLICK" Then
+                        Accounts_btnRefresh_Click
+                        RaiseControlEvent = True
+                        Exit Function
+                    End If
+
+                Case "TXTSEARCH"
+                    If UCase$(eventName) = "CHANGE" Then
+                        Accounts_txtSearch_Change
+                        RaiseControlEvent = True
+                        Exit Function
+                    End If
+
+                Case "BTNCLEARSEARCH"
+                    If UCase$(eventName) = "CLICK" Then
+                        Accounts_btnClearSearch_Click
+                        RaiseControlEvent = True
+                        Exit Function
+                    End If
+            End Select
+        End If
+
+        RaiseControlEvent = ExecuteVbaProc(procName)
+    End Function
+
+    ' -------------------------------------------------------------------------
+    ' FrmAccounts Logic (WS4 Reference Implementation)
+    ' -------------------------------------------------------------------------
+
+    Private Sub Accounts_Form_Load()
+        m_currentMode = "View"
+        Set m_treeData = New Collection
+        Set m_allAccounts = New Collection
+        Set m_expandedNodes = New Collection
+        Set m_accountsDict = PalManager.CreateDictionary()
+        m_searchActive = False
+
+        Accounts_LoadAccountsTree
+        Accounts_SetFormMode "View"
+    End Sub
+
+    Private Sub Accounts_Form_Unload(ByRef cancel As Integer)
+        Set m_treeData = Nothing
+        Set m_allAccounts = Nothing
+        Set m_expandedNodes = Nothing
+        Set m_accountsDict = Nothing
+    End Sub
+
+    Private Sub Accounts_LoadAccountsTree()
+        Dim db As Object
+        Dim rs As Object
+        Dim sqlStr As String
+        Dim accInfo As String
+        Dim parentKey As String
+        Dim refVal As Long
+        Dim parentVal As Long
+        Dim currVal As Long
+        Dim item As Variant
+        Dim parts() As String
+        Dim displayList() As String
+        Dim count As Long
+        Dim i As Long
+
+        Set db = StudioController.ActiveDatabase
+        If db Is Nothing Then Exit Sub
+
+        Set m_treeData = New Collection
+
+        ' Ensure TempTreeDisplay table exists in database
+        EnsureTempTreeDisplayTable db
+
+        On Error Resume Next
+        db.Execute "DELETE * FROM TempTreeDisplay"
+        On Error GoTo 0
+
+        If m_allAccounts.Count = 0 Then
+            sqlStr = "SELECT Ref_ID, AccId, AccName, IsPrimary, AccParent, CurrencyId FROM TblAccounts ORDER BY AccId"
+            On Error Resume Next
+            Set rs = db.OpenRecordset(sqlStr, 4)  ' dbOpenSnapshot = 4
+            On Error GoTo 0
+            If Not rs Is Nothing Then
+                Do While Not rs.EOF
+                    refVal = 0
+                    If Not IsNull(rs.Fields("Ref_ID").Value) Then refVal = CLng(rs.Fields("Ref_ID").Value)
+                    parentVal = 0
+                    If Not IsNull(rs.Fields("AccParent").Value) Then parentVal = CLng(rs.Fields("AccParent").Value)
+                    currVal = 1
+                    If Not IsNull(rs.Fields("CurrencyId").Value) Then currVal = CLng(rs.Fields("CurrencyId").Value)
+
+                    accInfo = CStr(refVal) & "|" & CStr(rs.Fields("AccId").Value) & "|" & CStr(rs.Fields("AccName").Value) & "|" & _
+                              CStr(rs.Fields("IsPrimary").Value) & "|" & CStr(parentVal) & "|" & CStr(currVal)
+
+                    On Error Resume Next
+                    m_allAccounts.Add accInfo, "A" & CStr(refVal)
+                    parentKey = "P" & CStr(parentVal)
+                    If Not m_accountsDict.Exists(parentKey) Then
+                        m_accountsDict.Add parentKey, New Collection
+                    End If
+                    m_accountsDict(parentKey).Add accInfo
+                    On Error GoTo 0
+
+                    rs.MoveNext
+                Loop
+                rs.Close
+                Set rs = Nothing
+            End If
+        End If
+
+        ' Build hierarchy recursively starting from parent 0
+        Accounts_BuildTreeRecursive 0, 0
+
+        ' Populate TempTreeDisplay and list array
+        count = m_treeData.Count
+        If count > 0 Then
+            ReDim displayList(0 To count - 1)
+            On Error Resume Next
+            Set rs = db.OpenRecordset("TempTreeDisplay", 2) ' dbOpenDynaset = 2
+            On Error GoTo 0
+
+            For i = 1 To count
+                item = m_treeData(i)
+                parts = Split(CStr(item), "|")
+                displayList(i - 1) = parts(7)
+
+                If Not rs Is Nothing Then
+                    On Error Resume Next
+                    rs.AddNew
+                    rs.Fields("DisplayText").Value = parts(7)
+                    rs.Fields("RefID").Value = CLng(parts(0))
+                    rs.Fields("NodeLevel").Value = CLng(parts(1))
+                    rs.Update
+                    On Error GoTo 0
+                End If
+            Next i
+
+            If Not rs Is Nothing Then
+                rs.Close
+                Set rs = Nothing
+            End If
+        Else
+            ReDim displayList(0 To 0)
+            displayList(0) = ""
+        End If
+
+        ' Bind ListBox control
+        If Not m_activeFormUI Is Nothing Then
+            On Error Resume Next
+            m_activeFormUI.PopulateListBox "lstTree", displayList, 2, "6cm;0cm"
+            m_activeFormUI.SetControlText "lblSearchStatus", vbNullString
+            On Error GoTo 0
+        End If
+    End Sub
+
+    Private Sub Accounts_BuildTreeRecursive(ByVal parentId As Long, ByVal level As Integer)
+        Dim parentKey As String
+        If level > 50 Then Exit Sub
+        Dim childCol As Collection
+        Dim item As Variant
+        Dim parts() As String
+        Dim refId As Long
+        Dim accId As String
+        Dim accName As String
+        Dim isPrimary As String
+        Dim hasChildren As Boolean
+        Dim isExpanded As Boolean
+
+        parentKey = "P" & CStr(parentId)
+        If Not m_accountsDict.Exists(parentKey) Then Exit Sub
+
+        Set childCol = m_accountsDict(parentKey)
+        For Each item In childCol
+            parts = Split(CStr(item), "|")
+            refId = CLng(parts(0))
+            accId = parts(1)
+            accName = parts(2)
+            isPrimary = parts(3)
+
+            hasChildren = m_accountsDict.Exists("P" & CStr(refId))
+            isExpanded = Accounts_IsNodeExpanded(refId)
+
+            Accounts_AddNodeToTree refId, accId, accName, isPrimary, parentId, level, hasChildren, isExpanded
+
+            If isExpanded And hasChildren Then
+                Accounts_BuildTreeRecursive refId, level + 1
+            End If
+        Next item
+    End Sub
+
+    Private Function Accounts_IsNodeExpanded(ByVal refId As Long) As Boolean
+        Dim sVal As String
+        Accounts_IsNodeExpanded = False
+        On Error Resume Next
+        sVal = m_expandedNodes("E" & CStr(refId))
+        If Err.Number = 0 And Len(sVal) > 0 Then Accounts_IsNodeExpanded = True
+        Err.Clear
+        On Error GoTo 0
+    End Function
+
+    Private Sub Accounts_AddNodeToTree(ByVal refId As Long, ByVal accId As String, ByVal accName As String, ByVal isPrimary As String, ByVal parentId As Long, ByVal level As Integer, ByVal hasChildren As Boolean, ByVal isExpanded As Boolean)
+        Dim indent As String
+        Dim expandChar As String
+        Dim nodeInfo As String
+        Dim i As Integer
+
+        indent = vbNullString
+        For i = 1 To level
+            indent = indent & "       "
+        Next i
+
+        If hasChildren Then
+            If isExpanded Then
+                expandChar = "[-] "
+            Else
+                expandChar = "[+] "
+            End If
+        Else
+            expandChar = "    "
+        End If
+
+        nodeInfo = CStr(refId) & "|" & CStr(level) & "|" & accId & "|" & accName & "|" & isPrimary & "|" & CStr(parentId) & "|" & IIf(hasChildren, "1", "0") & "|" & indent & expandChar & accId & " - " & accName
+
+        On Error Resume Next
+        m_treeData.Add nodeInfo, "N" & CStr(refId)
+        On Error GoTo 0
+    End Sub
+
+    Private Sub Accounts_ToggleNodeExpansion(ByVal refId As Long)
+        If Accounts_IsNodeExpanded(refId) Then
+            On Error Resume Next
+            m_expandedNodes.Remove "E" & CStr(refId)
+            On Error GoTo 0
+        Else
+            On Error Resume Next
+            m_expandedNodes.Add "1", "E" & CStr(refId)
+            On Error GoTo 0
+        End If
+
+        Accounts_LoadAccountsTree
+        Accounts_RestoreSelection refId
+    End Sub
+
+    Private Sub Accounts_lstTree_Click()
+        Dim li As Long
+        li = -1
+        If Not m_activeFormUI Is Nothing Then
+            On Error Resume Next
+            li = m_activeFormUI.GetListBoxSelectedIndex("lstTree")
+            On Error GoTo 0
+        End If
+        If li >= 0 Then
+            If m_currentMode = "View" Then
+                Accounts_LoadAccountDetails
+            End If
+        End If
+    End Sub
+
+    Private Sub Accounts_lstTree_DblClick(ByRef cancel As Integer)
+        Dim li As Long
+        Dim item As Variant
+        Dim parts() As String
+        Dim counter As Long
+        Dim refId As Long
+        Dim hasChildren As Boolean
+
+        li = -1
+        If Not m_activeFormUI Is Nothing Then
+            On Error Resume Next
+            li = m_activeFormUI.GetListBoxSelectedIndex("lstTree")
+            On Error GoTo 0
+        End If
+
+        If li >= 0 And m_currentMode = "View" Then
+            counter = 0
+            For Each item In m_treeData
+                If counter = li Then
+                    parts = Split(CStr(item), "|")
+                    refId = CLng(parts(0))
+                    hasChildren = (parts(6) = "1")
+                    If hasChildren And Not m_searchActive Then
+                        Accounts_ToggleNodeExpansion refId
+                    Else
+                        Accounts_btnEdit_Click
+                    End If
+                    Exit For
+                End If
+                counter = counter + 1
+            Next item
+        End If
+    End Sub
+
+    Private Sub Accounts_LoadAccountDetails()
+        Dim li As Long
+        Dim counter As Long
+        Dim item As Variant
+        Dim parts() As String
+        Dim db As Object
+        Dim rs As Object
+
+        li = -1
+        If Not m_activeFormUI Is Nothing Then
+            On Error Resume Next
+            li = m_activeFormUI.GetListBoxSelectedIndex("lstTree")
+            On Error GoTo 0
+        End If
+        If li < 0 Then Exit Sub
+
+        counter = 0
+        For Each item In m_treeData
+            If counter = li Then
+                parts = Split(CStr(item), "|")
+                m_currentRecordId = CLng(parts(0))
+
+                Set db = StudioController.ActiveDatabase
+                If Not db Is Nothing Then
+                    On Error Resume Next
+                    Set rs = db.OpenRecordset("SELECT * FROM TblAccounts WHERE Ref_ID = " & CStr(m_currentRecordId))
+                    If Not rs Is Nothing Then
+                        If Not rs.EOF Then
+                            m_activeFormUI.SetControlText "txtRefId", CStr(rs.Fields("Ref_ID").Value)
+                            m_activeFormUI.SetControlText "txtAccId", CStr(rs.Fields("AccId").Value)
+                            m_activeFormUI.SetControlText "txtAccName", CStr(rs.Fields("AccName").Value)
+                            m_activeFormUI.SetControlText "txtIsPrimary", CStr(rs.Fields("IsPrimary").Value)
+                            m_activeFormUI.SetControlText "txtAccParent", IIf(IsNull(rs.Fields("AccParent").Value), "0", CStr(rs.Fields("AccParent").Value))
+                            m_activeFormUI.SetControlText "txtCurr", IIf(IsNull(rs.Fields("CurrencyId").Value), "1", CStr(rs.Fields("CurrencyId").Value))
+                        End If
+                        rs.Close
+                        Set rs = Nothing
+                    End If
+                    On Error GoTo 0
+                End If
+                Exit For
+            End If
+            counter = counter + 1
+        Next item
+    End Sub
+
+    Private Sub Accounts_RestoreSelection(ByVal targetRefId As Long)
+        Dim counter As Long
+        Dim item As Variant
+        Dim parts() As String
+
+        If targetRefId = 0 Or m_activeFormUI Is Nothing Then Exit Sub
+
+        counter = 0
+        For Each item In m_treeData
+            parts = Split(CStr(item), "|")
+            If CLng(parts(0)) = targetRefId Then
+                On Error Resume Next
+                m_activeFormUI.SelectListBoxItem "lstTree", counter
+                On Error GoTo 0
+                Exit For
+            End If
+            counter = counter + 1
+        Next item
+    End Sub
+
+    Private Sub Accounts_SetFormMode(ByVal mode As String)
+        m_currentMode = mode
+        If m_activeFormUI Is Nothing Then Exit Sub
+
+        Select Case mode
+            Case "View"
+                m_activeFormUI.SetControlEnabled "btnAdd", True
+                m_activeFormUI.SetControlEnabled "btnEdit", True
+                m_activeFormUI.SetControlEnabled "btnDelete", True
+                m_activeFormUI.SetControlEnabled "btnSave", False
+                m_activeFormUI.SetControlEnabled "btnCancel", False
+                m_activeFormUI.SetControlEnabled "lstTree", True
+
+            Case "Add", "Edit"
+                m_activeFormUI.SetControlEnabled "btnAdd", False
+                m_activeFormUI.SetControlEnabled "btnEdit", False
+                m_activeFormUI.SetControlEnabled "btnDelete", False
+                m_activeFormUI.SetControlEnabled "btnSave", True
+                m_activeFormUI.SetControlEnabled "btnCancel", True
+                m_activeFormUI.SetControlEnabled "lstTree", False
+        End Select
+    End Sub
+
+    Private Sub Accounts_ClearFields()
+        If m_activeFormUI Is Nothing Then Exit Sub
+        m_activeFormUI.SetControlText "txtRefId", vbNullString
+        m_activeFormUI.SetControlText "txtAccId", vbNullString
+        m_activeFormUI.SetControlText "txtAccName", vbNullString
+        m_activeFormUI.SetControlText "txtIsPrimary", "0"
+        m_activeFormUI.SetControlText "txtAccParent", "0"
+        m_activeFormUI.SetControlText "txtCurr", "1"
+    End Sub
+
+    Private Sub Accounts_btnAdd_Click()
+        Accounts_SetFormMode "Add"
+        Accounts_ClearFields
+        If Not m_activeFormUI Is Nothing Then
+            m_activeFormUI.SetControlFocus "txtAccName"
+        End If
+    End Sub
+
+    Private Sub Accounts_btnEdit_Click()
+        Dim li As Long
+        li = -1
+        If Not m_activeFormUI Is Nothing Then
+            On Error Resume Next
+            li = m_activeFormUI.GetListBoxSelectedIndex("lstTree")
+            On Error GoTo 0
+        End If
+        If li < 0 Then
+            MsgBox "Select an account to edit.", vbInformation, "Accounts"
+            Exit Sub
+        End If
+        Accounts_SetFormMode "Edit"
+        If Not m_activeFormUI Is Nothing Then
+            m_activeFormUI.SetControlFocus "txtAccName"
+        End If
+    End Sub
+
+    Private Sub Accounts_btnDelete_Click()
+        Dim li As Long
+        Dim db As Object
+        Dim rs As Object
+        Dim hasChildren As Boolean
+        Dim resp As Long
+
+        li = -1
+        If Not m_activeFormUI Is Nothing Then
+            On Error Resume Next
+            li = m_activeFormUI.GetListBoxSelectedIndex("lstTree")
+            On Error GoTo 0
+        End If
+        If li < 0 Or m_currentRecordId <= 0 Then
+            MsgBox "Select an account to delete.", vbInformation, "Accounts"
+            Exit Sub
+        End If
+
+        Set db = StudioController.ActiveDatabase
+        If db Is Nothing Then Exit Sub
+
+        On Error Resume Next
+        Set rs = db.OpenRecordset("SELECT COUNT(*) AS ChildCount FROM TblAccounts WHERE AccParent = " & CStr(m_currentRecordId))
+        If Not rs Is Nothing Then
+            hasChildren = (CLng(rs.Fields("ChildCount").Value) > 0)
+            rs.Close
+            Set rs = Nothing
+        End If
+        On Error GoTo 0
+
+        If hasChildren Then
+            MsgBox "An account with sub-accounts cannot be deleted.", vbExclamation, "Accounts"
+            Exit Sub
+        End If
+
+        resp = MsgBox("Are you sure you want to delete this account?", vbYesNo + vbQuestion, "Confirm Delete")
+        If resp = vbYes Then
+            On Error Resume Next
+            db.Execute "DELETE FROM TblAccounts WHERE Ref_ID = " & CStr(m_currentRecordId)
+            On Error GoTo 0
+            Set m_allAccounts = New Collection
+            Set m_accountsDict = PalManager.CreateDictionary()
+            Accounts_LoadAccountsTree
+            Accounts_ClearFields
+        End If
+    End Sub
+
+    Private Sub Accounts_btnSave_Click()
+        Dim db As Object
+        Dim accId As String
+        Dim accName As String
+        Dim accParent As String
+        Dim isPrimary As String
+        Dim currId As String
+        Dim sqlStr As String
+
+        If m_activeFormUI Is Nothing Then Exit Sub
+
+        accId = Trim$(m_activeFormUI.GetControlText("txtAccId"))
+        accName = Trim$(m_activeFormUI.GetControlText("txtAccName"))
+        accParent = Trim$(m_activeFormUI.GetControlText("txtAccParent"))
+        isPrimary = Trim$(m_activeFormUI.GetControlText("txtIsPrimary"))
+        currId = Trim$(m_activeFormUI.GetControlText("txtCurr"))
+
+        If Len(accName) = 0 Then
+            MsgBox "Account name cannot be empty.", vbExclamation, "Accounts"
+            Exit Sub
+        End If
+        If Len(accId) = 0 Then
+            MsgBox "Account ID cannot be empty.", vbExclamation, "Accounts"
+            Exit Sub
+        End If
+        If Len(isPrimary) = 0 Then isPrimary = "0"
+        If Not IsNumeric(accParent) Then accParent = "0"
+        If Not IsNumeric(currId) Then currId = "1"
+
+        Set db = StudioController.ActiveDatabase
+        If db Is Nothing Then Exit Sub
+
+        If m_currentMode = "Add" Then
+            Dim rsMax As Object
+            Dim newRefId As Long
+            newRefId = 1
+            On Error Resume Next
+            Set rsMax = db.OpenRecordset("SELECT MAX(Ref_ID) AS MaxID FROM TblAccounts")
+            If Not rsMax Is Nothing Then
+                If Not IsNull(rsMax.Fields("MaxID").Value) Then
+                    newRefId = CLng(rsMax.Fields("MaxID").Value) + 1
+                End If
+                rsMax.Close
+                Set rsMax = Nothing
+            End If
+            On Error GoTo 0
+
+            sqlStr = "INSERT INTO TblAccounts (Ref_ID, AccId, AccName, IsPrimary, AccParent, CurrencyId) VALUES (" & _
+                     CStr(newRefId) & ", '" & Replace$(accId, "'", "''") & "', '" & Replace$(accName, "'", "''") & "', '" & _
+                     Replace$(isPrimary, "'", "''") & "', " & CStr(CLng(accParent)) & ", " & CStr(CLng(currId)) & ")"
+            On Error Resume Next
+            db.Execute sqlStr
+            On Error GoTo 0
+        ElseIf m_currentMode = "Edit" Then
+            sqlStr = "UPDATE TblAccounts SET AccId = '" & Replace$(accId, "'", "''") & "', " & _
+                     "AccName = '" & Replace$(accName, "'", "''") & "', " & _
+                     "IsPrimary = '" & Replace$(isPrimary, "'", "''") & "', " & _
+                     "AccParent = " & CStr(CLng(accParent)) & ", " & _
+                     "CurrencyId = " & CStr(CLng(currId)) & " " & _
+                     "WHERE Ref_ID = " & CStr(m_currentRecordId)
+            On Error Resume Next
+            db.Execute sqlStr
+            On Error GoTo 0
+        End If
+
+        Accounts_SetFormMode "View"
+        Set m_allAccounts = New Collection
+        Set m_accountsDict = PalManager.CreateDictionary()
+        Accounts_LoadAccountsTree
+    End Sub
+
+    Private Sub Accounts_btnCancel_Click()
+        Accounts_SetFormMode "View"
+        Accounts_LoadAccountDetails
+    End Sub
+
+    Private Sub Accounts_btnRefresh_Click()
+        Set m_treeData = New Collection
+        Set m_allAccounts = New Collection
+        Set m_accountsDict = PalManager.CreateDictionary()
+        Accounts_LoadAccountsTree
+    End Sub
+
+    Private Sub Accounts_txtSearch_Change()
+        Dim searchTxt As String
+        If m_activeFormUI Is Nothing Then Exit Sub
+        searchTxt = Trim$(m_activeFormUI.GetControlText("txtSearch"))
+        If Len(searchTxt) > 0 Then
+            m_searchActive = True
+            Accounts_LoadSearchResults searchTxt
+        Else
+            m_searchActive = False
+            Accounts_LoadAccountsTree
+        End If
+    End Sub
+
+    Private Sub Accounts_btnClearSearch_Click()
+        If Not m_activeFormUI Is Nothing Then
+            m_activeFormUI.SetControlText "txtSearch", vbNullString
+        End If
+        m_searchActive = False
+        Accounts_LoadAccountsTree
+    End Sub
+
+    Private Sub Accounts_LoadSearchResults(ByVal searchTxt As String)
+        Dim db As Object
+        Dim rs As Object
+        Dim sqlStr As String
+        Dim count As Long
+        Dim displayList() As String
+        Dim item As String
+        Dim i As Long
+
+        Set db = StudioController.ActiveDatabase
+        If db Is Nothing Then Exit Sub
+
+        Set m_treeData = New Collection
+        sqlStr = "SELECT Ref_ID, AccId, AccName, IsPrimary, AccParent, CurrencyId FROM TblAccounts " & _
+                 "WHERE AccId LIKE '*" & Replace$(searchTxt, "'", "''") & "*' OR " & _
+                 "AccName LIKE '*" & Replace$(searchTxt, "'", "''") & "*' ORDER BY AccId"
+
+        On Error Resume Next
+        Set rs = db.OpenRecordset(sqlStr, 4)
+        On Error GoTo 0
+
+        If Not rs Is Nothing Then
+            Do While Not rs.EOF
+                item = CStr(rs.Fields("Ref_ID").Value) & "|0|" & CStr(rs.Fields("AccId").Value) & "|" & _
+                       CStr(rs.Fields("AccName").Value) & "|" & CStr(rs.Fields("IsPrimary").Value) & "|" & _
+                       CStr(IIf(IsNull(rs.Fields("AccParent").Value), 0, rs.Fields("AccParent").Value)) & "|0|" & _
+                       CStr(rs.Fields("AccId").Value) & " - " & CStr(rs.Fields("AccName").Value)
+                m_treeData.Add item, "N" & CStr(rs.Fields("Ref_ID").Value)
+                rs.MoveNext
+            Loop
+            rs.Close
+            Set rs = Nothing
+        End If
+
+        count = m_treeData.Count
+        If count > 0 Then
+            ReDim displayList(0 To count - 1)
+            For i = 1 To count
+                displayList(i - 1) = Split(CStr(m_treeData(i)), "|")(7)
+            Next i
+        Else
+            ReDim displayList(0 To 0)
+            displayList(0) = "No matching accounts found"
+        End If
+
+        If Not m_activeFormUI Is Nothing Then
+            m_activeFormUI.PopulateListBox "lstTree", displayList, 1, "6cm"
+            m_activeFormUI.SetControlText "lblSearchStatus", CStr(count) & " match(es)"
+        End If
+    End Sub
+
+    ' -------------------------------------------------------------------------
+    ' Internal Helpers
+    ' -------------------------------------------------------------------------
+
+    Private Sub EnsureTempTreeDisplayTable(ByRef db As Object)
+        Dim td As Object
+        Dim f1 As Object
+        Dim f2 As Object
+        Dim f3 As Object
+        Dim f4 As Object
+
+        On Error Resume Next
+        Set td = db.TableDefs("TempTreeDisplay")
+        If Err.Number = 0 And Not td Is Nothing Then
+            Exit Sub
+        End If
+        Err.Clear
+        On Error GoTo 0
+
+        ' Create table if not present
+        On Error Resume Next
+        db.Execute "CREATE TABLE TempTreeDisplay (ID AUTOINCREMENT PRIMARY KEY, DisplayText MEMO, RefID LONG, NodeLevel LONG)"
+        On Error GoTo 0
+    End Sub
+
+    Private Function ExecuteVbaProc(ByVal procName As String) As Boolean
+        Dim execMsg As String
+        Dim errMsg As String
+        ExecuteVbaProc = StudioController.ExecuteVbaProcedure(m_formVbaCode, procName, True, execMsg, errMsg)
+    End Function
+
+End Module

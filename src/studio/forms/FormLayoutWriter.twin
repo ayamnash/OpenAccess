@@ -1,0 +1,494 @@
+' File: src/studio/forms/FormLayoutWriter.twin
+' Plan 7 WS6.3: Form Design Write-Back - Geometry and Caption persistence in Form Blobs
+Option Explicit
+
+Public Module FormLayoutWriter
+    Private Const PID_BOUND_COLUMN As Long = &H000D&
+    Private Const PID_CAPTION As Long = &H0011&
+    Private Const PID_COLUMN_WIDTHS As Long = &H0012&
+    Private Const PID_RECORD_SELECTORS As Long = &H0013&
+    Private Const PID_NAME As Long = &H0014&
+    Private Const PID_CONTROL_SOURCE As Long = &H001B&
+    Private Const PID_BACK_COLOR As Long = &H001C&
+    Private Const PID_FONT_NAME As Long = &H0022&
+    Private Const PID_FONT_SIZE As Long = &H0023&
+    Private Const PID_FONT_WEIGHT As Long = &H0025&
+    Private Const PID_HEIGHT As Long = &H002C&
+    Private Const PID_LINK_CHILD As Long = &H0031&
+    Private Const PID_LINK_MASTER As Long = &H0032&
+    Private Const PID_LEFT As Long = &H0036&
+    Private Const PID_COLUMN_COUNT As Long = &H0046&
+    Private Const PID_ROW_SOURCE As Long = &H005B&
+    Private Const PID_ON_CLICK As Long = &H007E&
+    Private Const PID_SOURCE_OBJECT As Long = &H0084&
+    Private Const PID_TOP As Long = &H008D&
+    Private Const PID_DEFAULT_VIEW As Long = &H0093&
+    Private Const PID_WIDTH As Long = &H0096&
+    Private Const PID_RECORD_SOURCE As Long = &H009C&
+    Private Const PID_NAVIGATION_BUTTONS As Long = &H0117&
+    Private Const PID_ALLOW_ADDITIONS As Long = &H0146&
+    Private Const PID_FORE_COLOR As Long = &H00CC&
+    Private Const PID_CACHED_LEFT As Long = &H024A&
+    Private Const PID_CACHED_TOP As Long = &H024B&
+    Private Const PID_CACHED_RIGHT As Long = &H024C&
+    Private Const PID_CACHED_BOTTOM As Long = &H024D&
+
+    Private Const BLOB_MARK_NEXT_OR_END As Long = &HFD&
+    Private Const BLOB_MARK_ONE_CHILD As Long = &HFE&
+    Private Const BLOB_MARK_CHILDREN As Long = &HFF&
+    Private Const BLOB_RECORD_HEADER As Long = 18
+    Private Const DT_BYTE As Long = 2&
+    Private Const DT_INT As Long = 3&
+    Private Const DT_LONG As Long = 4&
+    Private Const DT_TEXT As Long = 10&
+    Private Const DT_BINARY As Long = 11&
+    Private Const DT_MEMO As Long = 12&
+
+    Public Function UpdateControlGeometry(ByRef blobBytes() As Byte, ByVal controlName As String, ByVal newLeft As Long, ByVal newTop As Long, ByVal newWidth As Long, ByVal newHeight As Long) As Boolean
+        Dim ok1 As Boolean
+        Dim ok2 As Boolean
+        Dim ok3 As Boolean
+        Dim ok4 As Boolean
+        ok1 = UpdateControlProperty(blobBytes, controlName, PID_LEFT, newLeft)
+        ok2 = UpdateControlProperty(blobBytes, controlName, PID_TOP, newTop)
+        ok3 = UpdateControlProperty(blobBytes, controlName, PID_WIDTH, newWidth)
+        ok4 = UpdateControlProperty(blobBytes, controlName, PID_HEIGHT, newHeight)
+
+        UpdateControlProperty blobBytes, controlName, PID_CACHED_LEFT, newLeft
+        UpdateControlProperty blobBytes, controlName, PID_CACHED_TOP, newTop
+        UpdateControlProperty blobBytes, controlName, PID_CACHED_RIGHT, newLeft + newWidth
+        UpdateControlProperty blobBytes, controlName, PID_CACHED_BOTTOM, newTop + newHeight
+
+        UpdateControlGeometry = (ok1 Or ok2 Or ok3 Or ok4)
+    End Function
+
+    Public Function UpdateControlCaption(ByRef blobBytes() As Byte, ByVal controlName As String, ByVal newCaption As String) As Boolean
+        UpdateControlCaption = UpdateControlProperty(blobBytes, controlName, PID_CAPTION, newCaption)
+    End Function
+
+    Public Function UpdateControlProperty(ByRef b() As Byte, ByVal targetControlName As String, ByVal targetPid As Long, ByVal newValue As Variant) As Boolean
+        UpdateControlProperty = False
+        On Error GoTo ErrHandler
+
+        Dim n As Long
+        n = UBound(b) - LBound(b) + 1
+        If n < 18 Then Exit Function
+
+        Dim controlStart As Long
+        Dim controlEnd As Long
+        Dim foundControl As Boolean
+        foundControl = FindControlBounds(b, targetControlName, controlStart, controlEnd)
+        If Not foundControl Then Exit Function
+
+        Dim p As Long
+        p = controlStart
+        Do While p + BLOB_RECORD_HEADER <= controlEnd
+            If IsMarker(GetU32(b, p)) Then
+                Exit Do
+            End If
+
+            If PlausibleRecord(b, p, controlEnd) Then
+                Dim pid As Long
+                pid = GetU16(b, p + 4)
+                Dim dt As Long
+                dt = GetU32(b, p + 6)
+                Dim ln As Long
+                ln = GetU32(b, p + 14)
+
+                If pid = targetPid Then
+                    If VarType(newValue) = vbString Then
+                        Dim sBytes() As Byte
+                        sBytes = EncodeString(CStr(newValue))
+                        ReplaceRecordBytes b, p, pid, DT_TEXT, sBytes
+                        UpdateControlProperty = True
+                        Exit Function
+                    Else
+                        If ln = 4 Then
+                            PutU32 b, p + BLOB_RECORD_HEADER, CLng(newValue)
+                            UpdateControlProperty = True
+                            Exit Function
+                        ElseIf ln = 2 Then
+                            PutU16 b, p + BLOB_RECORD_HEADER, CLng(newValue)
+                            UpdateControlProperty = True
+                            Exit Function
+                        Else
+                            Dim numBytes(0 To 3) As Byte
+                            PutU32 numBytes, 0, CLng(newValue)
+                            ReplaceRecordBytes b, p, pid, DT_LONG, numBytes
+                            UpdateControlProperty = True
+                            Exit Function
+                        End If
+                    End If
+                End If
+                p = p + BLOB_RECORD_HEADER + ln
+            Else
+                p = p + 1
+            End If
+        Loop
+
+        Dim newRecBytes() As Byte
+        If VarType(newValue) = vbString Then
+            newRecBytes = BuildRecord(targetPid, DT_TEXT, EncodeString(CStr(newValue)))
+        Else
+            Dim numData(0 To 3) As Byte
+            PutU32 numData, 0, CLng(newValue)
+            newRecBytes = BuildRecord(targetPid, DT_LONG, numData)
+        End If
+
+        InsertBytes b, controlStart, newRecBytes
+        UpdateControlProperty = True
+        Exit Function
+
+ErrHandler:
+        UpdateControlProperty = False
+    End Function
+
+    Private Function FindControlBounds(ByRef b() As Byte, ByVal targetControlName As String, ByRef outStart As Long, ByRef outEnd As Long) As Boolean
+        FindControlBounds = False
+        On Error Resume Next
+        Dim n As Long
+        n = UBound(b) - LBound(b) + 1
+        If n < 18 Then Exit Function
+
+        Dim p As Long
+        p = 10
+        Dim currentObjStart As Long
+        currentObjStart = p
+        Dim currentControlName As String
+        currentControlName = ""
+
+        Do While p + BLOB_RECORD_HEADER <= n
+            Dim markerVal As Long
+            markerVal = GetU32(b, p)
+            If IsMarker(markerVal) Then
+                If StrComp(Trim$(currentControlName), Trim$(targetControlName), vbTextCompare) = 0 Then
+                    outStart = currentObjStart
+                    outEnd = p
+                    FindControlBounds = True
+                    Exit Function
+                End If
+
+                If markerVal = BLOB_MARK_CHILDREN Then
+                    p = p + 8
+                ElseIf markerVal = BLOB_MARK_ONE_CHILD Then
+                    p = p + 6
+                ElseIf markerVal = BLOB_MARK_NEXT_OR_END Then
+                    p = p + 4
+                Else
+                    p = p + 2
+                End If
+                currentObjStart = p
+                currentControlName = ""
+                GoTo NextLoop
+            End If
+
+            If PlausibleRecord(b, p, n) Then
+                Dim pid As Long
+                pid = GetU16(b, p + 4)
+                Dim ln As Long
+                ln = GetU32(b, p + 14)
+
+                If pid = PID_NAME Then
+                    currentControlName = DecodeString(b, p + BLOB_RECORD_HEADER, ln)
+                End If
+                p = p + BLOB_RECORD_HEADER + ln
+            Else
+                p = p + 1
+            End If
+NextLoop:
+        Loop
+
+        If StrComp(Trim$(currentControlName), Trim$(targetControlName), vbTextCompare) = 0 Then
+            outStart = currentObjStart
+            outEnd = p
+            FindControlBounds = True
+        End If
+    End Function
+
+    Public Function SaveFormBlob(ByVal db As Object, ByVal formName As String, ByRef blobBytes() As Byte, Optional ByVal dbPath As String = "") As Boolean
+        SaveFormBlob = False
+        Dim inTrans As Boolean
+        inTrans = False
+
+        Dim rsForms As Object
+        Dim rsDir As Object
+        Dim rsBlob As Object
+
+        On Error GoTo ErrHandler
+        If db Is Nothing Then Exit Function
+
+        If Len(dbPath) > 0 Then
+            If PalManager.FS.IsLockFilePresent(dbPath) Then
+                Err.Raise 70, "FormLayoutWriter.SaveFormBlob", "Database is locked by another user."
+                Exit Function
+            End If
+            CreateBackupCopy dbPath
+        End If
+
+        Set rsForms = db.OpenRecordset("SELECT [Id] FROM [MSysAccessStorage] WHERE [Name] = 'Forms';")
+        If rsForms Is Nothing Or rsForms.EOF Then GoTo Cleanup
+        Dim formsId As Long
+        formsId = CLng(rsForms.Fields(0).Value)
+        rsForms.Close
+        Set rsForms = Nothing
+
+        Dim folderIdx As Long
+        folderIdx = -1
+
+        Set rsDir = db.OpenRecordset("SELECT [Name], [Lv] FROM [MSysAccessStorage] WHERE [ParentId] = " & CStr(formsId) & ";")
+        If Not rsDir Is Nothing Then
+            Do Until rsDir.EOF
+                If InStr(1, CStr(rsDir.Fields(0).Value), "DirData", vbTextCompare) > 0 Then
+                    Dim vVal As Variant
+                    vVal = rsDir.Fields(1).Value
+                    If Not IsNull(vVal) Then
+                        Dim dirBytes() As Byte
+                        dirBytes = vVal
+                        folderIdx = ParseDirDataForName(dirBytes, formName)
+                        If folderIdx >= 0 Then Exit Do
+                    End If
+                End If
+                rsDir.MoveNext
+            Loop
+            rsDir.Close
+            Set rsDir = Nothing
+        End If
+
+        If folderIdx < 0 Then
+            Err.Raise 53, "FormLayoutWriter.SaveFormBlob", "Form '" & formName & "' not found in MSysAccessStorage."
+            GoTo Cleanup
+        End If
+
+        db.BeginTrans
+        inTrans = True
+
+        Set rsBlob = db.OpenRecordset("SELECT b.[Id], b.[Lv] FROM [MSysAccessStorage] f INNER JOIN [MSysAccessStorage] b ON f.[Id] = b.[ParentId] WHERE f.[ParentId] = " & CStr(formsId) & " AND f.[Name] = '" & CStr(folderIdx) & "' AND b.[Name] = 'Blob';")
+        If rsBlob Is Nothing Or rsBlob.EOF Then GoTo Cleanup
+
+        rsBlob.Edit
+        rsBlob.Fields(1).Value = blobBytes
+        rsBlob.Update
+        rsBlob.Close
+        Set rsBlob = Nothing
+
+        db.CommitTrans
+        inTrans = False
+        SaveFormBlob = True
+
+Cleanup:
+        On Error Resume Next
+        If Not rsForms Is Nothing Then rsForms.Close
+        If Not rsDir Is Nothing Then rsDir.Close
+        If Not rsBlob Is Nothing Then rsBlob.Close
+        Exit Function
+
+ErrHandler:
+        If inTrans Then
+            On Error Resume Next
+            db.Rollback
+        End If
+        SaveFormBlob = False
+        Resume Cleanup
+    End Function
+
+    Private Function ParseDirDataForName(ByRef dirBytes() As Byte, ByVal targetName As String) As Long
+        ParseDirDataForName = -1
+        On Error Resume Next
+        Dim dMax As Long
+        dMax = UBound(dirBytes)
+        Dim dPos As Long
+        dPos = 4
+
+        Do While (dPos + 5) <= dMax
+            Dim recLen As Long
+            recLen = CLng(dirBytes(dPos + 1))
+            If recLen <= 4 Or (dPos + 1 + recLen) > dMax Then Exit Do
+
+            Dim nameBytesLen As Long
+            nameBytesLen = recLen - 4
+            Dim entryName As String
+            entryName = vbNullString
+
+            Dim chIdx As Long
+            For chIdx = 0 To (nameBytesLen \ 2) - 1
+                entryName = entryName & ChrW$(CLng(dirBytes(dPos + 2 + (chIdx * 2))) Or (CLng(dirBytes(dPos + 3 + (chIdx * 2))) * 256))
+            Next chIdx
+
+            If StrComp(Trim$(entryName), Trim$(targetName), vbTextCompare) = 0 Then
+                ParseDirDataForName = CLng(dirBytes(dPos + 2 + nameBytesLen))
+                Exit Function
+            End If
+            dPos = dPos + 2 + recLen
+        Loop
+    End Function
+
+    Private Sub CreateBackupCopy(ByVal filePath As String)
+        On Error Resume Next
+        Dim fs As IFileSystem
+        Set fs = PalManager.FS
+        If Not fs.FileExists(filePath) Then Exit Sub
+
+        Dim dirPath As String
+        dirPath = fs.GetDirectoryName(filePath)
+        Dim baseName As String
+        baseName = fs.GetFileName(filePath)
+
+        Dim timeStamp As String
+        timeStamp = Format$(Now, "yyyymmdd_hhnnss")
+        Dim backupPath As String
+        backupPath = fs.Combine(dirPath, "backup_" & timeStamp & "_" & baseName)
+
+        fs.CopyFile filePath, backupPath, False
+    End Sub
+
+    Private Function BuildRecord(ByVal pid As Long, ByVal dt As Long, ByRef dataBytes() As Byte) As Byte()
+        Dim dataLen As Long
+        dataLen = UBound(dataBytes) - LBound(dataBytes) + 1
+        Dim totalLen As Long
+        totalLen = BLOB_RECORD_HEADER + dataLen
+
+        Dim res() As Byte
+        ReDim res(0 To totalLen - 1)
+
+        PutU32 res, 0, 0
+        PutU16 res, 4, pid
+        PutU32 res, 6, dt
+        PutU32 res, 10, dataLen
+        PutU32 res, 14, dataLen
+
+        Dim i As Long
+        For i = 0 To dataLen - 1
+            res(BLOB_RECORD_HEADER + i) = dataBytes(i)
+        Next i
+
+        BuildRecord = res
+    End Function
+
+    Private Sub ReplaceRecordBytes(ByRef b() As Byte, ByVal recOffset As Long, ByVal pid As Long, ByVal dt As Long, ByRef dataBytes() As Byte)
+        Dim oldDataLen As Long
+        oldDataLen = GetU32(b, recOffset + 14)
+        Dim oldRecLen As Long
+        oldRecLen = BLOB_RECORD_HEADER + oldDataLen
+
+        Dim newRec() As Byte
+        newRec = BuildRecord(pid, dt, dataBytes)
+        Dim newRecLen As Long
+        newRecLen = UBound(newRec) - LBound(newRec) + 1
+
+        If oldRecLen = newRecLen Then
+            Dim i As Long
+            For i = 0 To newRecLen - 1
+                b(recOffset + i) = newRec(i)
+            Next i
+        Else
+            Dim n As Long
+            n = UBound(b) - LBound(b) + 1
+            Dim diff As Long
+            diff = newRecLen - oldRecLen
+
+            If diff > 0 Then
+                ReDim Preserve b(0 To n + diff - 1)
+                Dim s As Long
+                For s = n - 1 To recOffset + oldRecLen Step -1
+                    b(s + diff) = b(s)
+                Next s
+            ElseIf diff < 0 Then
+                For s = recOffset + oldRecLen To n - 1
+                    b(s + diff) = b(s)
+                Next s
+                ReDim Preserve b(0 To n + diff - 1)
+            End If
+
+            For i = 0 To newRecLen - 1
+                b(recOffset + i) = newRec(i)
+            Next i
+        End If
+    End Sub
+
+    Private Sub InsertBytes(ByRef b() As Byte, ByVal insertOffset As Long, ByRef newBytes() As Byte)
+        Dim n As Long
+        n = UBound(b) - LBound(b) + 1
+        Dim addLen As Long
+        addLen = UBound(newBytes) - LBound(newBytes) + 1
+        If addLen <= 0 Then Exit Sub
+
+        ReDim Preserve b(0 To n + addLen - 1)
+        Dim s As Long
+        For s = n - 1 To insertOffset Step -1
+            b(s + addLen) = b(s)
+        Next s
+
+        Dim i As Long
+        For i = 0 To addLen - 1
+            b(insertOffset + i) = newBytes(i)
+        Next i
+    End Sub
+
+    Private Function EncodeString(ByVal s As String) As Byte()
+        Dim b() As Byte
+        b = s
+        Dim n As Long
+        n = UBound(b) - LBound(b) + 1
+        Dim res() As Byte
+        ReDim res(0 To n + 1)
+        Dim i As Long
+        For i = 0 To n - 1
+            res(i) = b(i)
+        Next i
+        res(n) = 0
+        res(n + 1) = 0
+        EncodeString = res
+    End Function
+
+    Private Function DecodeString(ByRef b() As Byte, ByVal p As Long, ByVal byteLen As Long) As String
+        Dim k As Long
+        Dim s As String
+        s = vbNullString
+        For k = 0 To (byteLen \ 2) - 1
+            Dim code As Long
+            code = CLng(b(p + 2 * k)) Or (CLng(b(p + 2 * k + 1)) * 256)
+            If code = 0 Then Exit For
+            s = s & ChrW$(code)
+        Next k
+        DecodeString = s
+    End Function
+
+    Private Function IsMarker(ByVal vVal As Long) As Boolean
+        IsMarker = (vVal = BLOB_MARK_NEXT_OR_END Or vVal = BLOB_MARK_ONE_CHILD Or vVal = BLOB_MARK_CHILDREN)
+    End Function
+
+    Private Function PlausibleRecord(ByRef b() As Byte, ByVal offset As Long, ByVal maxLen As Long) As Boolean
+        If offset + BLOB_RECORD_HEADER > maxLen Then Exit Function
+        Dim dt As Long
+        dt = GetU32(b, offset + 6)
+        Dim ln1 As Long
+        ln1 = GetU32(b, offset + 10)
+        Dim ln2 As Long
+        ln2 = GetU32(b, offset + 14)
+        If dt >= 1 And dt <= 12 And ln1 = ln2 And (offset + BLOB_RECORD_HEADER + ln1) <= maxLen Then
+            PlausibleRecord = True
+        Else
+            PlausibleRecord = False
+        End If
+    End Function
+
+    Private Function GetU16(ByRef b() As Byte, ByVal offset As Long) As Long
+        GetU16 = CLng(b(offset)) Or (CLng(b(offset + 1)) * 256)
+    End Function
+
+    Private Function GetU32(ByRef b() As Byte, ByVal offset As Long) As Long
+        GetU32 = CLng(b(offset)) Or (CLng(b(offset + 1)) * 256) Or (CLng(b(offset + 2)) * 65536) Or (CLng(b(offset + 3)) * 16777216)
+    End Function
+
+    Private Sub PutU16(ByRef b() As Byte, ByVal offset As Long, ByVal vVal As Long)
+        b(offset) = CByte(vVal And &HFF&)
+        b(offset + 1) = CByte((vVal \ 256) And &HFF&)
+    End Sub
+
+    Private Sub PutU32(ByRef b() As Byte, ByVal offset As Long, ByVal vVal As Long)
+        b(offset) = CByte(vVal And &HFF&)
+        b(offset + 1) = CByte((vVal \ 256) And &HFF&)
+        b(offset + 2) = CByte((vVal \ 65536) And &HFF&)
+        b(offset + 3) = CByte((vVal \ 16777216) And &H7F&)
+    End Sub
+End Module

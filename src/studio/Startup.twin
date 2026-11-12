@@ -1,0 +1,57 @@
+' File: src/studio/Startup.twin
+' OpenAccess Studio — Application Entry Point
+Option Explicit
+
+Public Module Startup
+
+    Public Sub Main()
+        Dim cmd As String
+        cmd = Trim$(Command$)
+        If InStr(1, cmd, "selftest", vbTextCompare) > 0 Or InStr(1, cmd, "verifylive", vbTextCompare) > 0 Then
+            LiveEngineSelfTest.VerifyLiveEngine
+            Exit Sub
+        End If
+
+        Dim isRuntime As Boolean
+        Dim targetDb As String
+        isRuntime = False
+        targetDb = vbNullString
+
+        Dim pRuntime As Long
+        pRuntime = InStr(1, cmd, "/runtime", vbTextCompare)
+        If pRuntime = 0 Then pRuntime = InStr(1, cmd, "-runtime", vbTextCompare)
+        If pRuntime > 0 Then
+            isRuntime = True
+            Dim afterParam As String
+            afterParam = Trim$(Mid$(cmd, pRuntime + 8))
+            If Left$(afterParam, 1) = """" Then
+                Dim qEnd As Long
+                qEnd = InStr(2, afterParam, """")
+                If qEnd > 0 Then
+                    targetDb = Mid$(afterParam, 2, qEnd - 2)
+                Else
+                    targetDb = Mid$(afterParam, 2)
+                End If
+            Else
+                Dim spPos As Long
+                spPos = InStr(1, afterParam, " ")
+                If spPos > 0 Then
+                    targetDb = Left$(afterParam, spPos - 1)
+                Else
+                    targetDb = afterParam
+                End If
+            End If
+            targetDb = Trim$(targetDb)
+        ElseIf Len(cmd) > 0 Then
+            targetDb = Replace$(cmd, """", "")
+        End If
+
+        StudioController.IsRuntimeMode = isRuntime
+        MainForm.Show
+        MainForm.ApplyResponsiveLayout
+        If Len(targetDb) > 0 Then
+            MainForm.LaunchDatabase targetDb, isRuntime
+        End If
+    End Sub
+
+End Module

@@ -1,0 +1,748 @@
+' File: src/studio/vba/VbaParser.twin
+' Plan 7 WS5.2: Complete Visual Basic for Applications (VBA) AST Parser
+Option Explicit
+
+[ Description ("VBA Grammar and Abstract Syntax Tree (AST) Parser for OpenAccess Studio") ]
+Public Module VbaParser
+
+    Public Enum VbaAstNodeType
+        NodeModule = 1
+        NodeOption = 2
+        NodeAttribute = 3
+        NodeDeclare = 4
+        NodeTypeDef = 5
+        NodeEnumDef = 6
+        NodeVarDecl = 7
+        NodeConstDecl = 8
+        NodeProcedure = 9
+        NodeParam = 10
+        NodeAssign = 11
+        NodeIf = 12
+        NodeSelect = 13
+        NodeFor = 14
+        NodeForEach = 15
+        NodeDoLoop = 16
+        NodeWhileWend = 17
+        NodeWith = 18
+        NodeOnError = 19
+        NodeResume = 20
+        NodeGoTo = 21
+        NodeExit = 22
+        NodeCall = 23
+        NodeLabel = 24
+        NodeExpr = 25
+        NodeDirective = 26
+    End Enum
+
+    Public Type VbaParseError
+        LineNumber As Long
+        ColumnNumber As Long
+        Message As String
+    End Type
+
+    Public Type VbaParamDef
+        ParamName As String
+        ParamType As String
+        IsByVal As Boolean
+        IsOptional As Boolean
+        IsParamArray As Boolean
+        DefaultValue As String
+    End Type
+
+    Public Type VbaProcedureDef
+        ProcType As String          ' Sub, Function, Property Get, Property Let, Property Set
+        ProcName As String
+        Visibility As String        ' Public, Private, Friend
+        IsStatic As Boolean
+        ReturnType As String
+        ParamCount As Long
+        Params() As VbaParamDef
+        BodyStatementCount As Long
+        StartLine As Long
+        EndLine As Long
+        RawSource As String
+    End Type
+
+    Public Type VbaModuleDef
+        ModuleName As String
+        HasOptionExplicit As Boolean
+        OptionCompare As String     ' Database, Text, Binary, None
+        ProcedureCount As Long
+        Procedures() As VbaProcedureDef
+        TypeCount As Long
+        Types() As String           ' Names of custom UDTs
+        EnumCount As Long
+        Enums() As String           ' Names of enums
+        DeclareCount As Long
+        Declares() As String        ' Names of API declares
+        VarCount As Long
+        Vars() As String            ' Module-level variable names
+        ErrorCount As Long
+        Errors() As VbaParseError
+    End Type
+
+    Private Type ParseCursor
+        Tokens() As VbaToken
+        TokenCount As Long
+        Pos As Long
+    End Type
+
+    ' Parse complete VBA module source into VbaModuleDef
+    Public Function ParseModule(ByVal sourceCode As String, Optional ByVal modName As String = "Module1") As VbaModuleDef
+        Dim cur As ParseCursor
+        Dim mDef As VbaModuleDef
+        Dim tokCount As Long
+
+        mDef.ModuleName = modName
+        mDef.HasOptionExplicit = False
+        mDef.OptionCompare = "None"
+        mDef.ProcedureCount = 0
+        mDef.TypeCount = 0
+        mDef.EnumCount = 0
+        mDef.DeclareCount = 0
+        mDef.VarCount = 0
+        mDef.ErrorCount = 0
+        ReDim mDef.Procedures(0 To 0)
+        ReDim mDef.Types(0 To 0)
+        ReDim mDef.Enums(0 To 0)
+        ReDim mDef.Declares(0 To 0)
+        ReDim mDef.Vars(0 To 0)
+        ReDim mDef.Errors(0 To 0)
+
+        cur.Tokens = VbaLexer.Tokenize(sourceCode, tokCount)
+        cur.TokenCount = tokCount
+        cur.Pos = 0
+
+        ' Skip leading newlines and comments
+        SkipTrivia cur
+
+        Do While Not IsEOF(cur)
+            Dim t As VbaToken
+            t = Peek(cur)
+
+            If t.TokenType = TokNewLine Or t.TokenType = TokComment Then
+                Advance cur
+            ElseIf t.TokenType = TokDirective Then
+                ' Compiler directive (#If, #Const, etc.)
+                Advance cur
+                SkipToNextStatement cur
+            ElseIf t.TokenType = VbaTokenType.TokKeyword Then
+                Dim kw As String
+                kw = UCase$(t.Value)
+
+                Select Case kw
+                    Case "OPTION"
+                        ParseOptionStmt cur, mDef
+
+                    Case "ATTRIBUTE"
+                        ParseAttributeStmt cur, mDef
+
+                    Case "TYPE"
+                        ParseTypeBlock cur, mDef
+
+                    Case "ENUM"
+                        ParseEnumBlock cur, mDef
+
+                    Case "DECLARE"
+                        ParseDeclareStmt cur, mDef, "Public"
+
+                    Case "DIM", "REDIM"
+                        ParseDimStmt cur, mDef
+
+                    Case "CONST"
+                        ParseConstStmt cur, mDef
+
+                    Case "SUB", "FUNCTION"
+                        ParseProcedureBlock cur, mDef, "Public", False
+
+                    Case "PROPERTY"
+                        ParsePropertyBlock cur, mDef, "Public", False
+
+                    Case "PUBLIC", "PRIVATE", "FRIEND", "GLOBAL", "STATIC"
+                        ParseScopedDeclaration cur, mDef
+
+                    Case Else
+                        ' Top-level statement or unrecognized token
+                        AddError mDef, t.LineNumber, t.ColumnNumber, "Unexpected statement in module header: " & t.Value
+                        SkipToNextStatement cur
+                End Select
+            Else
+                ' Unrecognized token
+                AddError mDef, t.LineNumber, t.ColumnNumber, "Unexpected token in module header: " & t.Value
+                SkipToNextStatement cur
+            End If
+
+            SkipTrivia cur
+        Loop
+
+        ParseModule = mDef
+    End Function
+
+    ' =========================================================================
+    ' Parser Subroutines for Declarations and Procedures
+    ' =========================================================================
+
+        Private Function ParseTypeName(ByRef cur As ParseCursor) As String
+        Dim tName As String
+        tName = vbNullString
+        If Not IsEOF(cur) Then
+            tName = Peek(cur).Value
+            Advance cur
+            Do While Not IsEOF(cur) And Peek(cur).Value = "."
+                Advance cur
+                If Not IsEOF(cur) Then
+                    tName = tName & "." & Peek(cur).Value
+                    Advance cur
+                End If
+            Loop
+        End If
+        ParseTypeName = tName
+    End Function
+
+Private Sub ParseOptionStmt(ByRef cur As ParseCursor, ByRef mDef As VbaModuleDef)
+        Advance cur ' Skip "Option"
+        If Not IsEOF(cur) Then
+            Dim optName As String
+            optName = UCase$(Peek(cur).Value)
+            Advance cur
+
+            If optName = "EXPLICIT" Then
+                mDef.HasOptionExplicit = True
+            ElseIf optName = "COMPARE" Then
+                If Not IsEOF(cur) Then
+                    mDef.OptionCompare = Peek(cur).Value
+                    Advance cur
+                End If
+            End If
+        End If
+        SkipToNextStatement cur
+    End Sub
+
+    Private Sub ParseAttributeStmt(ByRef cur As ParseCursor, ByRef mDef As VbaModuleDef)
+        Advance cur ' Skip "Attribute"
+        ' Consume attribute line: Attribute VB_Name = "..."
+        SkipToNextStatement cur
+    End Sub
+
+    Private Sub ParseScopedDeclaration(ByRef cur As ParseCursor, ByRef mDef As VbaModuleDef)
+        Dim scope As String
+        Dim isStatic As Boolean
+        Dim t As VbaToken
+
+        scope = Peek(cur).Value
+        Advance cur
+
+        isStatic = False
+        If UCase$(scope) = "STATIC" Then
+            isStatic = True
+            scope = "Public"
+        ElseIf Not IsEOF(cur) And UCase$(Peek(cur).Value) = "STATIC" Then
+            isStatic = True
+            Advance cur
+        End If
+
+        If IsEOF(cur) Then Exit Sub
+        t = Peek(cur)
+
+        Select Case UCase$(t.Value)
+            Case "SUB", "FUNCTION"
+                ParseProcedureBlock cur, mDef, scope, isStatic
+            Case "PROPERTY"
+                ParsePropertyBlock cur, mDef, scope, isStatic
+            Case "DECLARE"
+                ParseDeclareStmt cur, mDef, scope
+            Case "TYPE"
+                ParseTypeBlock cur, mDef
+            Case "ENUM"
+                ParseEnumBlock cur, mDef
+            Case "EVENT"
+                Advance cur
+                SkipToNextStatement cur
+            Case "CONST"
+                ParseConstStmt cur, mDef
+            Case "DIM"
+                ParseDimStmt cur, mDef
+            Case Else
+                ' Variable declaration: Public varName As Type
+                ParseModuleVar cur, mDef, scope
+        End Select
+    End Sub
+
+    Private Sub ParseProcedureBlock(ByRef cur As ParseCursor, ByRef mDef As VbaModuleDef, ByVal scope As String, ByVal isStatic As Boolean)
+        Dim procType As String
+        Dim procName As String
+        Dim startLine As Long
+        Dim endLine As Long
+        Dim pDef As VbaProcedureDef
+
+        procType = Peek(cur).Value
+        startLine = Peek(cur).LineNumber
+        Advance cur ' Skip Sub / Function
+
+        If Not IsEOF(cur) Then
+            procName = Peek(cur).Value
+            Advance cur
+        Else
+            procName = "Unnamed"
+        End If
+
+        pDef.ProcType = procType
+        pDef.ProcName = procName
+        pDef.Visibility = scope
+        pDef.IsStatic = isStatic
+        pDef.StartLine = startLine
+        pDef.ReturnType = "Variant"
+        pDef.ParamCount = 0
+        ReDim pDef.Params(0 To 0)
+
+        ' Parse Parameters: (param1, Optional param2 As String = "x")
+        If Not IsEOF(cur) And Peek(cur).Value = "(" Then
+            Advance cur ' Skip (
+            ParseParameterList cur, pDef
+            If Not IsEOF(cur) And Peek(cur).Value = ")" Then Advance cur
+        End If
+
+        ' Parse Return Type if Function: As TypeName
+        If Not IsEOF(cur) And UCase$(Peek(cur).Value) = "AS" Then
+            Advance cur ' Skip As
+            If Not IsEOF(cur) Then
+                pDef.ReturnType = Peek(cur).Value
+                Advance cur
+            End If
+        End If
+
+        SkipToNextStatement cur
+
+        ' Consume procedure body statements until End Sub / End Function
+        Dim targetEnd As String
+        targetEnd = "END " & UCase$(procType)
+        pDef.BodyStatementCount = 0
+
+        Do While Not IsEOF(cur)
+            Dim pt As VbaToken
+            pt = Peek(cur)
+
+            If UCase$(pt.Value) = "END" Then
+                Dim nxt As VbaToken
+                nxt = LookAhead(cur, 1)
+                If UCase$(nxt.Value) = UCase$(procType) Then
+                    Advance cur ' Skip End
+                    Advance cur ' Skip Sub / Function
+                    endLine = nxt.LineNumber
+                    Exit Do
+                ElseIf UCase$(nxt.Value) = "PROPERTY" And Left$(UCase$(procType), 8) = "PROPERTY" Then
+                    Advance cur
+                    Advance cur
+                    endLine = nxt.LineNumber
+                    Exit Do
+                End If
+            End If
+
+            ' Count statements (non-trivia, non-comment tokens at start of line)
+            If pt.TokenType <> TokNewLine And pt.TokenType <> TokComment Then
+                pDef.BodyStatementCount = pDef.BodyStatementCount + 1
+            End If
+
+            Advance cur
+        Loop
+
+        pDef.EndLine = endLine
+
+        ' Append procedure to module definition
+        If mDef.ProcedureCount = 0 Then
+            ReDim mDef.Procedures(0 To 0)
+        Else
+            ReDim Preserve mDef.Procedures(0 To mDef.ProcedureCount)
+        End If
+        mDef.Procedures(mDef.ProcedureCount) = pDef
+        mDef.ProcedureCount = mDef.ProcedureCount + 1
+    End Sub
+
+    Private Sub ParsePropertyBlock(ByRef cur As ParseCursor, ByRef mDef As VbaModuleDef, ByVal scope As String, ByVal isStatic As Boolean)
+        Dim propKind As String
+        Dim propName As String
+        Dim startLine As Long
+        Dim endLine As Long
+        Dim pDef As VbaProcedureDef
+
+        startLine = Peek(cur).LineNumber
+        Advance cur ' Skip Property
+
+        If Not IsEOF(cur) Then
+            propKind = Peek(cur).Value ' Get, Let, Set
+            Advance cur
+        Else
+            propKind = "Get"
+        End If
+
+        If Not IsEOF(cur) Then
+            propName = Peek(cur).Value
+            Advance cur
+        Else
+            propName = "Unnamed"
+        End If
+
+        pDef.ProcType = "Property " & propKind
+        pDef.ProcName = propName
+        pDef.Visibility = scope
+        pDef.IsStatic = isStatic
+        pDef.StartLine = startLine
+        pDef.ReturnType = "Variant"
+        pDef.ParamCount = 0
+        ReDim pDef.Params(0 To 0)
+
+        ' Parse Parameters: (param1, ...)
+        If Not IsEOF(cur) And Peek(cur).Value = "(" Then
+            Advance cur ' Skip (
+            ParseParameterList cur, pDef
+            If Not IsEOF(cur) And Peek(cur).Value = ")" Then Advance cur
+        End If
+
+        ' Parse Return Type if Property Get: As TypeName
+        If Not IsEOF(cur) And UCase$(Peek(cur).Value) = "AS" Then
+            Advance cur ' Skip As
+            pDef.ReturnType = ParseTypeName(cur)
+        End If
+
+        SkipToNextStatement cur
+
+        ' Consume procedure body statements until End Property
+        pDef.BodyStatementCount = 0
+
+        Do While Not IsEOF(cur)
+            Dim pt As VbaToken
+            pt = Peek(cur)
+
+            If UCase$(pt.Value) = "END" Then
+                Dim nxt As VbaToken
+                nxt = LookAhead(cur, 1)
+                If UCase$(nxt.Value) = "PROPERTY" Then
+                    Advance cur ' Skip End
+                    Advance cur ' Skip Property
+                    endLine = nxt.LineNumber
+                    Exit Do
+                End If
+            End If
+
+            If pt.TokenType <> TokNewLine And pt.TokenType <> TokComment Then
+                pDef.BodyStatementCount = pDef.BodyStatementCount + 1
+            End If
+
+            Advance cur
+        Loop
+
+        pDef.EndLine = endLine
+
+        If mDef.ProcedureCount = 0 Then
+            ReDim mDef.Procedures(0 To 0)
+        Else
+            ReDim Preserve mDef.Procedures(0 To mDef.ProcedureCount)
+        End If
+        mDef.Procedures(mDef.ProcedureCount) = pDef
+        mDef.ProcedureCount = mDef.ProcedureCount + 1
+    End Sub
+
+    Private Sub ParseParameterList(ByRef cur As ParseCursor, ByRef pDef As VbaProcedureDef)
+        Do While Not IsEOF(cur) And Peek(cur).Value <> ")"
+            Dim param As VbaParamDef
+            param.IsByVal = False
+            param.IsOptional = False
+            param.IsParamArray = False
+            param.ParamType = "Variant"
+            param.DefaultValue = vbNullString
+
+            ' Optional
+            If UCase$(Peek(cur).Value) = "OPTIONAL" Then
+                param.IsOptional = True
+                Advance cur
+            End If
+
+            ' ByVal / ByRef
+            If UCase$(Peek(cur).Value) = "BYVAL" Then
+                param.IsByVal = True
+                Advance cur
+            ElseIf UCase$(Peek(cur).Value) = "BYREF" Then
+                param.IsByVal = False
+                Advance cur
+            End If
+
+            ' ParamArray
+            If UCase$(Peek(cur).Value) = "PARAMARRAY" Then
+                param.IsParamArray = True
+                Advance cur
+            End If
+
+            ' Parameter name
+            If Not IsEOF(cur) And Peek(cur).Value <> ")" Then
+                param.ParamName = Peek(cur).Value
+                Advance cur
+                ' Array brackets: name()
+                If Not IsEOF(cur) And Peek(cur).Value = "(" Then
+                    Advance cur
+                    If Not IsEOF(cur) And Peek(cur).Value = ")" Then Advance cur
+                    param.ParamName = param.ParamName & "()"
+                End If
+            End If
+
+            ' As Type
+            If Not IsEOF(cur) And UCase$(Peek(cur).Value) = "AS" Then
+                Advance cur
+                param.ParamType = ParseTypeName(cur)
+            End If
+
+            ' Default value: = expr (consume until comma or closing parenthesis)
+            If Not IsEOF(cur) And Peek(cur).Value = "=" Then
+                Advance cur
+                Dim defExpr As String
+                defExpr = vbNullString
+                Do While Not IsEOF(cur) And Peek(cur).Value <> "," And Peek(cur).Value <> ")"
+                    defExpr = defExpr & Peek(cur).Value
+                    Advance cur
+                Loop
+                param.DefaultValue = Trim$(defExpr)
+            End If
+
+            ' Append parameter
+            If pDef.ParamCount = 0 Then
+                ReDim pDef.Params(0 To 0)
+            Else
+                ReDim Preserve pDef.Params(0 To pDef.ParamCount)
+            End If
+            pDef.Params(pDef.ParamCount) = param
+            pDef.ParamCount = pDef.ParamCount + 1
+
+            If Not IsEOF(cur) And Peek(cur).Value = "," Then
+                Advance cur ' Skip comma
+            Else
+                Exit Do
+            End If
+        Loop
+    End Sub
+
+    Private Sub ParseTypeBlock(ByRef cur As ParseCursor, ByRef mDef As VbaModuleDef)
+        Dim typeName As String
+        Advance cur ' Skip Type
+        If Not IsEOF(cur) Then
+            typeName = Peek(cur).Value
+            Advance cur
+            If mDef.TypeCount = 0 Then
+                ReDim mDef.Types(0 To 0)
+            Else
+                ReDim Preserve mDef.Types(0 To mDef.TypeCount)
+            End If
+            mDef.Types(mDef.TypeCount) = typeName
+            mDef.TypeCount = mDef.TypeCount + 1
+        End If
+
+        ' Consume until End Type
+        Do While Not IsEOF(cur)
+            If UCase$(Peek(cur).Value) = "END" Then
+                If UCase$(LookAhead(cur, 1).Value) = "TYPE" Then
+                    Advance cur
+                    Advance cur
+                    Exit Do
+                End If
+            End If
+            Advance cur
+        Loop
+        SkipToNextStatement cur
+    End Sub
+
+    Private Sub ParseEnumBlock(ByRef cur As ParseCursor, ByRef mDef As VbaModuleDef)
+        Dim enumName As String
+        Advance cur ' Skip Enum
+        If Not IsEOF(cur) Then
+            enumName = Peek(cur).Value
+            Advance cur
+            If mDef.EnumCount = 0 Then
+                ReDim mDef.Enums(0 To 0)
+            Else
+                ReDim Preserve mDef.Enums(0 To mDef.EnumCount)
+            End If
+            mDef.Enums(mDef.EnumCount) = enumName
+            mDef.EnumCount = mDef.EnumCount + 1
+        End If
+
+        ' Consume until End Enum
+        Do While Not IsEOF(cur)
+            If UCase$(Peek(cur).Value) = "END" Then
+                If UCase$(LookAhead(cur, 1).Value) = "ENUM" Then
+                    Advance cur
+                    Advance cur
+                    Exit Do
+                End If
+            End If
+            Advance cur
+        Loop
+        SkipToNextStatement cur
+    End Sub
+
+    Private Sub ParseDeclareStmt(ByRef cur As ParseCursor, ByRef mDef As VbaModuleDef, ByVal scope As String)
+        Dim declName As String
+        Advance cur ' Skip Declare
+        ' Check PtrSafe
+        If Not IsEOF(cur) And UCase$(Peek(cur).Value) = "PTRSAFE" Then Advance cur
+        ' Sub or Function
+        If Not IsEOF(cur) And (UCase$(Peek(cur).Value) = "SUB" Or UCase$(Peek(cur).Value) = "FUNCTION") Then Advance cur
+
+        If Not IsEOF(cur) Then
+            declName = Peek(cur).Value
+            If mDef.DeclareCount = 0 Then
+                ReDim mDef.Declares(0 To 0)
+            Else
+                ReDim Preserve mDef.Declares(0 To mDef.DeclareCount)
+            End If
+            mDef.Declares(mDef.DeclareCount) = declName
+            mDef.DeclareCount = mDef.DeclareCount + 1
+        End If
+
+        SkipToNextStatement cur
+    End Sub
+
+    Private Sub ParseDimStmt(ByRef cur As ParseCursor, ByRef mDef As VbaModuleDef)
+        Advance cur ' Skip Dim
+        ParseModuleVar cur, mDef, "Private"
+    End Sub
+
+    Private Sub ParseConstStmt(ByRef cur As ParseCursor, ByRef mDef As VbaModuleDef)
+        Advance cur ' Skip Const
+        If Not IsEOF(cur) Then
+            Dim cName As String
+            cName = Peek(cur).Value
+            Advance cur
+        End If
+        SkipToNextStatement cur
+    End Sub
+
+    Private Sub ParseModuleVar(ByRef cur As ParseCursor, ByRef mDef As VbaModuleDef, ByVal scope As String)
+        ' Check for WithEvents keyword
+        If Not IsEOF(cur) And UCase$(Peek(cur).Value) = "WITHEVENTS" Then
+            Advance cur ' Skip WithEvents
+        End If
+
+        ' Check for Preserve keyword (in ReDim Preserve)
+        If Not IsEOF(cur) And UCase$(Peek(cur).Value) = "PRESERVE" Then
+            Advance cur ' Skip Preserve
+        End If
+
+        Do While Not IsEOF(cur)
+            Dim vName As String
+            vName = Peek(cur).Value
+            Advance cur
+
+            If mDef.VarCount = 0 Then
+                ReDim mDef.Vars(0 To 0)
+            Else
+                ReDim Preserve mDef.Vars(0 To mDef.VarCount)
+            End If
+            mDef.Vars(mDef.VarCount) = vName
+            mDef.VarCount = mDef.VarCount + 1
+
+            ' Array dimensions: v(1 To 10) or v()
+            If Not IsEOF(cur) And Peek(cur).Value = "(" Then
+                Do While Not IsEOF(cur) And Peek(cur).Value <> ")"
+                    Advance cur
+                Loop
+                If Not IsEOF(cur) And Peek(cur).Value = ")" Then Advance cur
+            End If
+
+            ' As [New] Type
+            If Not IsEOF(cur) And UCase$(Peek(cur).Value) = "AS" Then
+                Advance cur
+                If Not IsEOF(cur) And UCase$(Peek(cur).Value) = "NEW" Then Advance cur
+                Dim varType As String
+                varType = ParseTypeName(cur)
+                ' Fixed length string: As String * 50
+                If Not IsEOF(cur) And Peek(cur).Value = "*" Then
+                    Advance cur
+                    If Not IsEOF(cur) Then Advance cur
+                End If
+            End If
+
+            If Not IsEOF(cur) And Peek(cur).Value = "," Then
+                Advance cur ' Next variable
+            Else
+                Exit Do
+            End If
+        Loop
+        SkipToNextStatement cur
+    End Sub
+
+    ' =========================================================================
+    ' Cursor Navigation & Error Helpers
+    ' =========================================================================
+
+    Private Function IsEOF(ByRef cur As ParseCursor) As Boolean
+        If cur.Pos >= cur.TokenCount Then
+            IsEOF = True
+        Else
+            IsEOF = (cur.Tokens(cur.Pos).TokenType = VbaTokenType.TokEOF)
+        End If
+    End Function
+
+    Private Function Peek(ByRef cur As ParseCursor) As VbaToken
+        If cur.Pos < cur.TokenCount Then
+            Peek = cur.Tokens(cur.Pos)
+        Else
+            Dim eofTok As VbaToken
+            eofTok.TokenType = VbaTokenType.TokEOF
+            eofTok.Value = vbNullString
+            Peek = eofTok
+        End If
+    End Function
+
+    Private Function LookAhead(ByRef cur As ParseCursor, ByVal offset As Long) As VbaToken
+        Dim target As Long
+        target = cur.Pos + offset
+        If target >= 0 And target < cur.TokenCount Then
+            LookAhead = cur.Tokens(target)
+        Else
+            Dim eofTok As VbaToken
+            eofTok.TokenType = VbaTokenType.TokEOF
+            eofTok.Value = vbNullString
+            LookAhead = eofTok
+        End If
+    End Function
+
+    Private Sub Advance(ByRef cur As ParseCursor)
+        If cur.Pos < cur.TokenCount Then cur.Pos = cur.Pos + 1
+    End Sub
+
+    Private Sub SkipTrivia(ByRef cur As ParseCursor)
+        Do While Not IsEOF(cur)
+            Dim tType As VbaTokenType
+            tType = Peek(cur).TokenType
+            If tType = TokNewLine Or tType = TokComment Then
+                Advance cur
+            Else
+                Exit Do
+            End If
+        Loop
+    End Sub
+
+    Private Sub SkipToNextStatement(ByRef cur As ParseCursor)
+        Do While Not IsEOF(cur)
+            Dim tType As VbaTokenType
+            tType = Peek(cur).TokenType
+            If tType = TokNewLine Then
+                Advance cur
+                Exit Do
+            End If
+            Advance cur
+        Loop
+        SkipTrivia cur
+    End Sub
+
+    Private Sub AddError(ByRef mDef As VbaModuleDef, ByVal lineNo As Long, ByVal colNo As Long, ByVal msg As String)
+        If mDef.ErrorCount = 0 Then
+            ReDim mDef.Errors(0 To 0)
+        Else
+            ReDim Preserve mDef.Errors(0 To mDef.ErrorCount)
+        End If
+        mDef.Errors(mDef.ErrorCount).LineNumber = lineNo
+        mDef.Errors(mDef.ErrorCount).ColumnNumber = colNo
+        mDef.Errors(mDef.ErrorCount).Message = msg
+        mDef.ErrorCount = mDef.ErrorCount + 1
+    End Sub
+
+End Module

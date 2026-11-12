@@ -1,0 +1,249 @@
+' File: src/studio/vba/VbaStdLib.twin
+' Plan 7 WS5.4: Visual Basic for Applications (VBA) & Access Standard Library
+Option Explicit
+
+Public Module VbaStdLib
+
+    ' =========================================================================
+    ' Access Special Functions
+    ' =========================================================================
+
+    Public Function Nz(ByVal vVal As Variant, Optional ByVal valueIfNull As Variant = "") As Variant
+        If IsNull(vVal) Or IsEmpty(vVal) Then
+            If IsObject(valueIfNull) Then
+                Set Nz = valueIfNull
+            Else
+                Nz = valueIfNull
+            End If
+        Else
+            If IsObject(vVal) Then
+                Set Nz = vVal
+            Else
+                Nz = vVal
+            End If
+        End If
+    End Function
+
+    Public Function IIf(ByVal condition As Boolean, ByVal truePart As Variant, ByVal falsePart As Variant) As Variant
+        If condition Then
+            If IsObject(truePart) Then
+                Set IIf = truePart
+            Else
+                IIf = truePart
+            End If
+        Else
+            If IsObject(falsePart) Then
+                Set IIf = falsePart
+            Else
+                IIf = falsePart
+            End If
+        End If
+    End Function
+
+    Public Function Choose(ByVal index As Long, ParamArray choices() As Variant) As Variant
+        If index >= 1 And index <= (UBound(choices) + 1) Then
+            Dim c As Variant
+            If IsObject(choices(index - 1)) Then
+                Set Choose = choices(index - 1)
+            Else
+                Choose = choices(index - 1)
+            End If
+        Else
+            Choose = Null
+        End If
+    End Function
+
+    Public Function Switch(ParamArray pairs() As Variant) As Variant
+        Dim i As Long
+        Dim ub As Long
+        ub = UBound(pairs)
+        For i = 0 To ub Step 2
+            If i + 1 <= ub Then
+                Dim cond As Variant
+                cond = pairs(i)
+                If Not IsNull(cond) And Not IsEmpty(cond) Then
+                    If CBool(cond) Then
+                        If IsObject(pairs(i + 1)) Then
+                            Set Switch = pairs(i + 1)
+                        Else
+                            Switch = pairs(i + 1)
+                        End If
+                        Exit Function
+                    End If
+                End If
+            End If
+        Next i
+        Switch = Null
+    End Function
+
+    Public Function FormatValue(ByVal expr As Variant, Optional ByVal formatStr As String = "") As String
+        If IsNull(expr) Or IsEmpty(expr) Then
+            FormatValue = vbNullString
+            Exit Function
+        End If
+        If Len(formatStr) = 0 Then
+            FormatValue = CStr(expr)
+            Exit Function
+        End If
+
+        On Error Resume Next
+        Select Case LCase$(Trim$(formatStr))
+            Case "general date": FormatValue = Format$(expr, "General Date")
+            Case "long date": FormatValue = Format$(expr, "Long Date")
+            Case "medium date": FormatValue = Format$(expr, "Medium Date")
+            Case "short date": FormatValue = Format$(expr, "Short Date")
+            Case "long time": FormatValue = Format$(expr, "Long Time")
+            Case "medium time": FormatValue = Format$(expr, "Medium Time")
+            Case "short time": FormatValue = Format$(expr, "Short Time")
+            Case "currency": FormatValue = Format$(expr, "Currency")
+            Case "fixed": FormatValue = Format$(expr, "Fixed")
+            Case "standard": FormatValue = Format$(expr, "Standard")
+            Case "percent": FormatValue = Format$(expr, "Percent")
+            Case "scientific": FormatValue = Format$(expr, "Scientific")
+            Case "yes/no": FormatValue = IIf(CBool(expr), "Yes", "No")
+            Case "true/false": FormatValue = IIf(CBool(expr), "True", "False")
+            Case "on/off": FormatValue = IIf(CBool(expr), "On", "Off")
+            Case Else: FormatValue = Format$(expr, formatStr)
+        End Select
+        If Err.Number <> 0 Then
+            FormatValue = CStr(expr)
+        End If
+        On Error GoTo 0
+    End Function
+
+    ' =========================================================================
+    ' Dialog Functions (Routing through PAL)
+    ' =========================================================================
+
+    Public Function ShowMsgBox(ByVal prompt As String, Optional ByVal buttons As Long = 0, Optional ByVal title As String = "") As Long
+        ShowMsgBox = PalManager.Dialogs.ShowMessage(prompt, buttons, title)
+    End Function
+
+    Public Function ShowInputBox(ByVal prompt As String, Optional ByVal title As String = "", Optional ByVal defaultVal As String = "") As String
+        ShowInputBox = PalManager.Dialogs.ShowInput(prompt, title, defaultVal)
+    End Function
+
+    ' =========================================================================
+    ' Domain Aggregate Evaluation Helpers
+    ' =========================================================================
+
+    Private Function SafeBracketField(ByVal fieldExpr As String) As String
+        Dim s As String
+        s = Trim$(fieldExpr)
+        If Left$(s, 1) = "[" And Right$(s, 1) = "]" Then
+            SafeBracketField = s
+            Exit Function
+        End If
+        ' If expression contains operators or function calls, do not bracket as a single column!
+        If InStr(s, "*") > 0 Or InStr(s, "+") > 0 Or InStr(s, "-") > 0 Or InStr(s, "/") > 0 Or _
+           InStr(s, "&") > 0 Or InStr(s, "(") > 0 Or InStr(s, ")") > 0 Then
+            SafeBracketField = s
+            Exit Function
+        End If
+        If InStr(s, " ") > 0 Then
+            SafeBracketField = "[" & s & "]"
+        Else
+            SafeBracketField = s
+        End If
+    End Function
+
+    Public Function EvalDomainAggregate(ByVal aggFunc As String, ByVal expr As String, ByVal domain As String, Optional ByVal criteria As String = "") As Variant
+        Dim sql As String
+        Dim colExpr As String
+        Dim dName As String
+        Dim crit As String
+
+        dName = Trim$(domain)
+        If Left$(dName, 1) <> "[" And InStr(dName, " ") > 0 Then dName = "[" & dName & "]"
+        colExpr = SafeBracketField(expr)
+        crit = Trim$(criteria)
+
+        On Error Resume Next
+        Dim dbObj As Object
+        Set dbObj = VbaInterpreter.GetActiveDatabase()
+        If dbObj Is Nothing Then
+            Set dbObj = StudioController.ActiveDatabase
+        End If
+        If Not dbObj Is Nothing Then
+            Select Case UCase$(aggFunc)
+                Case "DLOOKUP"
+                    EvalDomainAggregate = dbObj.DLookup(expr, domain, crit)
+                    On Error GoTo 0
+                    Exit Function
+                Case "DCOUNT"
+                    EvalDomainAggregate = dbObj.DCount(expr, domain, crit)
+                    On Error GoTo 0
+                    Exit Function
+                Case "DSUM"
+                    EvalDomainAggregate = dbObj.DSum(expr, domain, crit)
+                    On Error GoTo 0
+                    Exit Function
+                Case "DMIN"
+                    EvalDomainAggregate = dbObj.DMin(expr, domain, crit)
+                    On Error GoTo 0
+                    Exit Function
+                Case "DMAX"
+                    EvalDomainAggregate = dbObj.DMax(expr, domain, crit)
+                    On Error GoTo 0
+                    Exit Function
+            End Select
+        End If
+        On Error GoTo 0
+
+        Select Case UCase$(aggFunc)
+            Case "DCOUNT"
+                If colExpr = "*" Or Len(colExpr) = 0 Then
+                    sql = "SELECT Count(*) AS AggregateResult FROM " & dName
+                Else
+                    sql = "SELECT Count(" & colExpr & ") AS AggregateResult FROM " & dName
+                End If
+            Case "DLOOKUP"
+                sql = "SELECT " & colExpr & " AS AggregateResult FROM " & dName
+            Case "DSUM"
+                sql = "SELECT Sum(" & colExpr & ") AS AggregateResult FROM " & dName
+            Case "DAVG"
+                sql = "SELECT Avg(" & colExpr & ") AS AggregateResult FROM " & dName
+            Case "DMIN"
+                sql = "SELECT Min(" & colExpr & ") AS AggregateResult FROM " & dName
+            Case "DMAX"
+                sql = "SELECT Max(" & colExpr & ") AS AggregateResult FROM " & dName
+            Case "DFIRST"
+                sql = "SELECT First(" & colExpr & ") AS AggregateResult FROM " & dName
+            Case "DLAST"
+                sql = "SELECT Last(" & colExpr & ") AS AggregateResult FROM " & dName
+            Case Else
+                EvalDomainAggregate = Null
+                Exit Function
+        End Select
+
+        If Len(crit) > 0 Then
+            sql = sql & " WHERE " & crit
+        End If
+
+        Dim activeEng As IDataEngine
+        Set activeEng = EngineManager.ActiveEngine
+        If activeEng Is Nothing Then
+            EvalDomainAggregate = Null
+            Exit Function
+        End If
+
+        On Error Resume Next
+        Dim rs As Object
+        Set rs = activeEng.OpenRecordset(sql)
+        If Err.Number = 0 And Not rs Is Nothing Then
+            If Not rs.EOF Then
+                EvalDomainAggregate = rs.Fields(0).Value
+            Else
+                If UCase$(aggFunc) = "DCOUNT" Then
+                    EvalDomainAggregate = 0
+                Else
+                    EvalDomainAggregate = Null
+                End If
+            End If
+            rs.Close
+        Else
+            EvalDomainAggregate = Null
+        End If
+        On Error GoTo 0
+    End Function
+End Module

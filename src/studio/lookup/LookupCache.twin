@@ -1,0 +1,730 @@
+' File: src/studio/lookup/LookupCache.twin
+' Fast Table/Query Field Lookup Cache (Plan 7 WS1)
+Option Explicit
+
+Public Module LookupCache
+
+    Public Type LookupItem
+        ItemKey As String
+        DisplayValue As String
+    End Type
+
+    Public Type LookupFieldInfo
+        FieldName As String
+        DisplayControl As Long     ' 106 CheckBox, 109 TextBox, 111 ComboBox
+        RowSourceType As String    ' "Table/Query", "Value List"
+        RowSource As String
+        BoundColumn As Long        ' 1-based, default 1
+        ColumnCount As Long        ' default 1
+        ColumnWidths As String
+        HasLookup As Boolean
+        Items() As LookupItem
+        ItemCount As Long
+        LookupOptions As String    ' Joined with " | "
+    End Type
+
+    Public Type TableLookupCache
+        TableName As String
+        Fields() As LookupFieldInfo
+        FieldCount As Long
+        IsLoaded As Boolean
+    End Type
+
+    Private m_tableCaches() As TableLookupCache
+    Private m_cacheCount As Long
+
+    Public Sub ClearLookupCache()
+        Erase m_tableCaches
+        m_cacheCount = 0
+    End Sub
+
+    Public Sub InvalidateTableCache(ByVal tableName As String)
+        Dim i As Long
+        Dim cleanName As String
+        cleanName = UCase$(Trim$(tableName))
+        If m_cacheCount <= 0 Then Exit Sub
+        For i = 0 To m_cacheCount - 1
+            If UCase$(Trim$(m_tableCaches(i).TableName)) = cleanName Then
+                m_tableCaches(i).IsLoaded = False
+                Exit Sub
+            End If
+        Next i
+    End Sub
+
+    Private Function FindTableCacheIndex(ByVal tableName As String) As Long
+        Dim i As Long
+        Dim cleanName As String
+        cleanName = UCase$(Trim$(tableName))
+        FindTableCacheIndex = -1
+        If m_cacheCount <= 0 Then Exit Function
+        For i = 0 To m_cacheCount - 1
+            If UCase$(Trim$(m_tableCaches(i).TableName)) = cleanName Then
+                FindTableCacheIndex = i
+                Exit Function
+            End If
+        Next i
+    End Function
+
+    Public Function EnsureTableLookupCache(ByVal db As Object, ByVal tableName As String) As Long
+        Dim idx As Long
+        Dim cleanName As String
+        Dim newEntry As TableLookupCache
+
+        cleanName = Trim$(tableName)
+        If Len(cleanName) = 0 Then
+            EnsureTableLookupCache = -1
+            Exit Function
+        End If
+
+        idx = FindTableCacheIndex(cleanName)
+        If idx >= 0 Then
+            If m_tableCaches(idx).IsLoaded Then
+                EnsureTableLookupCache = idx
+                Exit Function
+            End If
+        Else
+            idx = m_cacheCount
+            If m_cacheCount = 0 Then
+                ReDim m_tableCaches(0 To 7)
+            ElseIf m_cacheCount > UBound(m_tableCaches) Then
+                ReDim Preserve m_tableCaches(0 To m_cacheCount * 2 - 1)
+            End If
+            m_tableCaches(idx) = newEntry
+            m_tableCaches(idx).TableName = cleanName
+            m_cacheCount = m_cacheCount + 1
+        End If
+
+        BuildTableLookupCache db, idx, cleanName
+        EnsureTableLookupCache = idx
+    End Function
+
+    Private Sub BuildTableLookupCache(ByVal db As Object, ByVal cacheIdx As Long, ByVal tableName As String)
+        Dim td As Object
+        Dim qd As Object
+        Dim fldList As Object
+        Dim nFlds As Long
+        Dim fIdx As Long
+        Dim fldObj As Object
+        Dim fldInfo As LookupFieldInfo
+        Dim fldName As String
+        Dim rSrc As String
+        Dim rType As String
+        Dim bCol As Long
+        Dim cCount As Long
+        Dim cWidths As String
+        Dim dCtl As Long
+        Dim propVal As Variant
+
+        m_tableCaches(cacheIdx).FieldCount = 0
+        m_tableCaches(cacheIdx).IsLoaded = False
+        Erase m_tableCaches(cacheIdx).Fields
+
+        If db Is Nothing Then Exit Sub
+
+        On Error Resume Next
+        Set td = db.TableDefs(tableName)
+        If td Is Nothing Or Err.Number <> 0 Then
+            Err.Clear
+            Set qd = db.QueryDefs(tableName)
+            If Not qd Is Nothing And Err.Number = 0 Then
+                Set fldList = qd.Fields
+            End If
+        Else
+            Set fldList = td.Fields
+        End If
+        Err.Clear
+        On Error GoTo 0
+
+        If fldList Is Nothing Then Exit Sub
+
+        On Error Resume Next
+        nFlds = fldList.Count
+        If Err.Number <> 0 Then nFlds = 0
+        Err.Clear
+        On Error GoTo 0
+
+        If nFlds <= 0 Then Exit Sub
+
+        ' Discover Primary Key fields on TableDef so a table's own PK / AutoNumber is never treated as a Foreign Key Lookup
+        Dim pkNames As New Collection
+        If Not td Is Nothing Then
+            On Error Resume Next
+            Dim idxScan As Long
+            Dim idxObj As Object
+            Dim idxFldScan As Long
+            For idxScan = 0 To td.Indexes.Count - 1
+                Set idxObj = td.Indexes(idxScan)
+                If Not idxObj Is Nothing Then
+                    If idxObj.Primary Then
+                        For idxFldScan = 0 To idxObj.Fields.Count - 1
+                            pkNames.Add idxObj.Fields(idxFldScan).Name, UCase$(Trim$(idxObj.Fields(idxFldScan).Name))
+                        Next idxFldScan
+                    End If
+                End If
+            Next idxScan
+            Err.Clear
+            On Error GoTo 0
+        End If
+
+        ReDim m_tableCaches(cacheIdx).Fields(0 To nFlds - 1)
+
+        For fIdx = 0 To nFlds - 1
+            Set fldObj = fldList(fIdx)
+            fldName = fldObj.Name
+            rSrc = vbNullString
+            rType = "Table/Query"
+            bCol = 1
+            cCount = 1
+            cWidths = vbNullString
+            dCtl = 109
+
+            Dim isOwnPkOrAuto As Boolean
+            isOwnPkOrAuto = False
+            If Not td Is Nothing Then
+                On Error Resume Next
+                If (fldObj.Attributes And &H10&) <> 0 Then isOwnPkOrAuto = True
+                If Not isOwnPkOrAuto And pkNames.Count > 0 Then
+                    Dim dummyPk As Variant
+                    Err.Clear
+                    dummyPk = pkNames(UCase$(Trim$(fldName)))
+                    If Err.Number = 0 Then isOwnPkOrAuto = True
+                    Err.Clear
+                End If
+                If Not isOwnPkOrAuto And fIdx = 0 And fldObj.Required Then
+                    isOwnPkOrAuto = True
+                End If
+                If Not isOwnPkOrAuto And Right$(UCase$(Trim$(fldName)), 2) = "ID" And Len(Trim$(fldName)) > 2 Then
+                    Dim ownStem As String
+                    ownStem = Left$(Trim$(fldName), Len(Trim$(fldName)) - 2)
+                    If StrComp(ownStem, tableName, vbTextCompare) = 0 Or StrComp(ownStem & "s", tableName, vbTextCompare) = 0 Or StrComp(ownStem & "es", tableName, vbTextCompare) = 0 Then
+                        isOwnPkOrAuto = True
+                    End If
+                ElseIf StrComp(Trim$(fldName), "ID", vbTextCompare) = 0 And fIdx = 0 Then
+                    isOwnPkOrAuto = True
+                End If
+                Err.Clear
+                On Error GoTo 0
+            End If
+
+            ' Read extended DAO field properties (error 3270 if absent)
+            If Not isOwnPkOrAuto Then
+                On Error Resume Next
+                propVal = Empty
+                propVal = fldObj.Properties("RowSource").Value
+                If Err.Number = 0 And Not IsNull(propVal) And Not IsEmpty(propVal) Then rSrc = Trim$(CStr(propVal))
+                Err.Clear
+
+                propVal = Empty
+                propVal = fldObj.Properties("RowSourceType").Value
+                If Err.Number = 0 And Not IsNull(propVal) And Not IsEmpty(propVal) Then rType = Trim$(CStr(propVal))
+                Err.Clear
+
+                propVal = Empty
+                propVal = fldObj.Properties("BoundColumn").Value
+                If Err.Number = 0 And Not IsNull(propVal) And Not IsEmpty(propVal) Then bCol = CLng(propVal)
+                Err.Clear
+
+                propVal = Empty
+                propVal = fldObj.Properties("ColumnCount").Value
+                If Err.Number = 0 And Not IsNull(propVal) And Not IsEmpty(propVal) Then cCount = CLng(propVal)
+                Err.Clear
+
+                propVal = Empty
+                propVal = fldObj.Properties("ColumnWidths").Value
+                If Err.Number = 0 And Not IsNull(propVal) And Not IsEmpty(propVal) Then cWidths = Trim$(CStr(propVal))
+                Err.Clear
+
+                propVal = Empty
+                propVal = fldObj.Properties("DisplayControl").Value
+                If Err.Number = 0 And Not IsNull(propVal) And Not IsEmpty(propVal) Then dCtl = CLng(propVal)
+                Err.Clear
+                On Error GoTo 0
+            End If
+
+            ' Auto-discovery of Foreign Key & Relationship Lookups (Plan 7 UI-2B)
+            If Not isOwnPkOrAuto And Len(rSrc) = 0 Then
+                ' 1. Check if hidden query exists in QueryDefs: ~sq_c<Table>~sq_c<Field>
+                Dim hiddenQryName As String
+                hiddenQryName = "~sq_c" & tableName & "~sq_c" & fldName
+                On Error Resume Next
+                Dim hQd As Object
+                Set hQd = Nothing
+                Set hQd = db.QueryDefs(hiddenQryName)
+                If (hQd Is Nothing Or Err.Number <> 0) And db.QueryDefs.Count > 0 Then
+                    Set hQd = Nothing
+                    Err.Clear
+                    Dim qk As Long
+                    Dim candQd As Object
+                    For qk = 0 To db.QueryDefs.Count - 1
+                        Set candQd = db.QueryDefs(qk)
+                        If Not candQd Is Nothing Then
+                            If LCase$(Left$(candQd.Name, 4)) = "~sq_" Then
+                                If InStr(1, candQd.Name, "~sq_c" & tableName & "~", vbTextCompare) > 0 And InStr(1, candQd.Name, "~sq_c" & fldName, vbTextCompare) > 0 Then
+                                    Set hQd = candQd
+                                    Exit For
+                                End If
+                            End If
+                        End If
+                    Next qk
+                End If
+
+                If Err.Number = 0 And Not hQd Is Nothing Then
+                    rSrc = Trim$(hQd.Sql)
+                    If Len(rSrc) > 0 Then
+                        rType = "Table/Query"
+                        bCol = 1
+                        cCount = 2
+                        cWidths = "0;2"
+                        dCtl = 111
+                    End If
+                End If
+                Err.Clear
+                On Error GoTo 0
+            End If
+
+            ' 2b. Check formal relationships in db.Relations (loaded from MSysRelationships)
+            If Not isOwnPkOrAuto And Len(rSrc) = 0 Then
+                On Error Resume Next
+                Dim relIdx As Long
+                Dim relObj As Object
+                For relIdx = 0 To db.Relations.Count - 1
+                    Set relObj = db.Relations(relIdx)
+                    If Not relObj Is Nothing Then
+                        If StrComp(relObj.ForeignTable, tableName, vbTextCompare) = 0 And StrComp(relObj.Table, tableName, vbTextCompare) <> 0 And relObj.Fields.Count > 0 Then
+                            If StrComp(relObj.Fields(0).ForeignName, fldName, vbTextCompare) = 0 Then
+                                Dim parentTbl As String
+                                Dim parentKeyCol As String
+                                parentTbl = relObj.Table
+                                parentKeyCol = relObj.Fields(0).Name
+                                Dim refTdRel As Object
+                                Set refTdRel = Nothing
+                                Set refTdRel = db.TableDefs(parentTbl)
+                                If Not refTdRel Is Nothing Then
+                                    Dim dispColRel As String
+                                    dispColRel = parentKeyCol
+                                    Dim relFldIdx As Long
+                                    For relFldIdx = 0 To refTdRel.Fields.Count - 1
+                                        If StrComp(refTdRel.Fields(relFldIdx).Name, parentKeyCol, vbTextCompare) <> 0 Then
+                                            dispColRel = refTdRel.Fields(relFldIdx).Name
+                                            Exit For
+                                        End If
+                                    Next relFldIdx
+                                    If StrComp(dispColRel, parentKeyCol, vbTextCompare) <> 0 Then
+                                        rSrc = "SELECT [" & parentKeyCol & "], [" & dispColRel & "] FROM [" & parentTbl & "]"
+                                        cCount = 2
+                                        cWidths = "0;1440"
+                                    Else
+                                        rSrc = "SELECT [" & parentKeyCol & "] FROM [" & parentTbl & "]"
+                                        cCount = 1
+                                    End If
+                                    rType = "Table/Query"
+                                    bCol = 1
+                                    dCtl = 111
+                                    Exit For
+                                End If
+                            End If
+                        End If
+                    End If
+                Next relIdx
+                Err.Clear
+                On Error GoTo 0
+            End If
+
+            If Not isOwnPkOrAuto And Len(rSrc) = 0 Then
+                ' 2. Check standard Foreign Key naming conventions and MSysRelationships
+                Dim candTable As String
+                Dim pkField As String
+                Dim dispField As String
+                Dim relTd As Object
+                Dim rfIdx As Long
+                Dim rfObj As Object
+
+                candTable = vbNullString
+                pkField = fldName
+                Set relTd = Nothing
+
+                If Right$(UCase$(fldName), 2) = "ID" And Len(fldName) > 2 Then
+                    Dim stem As String
+                    stem = Left$(fldName, Len(fldName) - 2)
+                    On Error Resume Next
+                    Set relTd = Nothing
+                    Set relTd = db.TableDefs(stem & "s")
+                    If Err.Number = 0 And Not relTd Is Nothing And StrComp(stem & "s", tableName, vbTextCompare) <> 0 Then
+                        candTable = stem & "s"
+                    Else
+                        Err.Clear
+                        Set relTd = Nothing
+                        Set relTd = db.TableDefs(stem & "es")
+                        If Err.Number = 0 And Not relTd Is Nothing And StrComp(stem & "es", tableName, vbTextCompare) <> 0 Then
+                            candTable = stem & "es"
+                        Else
+                            Err.Clear
+                            Set relTd = Nothing
+                            Set relTd = db.TableDefs(stem)
+                            If Err.Number = 0 And Not relTd Is Nothing And StrComp(stem, tableName, vbTextCompare) <> 0 Then
+                                candTable = stem
+                            Else
+                                Set relTd = Nothing
+                            End If
+                        End If
+                    End If
+                    Err.Clear
+                    On Error GoTo 0
+                ElseIf UCase$(fldName) = "SHIPVIA" And StrComp("Shippers", tableName, vbTextCompare) <> 0 Then
+                    On Error Resume Next
+                    Set relTd = Nothing
+                    Set relTd = db.TableDefs("Shippers")
+                    If Err.Number = 0 And Not relTd Is Nothing Then
+                        candTable = "Shippers"
+                        pkField = "ShipperID"
+                    End If
+                    Err.Clear
+                    On Error GoTo 0
+                End If
+
+                If Len(candTable) > 0 And Not relTd Is Nothing And StrComp(candTable, tableName, vbTextCompare) <> 0 Then
+                    dispField = vbNullString
+                    For rfIdx = 0 To relTd.Fields.Count - 1
+                        Set rfObj = relTd.Fields(rfIdx)
+                        If rfObj.Type = 10 Or rfObj.Type = 12 Or rfObj.Type = 11 Then
+                            If UCase$(rfObj.Name) <> UCase$(pkField) Then
+                                dispField = rfObj.Name
+                                Exit For
+                            End If
+                        End If
+                    Next rfIdx
+
+                    If Len(dispField) > 0 Then
+                        rSrc = "SELECT [" & pkField & "], [" & dispField & "] FROM [" & candTable & "]"
+                        rType = "Table/Query"
+                        bCol = 1
+                        cCount = 2
+                        cWidths = "0;2"
+                        dCtl = 111
+                    End If
+                End If
+            End If
+
+            fldInfo.FieldName = fldName
+            fldInfo.DisplayControl = dCtl
+            fldInfo.RowSourceType = rType
+            fldInfo.RowSource = rSrc
+            fldInfo.BoundColumn = bCol
+            fldInfo.ColumnCount = cCount
+            fldInfo.ColumnWidths = cWidths
+            fldInfo.HasLookup = False
+            fldInfo.ItemCount = 0
+            fldInfo.LookupOptions = vbNullString
+            Erase fldInfo.Items
+
+            If Len(rSrc) > 0 Then
+                PopulateFieldLookupItems db, fldInfo
+            End If
+
+            m_tableCaches(cacheIdx).Fields(fIdx) = fldInfo
+        Next fIdx
+
+        m_tableCaches(cacheIdx).FieldCount = nFlds
+        m_tableCaches(cacheIdx).IsLoaded = True
+    End Sub
+
+    Private Sub PopulateFieldLookupItems(ByVal db As Object, ByRef fldInfo As LookupFieldInfo)
+        Dim parts() As String
+        Dim pIdx As Long
+        Dim cleanPart As String
+        Dim rs As Object
+        Dim kCol As Long
+        Dim dCol As Long
+        Dim colW() As String
+        Dim wIdx As Long
+        Dim wVal As Double
+        Dim rowCount As Long
+        Dim kVal As String
+        Dim dVal As String
+        Dim maxRows As Long
+
+        maxRows = 4096
+
+        If LCase$(Trim$(fldInfo.RowSourceType)) = "value list" Then
+            parts = Split(fldInfo.RowSource, ";")
+            If UBound(parts) >= 0 Then
+                fldInfo.HasLookup = True
+                Dim nCols As Long
+                Dim nRows As Long
+                Dim bCol As Long
+                Dim rowIdx As Long
+                Dim kIdx As Long
+                Dim vIdx As Long
+
+                nCols = fldInfo.ColumnCount
+                If nCols <= 0 Then nCols = 1
+
+                bCol = fldInfo.BoundColumn - 1
+                If bCol < 0 Then bCol = 0
+                If bCol >= nCols Then bCol = nCols - 1
+
+                If nCols > 1 Then
+                    dCol = IIf(bCol = 0, 1, 0)
+                Else
+                    dCol = 0
+                End If
+
+                nRows = (UBound(parts) + 1) \ nCols
+                If nRows <= 0 Then nRows = UBound(parts) + 1
+
+                fldInfo.ItemCount = nRows
+                ReDim fldInfo.Items(0 To nRows - 1)
+
+                For rowIdx = 0 To nRows - 1
+                    kIdx = rowIdx * nCols + bCol
+                    If kIdx > UBound(parts) Then kIdx = rowIdx
+                    vIdx = rowIdx * nCols + dCol
+                    If vIdx > UBound(parts) Then vIdx = kIdx
+
+                    kVal = Trim$(parts(kIdx))
+                    If Left$(kVal, 1) = """" And Right$(kVal, 1) = """" And Len(kVal) >= 2 Then
+                        kVal = Mid$(kVal, 2, Len(kVal) - 2)
+                    End If
+
+                    dVal = Trim$(parts(vIdx))
+                    If Left$(dVal, 1) = """" And Right$(dVal, 1) = """" And Len(dVal) >= 2 Then
+                        dVal = Mid$(dVal, 2, Len(dVal) - 2)
+                    End If
+
+                    fldInfo.Items(rowIdx).ItemKey = kVal
+                    fldInfo.Items(rowIdx).DisplayValue = dVal
+                    If Len(fldInfo.LookupOptions) > 0 Then fldInfo.LookupOptions = fldInfo.LookupOptions & " | "
+                    fldInfo.LookupOptions = fldInfo.LookupOptions & dVal
+                Next rowIdx
+            End If
+            Exit Sub
+        End If
+
+        ' Table/Query row source
+        On Error Resume Next
+        Set rs = db.OpenRecordset(fldInfo.RowSource)
+        If Err.Number <> 0 Or rs Is Nothing Then
+            Err.Clear
+            On Error GoTo 0
+            Exit Sub
+        End If
+        On Error GoTo 0
+
+        On Error Resume Next
+        If rs.Fields.Count <= 0 Then
+            rs.Close
+            Exit Sub
+        End If
+
+        kCol = fldInfo.BoundColumn - 1
+        If kCol < 0 Then kCol = 0
+        If kCol >= rs.Fields.Count Then kCol = rs.Fields.Count - 1
+
+        dCol = kCol
+        If Len(fldInfo.ColumnWidths) > 0 Then
+            colW = Split(fldInfo.ColumnWidths, ";")
+            For wIdx = 0 To UBound(colW)
+                wVal = Val(Trim$(colW(wIdx)))
+                If wVal > 0 And wIdx < rs.Fields.Count Then
+                    dCol = wIdx
+                    Exit For
+                End If
+            Next wIdx
+        ElseIf fldInfo.ColumnCount >= 2 And kCol = 0 Then
+            dCol = 1
+        End If
+
+        rowCount = 0
+        ReDim fldInfo.Items(0 To 63)
+
+        Do Until rs.EOF
+            kVal = vbNullString
+            dVal = vbNullString
+            If Not IsNull(rs.Fields(kCol).Value) Then kVal = CStr(rs.Fields(kCol).Value)
+            If Not IsNull(rs.Fields(dCol).Value) Then dVal = CStr(rs.Fields(dCol).Value)
+
+            If rowCount > UBound(fldInfo.Items) Then
+                ReDim Preserve fldInfo.Items(0 To rowCount * 2 - 1)
+            End If
+            fldInfo.Items(rowCount).ItemKey = kVal
+            fldInfo.Items(rowCount).DisplayValue = dVal
+            If Len(fldInfo.LookupOptions) > 0 Then fldInfo.LookupOptions = fldInfo.LookupOptions & " | "
+            fldInfo.LookupOptions = fldInfo.LookupOptions & dVal
+
+            rowCount = rowCount + 1
+            If rowCount >= maxRows Then Exit Do
+            rs.MoveNext
+        Loop
+        rs.Close
+        Err.Clear
+        On Error GoTo 0
+
+        If rowCount > 0 Then
+            fldInfo.HasLookup = True
+            fldInfo.ItemCount = rowCount
+            ReDim Preserve fldInfo.Items(0 To rowCount - 1)
+        End If
+    End Sub
+
+    Public Function ResolveLookupValue(ByVal db As Object, ByVal tableName As String, ByVal fieldName As String, ByVal rawVal As Variant, Optional ByRef outHasLookup As Boolean = False, Optional ByRef outLookupOptions As String = "") As String
+        Dim tIdx As Long
+        Dim fIdx As Long
+        Dim iIdx As Long
+        Dim rawStr As String
+        Dim upperRaw As String
+        Dim cleanField As String
+
+        outHasLookup = False
+        outLookupOptions = vbNullString
+
+        If IsNull(rawVal) Or IsEmpty(rawVal) Then
+            ResolveLookupValue = vbNullString
+            Exit Function
+        End If
+
+        rawStr = CStr(rawVal)
+        ResolveLookupValue = rawStr
+        upperRaw = UCase$(Trim$(rawStr))
+        cleanField = UCase$(Trim$(fieldName))
+
+        tIdx = EnsureTableLookupCache(db, tableName)
+        If tIdx < 0 Then Exit Function
+
+        For fIdx = 0 To m_tableCaches(tIdx).FieldCount - 1
+            If UCase$(Trim$(m_tableCaches(tIdx).Fields(fIdx).FieldName)) = cleanField Then
+                If m_tableCaches(tIdx).Fields(fIdx).HasLookup Then
+                    outHasLookup = True
+                    outLookupOptions = m_tableCaches(tIdx).Fields(fIdx).LookupOptions
+                    For iIdx = 0 To m_tableCaches(tIdx).Fields(fIdx).ItemCount - 1
+                        If UCase$(Trim$(m_tableCaches(tIdx).Fields(fIdx).Items(iIdx).ItemKey)) = upperRaw Then
+                            ResolveLookupValue = m_tableCaches(tIdx).Fields(fIdx).Items(iIdx).DisplayValue
+                            Exit Function
+                        End If
+                    Next iIdx
+                End If
+                Exit For
+            End If
+        Next fIdx
+    End Function
+
+    Public Function ConvertDisplayToKey(ByVal db As Object, ByVal tableName As String, ByVal fieldName As String, ByVal displayOrKey As String) As String
+        Dim tIdx As Long
+        Dim fIdx As Long
+        Dim iIdx As Long
+        Dim upperInput As String
+        Dim cleanField As String
+
+        ConvertDisplayToKey = displayOrKey
+        upperInput = UCase$(Trim$(displayOrKey))
+        If Len(upperInput) = 0 Then Exit Function
+
+        cleanField = UCase$(Trim$(fieldName))
+        tIdx = EnsureTableLookupCache(db, tableName)
+        If tIdx < 0 Then Exit Function
+
+        For fIdx = 0 To m_tableCaches(tIdx).FieldCount - 1
+            If UCase$(Trim$(m_tableCaches(tIdx).Fields(fIdx).FieldName)) = cleanField Then
+                If m_tableCaches(tIdx).Fields(fIdx).HasLookup Then
+                    For iIdx = 0 To m_tableCaches(tIdx).Fields(fIdx).ItemCount - 1
+                        If UCase$(Trim$(m_tableCaches(tIdx).Fields(fIdx).Items(iIdx).DisplayValue)) = upperInput Or UCase$(Trim$(m_tableCaches(tIdx).Fields(fIdx).Items(iIdx).ItemKey)) = upperInput Then
+                            ConvertDisplayToKey = m_tableCaches(tIdx).Fields(fIdx).Items(iIdx).ItemKey
+                            Exit Function
+                        End If
+                    Next iIdx
+                End If
+                Exit For
+            End If
+        Next fIdx
+    End Function
+
+    Public Function IsLookupField(ByVal db As Object, ByVal tableName As String, ByVal fieldName As String) As Boolean
+        Dim tIdx As Long
+        Dim fIdx As Long
+        Dim cleanField As String
+
+        IsLookupField = False
+        cleanField = UCase$(Trim$(fieldName))
+        tIdx = EnsureTableLookupCache(db, tableName)
+        If tIdx < 0 Then Exit Function
+
+        For fIdx = 0 To m_tableCaches(tIdx).FieldCount - 1
+            If UCase$(Trim$(m_tableCaches(tIdx).Fields(fIdx).FieldName)) = cleanField Then
+                IsLookupField = m_tableCaches(tIdx).Fields(fIdx).HasLookup
+                Exit Function
+            End If
+        Next fIdx
+    End Function
+
+    Public Function PopulateLookupComboBox(ByVal db As Object, ByVal tableName As String, ByVal fieldName As String, ByVal cbo As Object) As Boolean
+        Dim tIdx As Long
+        Dim fIdx As Long
+        Dim iIdx As Long
+        Dim cleanField As String
+
+        PopulateLookupComboBox = False
+        If cbo Is Nothing Then Exit Function
+
+        cleanField = UCase$(Trim$(fieldName))
+        tIdx = EnsureTableLookupCache(db, tableName)
+        If tIdx < 0 Then Exit Function
+
+        For fIdx = 0 To m_tableCaches(tIdx).FieldCount - 1
+            If UCase$(Trim$(m_tableCaches(tIdx).Fields(fIdx).FieldName)) = cleanField Then
+                If m_tableCaches(tIdx).Fields(fIdx).HasLookup Then
+                    On Error Resume Next
+                    cbo.Clear
+                    For iIdx = 0 To m_tableCaches(tIdx).Fields(fIdx).ItemCount - 1
+                        cbo.AddItem m_tableCaches(tIdx).Fields(fIdx).Items(iIdx).DisplayValue
+                    Next iIdx
+                    Err.Clear
+                    On Error GoTo 0
+                    PopulateLookupComboBox = True
+                End If
+                Exit Function
+            End If
+        Next fIdx
+    End Function
+
+    Public Function ValidateLookupValue(ByVal db As Object, ByVal tableName As String, ByVal fieldName As String, ByVal inputVal As String, Optional ByRef outKey As String = "") As Boolean
+        Dim tIdx As Long
+        Dim fIdx As Long
+        Dim iIdx As Long
+        Dim upperInput As String
+        Dim cleanField As String
+
+        ValidateLookupValue = False
+        outKey = inputVal
+        upperInput = UCase$(Trim$(inputVal))
+        If Len(upperInput) = 0 Then
+            ValidateLookupValue = True
+            Exit Function
+        End If
+
+        cleanField = UCase$(Trim$(fieldName))
+        tIdx = EnsureTableLookupCache(db, tableName)
+        If tIdx < 0 Then
+            ValidateLookupValue = True
+            Exit Function
+        End If
+
+        For fIdx = 0 To m_tableCaches(tIdx).FieldCount - 1
+            If UCase$(Trim$(m_tableCaches(tIdx).Fields(fIdx).FieldName)) = cleanField Then
+                If Not m_tableCaches(tIdx).Fields(fIdx).HasLookup Then
+                    ValidateLookupValue = True
+                    Exit Function
+                End If
+                For iIdx = 0 To m_tableCaches(tIdx).Fields(fIdx).ItemCount - 1
+                    If UCase$(Trim$(m_tableCaches(tIdx).Fields(fIdx).Items(iIdx).DisplayValue)) = upperInput Or UCase$(Trim$(m_tableCaches(tIdx).Fields(fIdx).Items(iIdx).ItemKey)) = upperInput Then
+                        outKey = m_tableCaches(tIdx).Fields(fIdx).Items(iIdx).ItemKey
+                        ValidateLookupValue = True
+                        Exit Function
+                    End If
+                Next iIdx
+                ValidateLookupValue = False
+                Exit Function
+            End If
+        Next fIdx
+        ValidateLookupValue = True
+    End Function
+
+End Module

@@ -1,0 +1,8 @@
+' File: src/studio/pal/IShell.twin
+' Plan 7 WS7: Platform Abstraction Layer - Shell Execution Interface
+Option Explicit
+
+Public Interface IShell
+    Function OpenUrl(ByVal url As String) As Boolean
+    Function Execute(ByVal command As String, Optional ByVal parameters As String = "", Optional ByVal workingDir As String = "") As LongPtr
+End Interface

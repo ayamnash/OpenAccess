@@ -1,0 +1,10 @@
+' File: src/studio/pal/IFonts.twin
+' Plan 7 WS7: Platform Abstraction Layer - Fonts Interface
+Option Explicit
+
+Public Interface IFonts
+    Function GetCodeFont() As String
+    Function GetUiFont() As String
+    Function GetArabicFont() As String
+    Function GetDefaultFontSize() As Single
+End Interface

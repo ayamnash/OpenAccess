@@ -1,0 +1,59 @@
+' =============================================================================
+' File: src/studio/engine/EngineManager.twin
+' Purpose: Strictly manages the internal OpenAccess Native Engine instance.
+'          Zero external database engines or fallback modes are permitted.
+' =============================================================================
+Option Explicit
+
+[ Description ("Data Engine Manager and Runtime Engine Factory") ]
+Public Module EngineManager
+
+    Public Const ENGINE_MODE_NATIVE As String = "NATIVE"
+
+    Private m_activeEngine As IDataEngine
+    Private m_engineMode As String = ENGINE_MODE_NATIVE
+
+    Public Function CreateDataEngine(Optional ByVal mode As String = "NATIVE") As IDataEngine
+        Dim uMode As String
+        uMode = UCase$(Trim$(mode))
+        If Len(uMode) > 0 And uMode <> ENGINE_MODE_NATIVE Then
+            Err.Raise vbObjectError + 5101, "EngineManager.CreateDataEngine", _
+                "Red-Line Policy Violation: External engine mode '" & mode & _
+                "' is prohibited. OpenAccess Studio operates exclusively on NATIVE."
+        End If
+        Dim natEng As New NativeEngine
+        Set CreateDataEngine = natEng
+    End Function
+
+    Public Property Get ActiveEngine() As IDataEngine
+        If m_activeEngine Is Nothing Then
+            Set m_activeEngine = CreateDataEngine(m_engineMode)
+        End If
+        Set ActiveEngine = m_activeEngine
+    End Property
+
+    Public Property Set ActiveEngine(ByVal newEngine As IDataEngine)
+        Set m_activeEngine = newEngine
+    End Property
+
+    Public Property Get EngineMode() As String
+        EngineMode = ENGINE_MODE_NATIVE
+    End Property
+
+    Public Property Let EngineMode(ByVal newMode As String)
+        Dim uMode As String
+        uMode = UCase$(Trim$(newMode))
+        If Len(uMode) > 0 And uMode <> ENGINE_MODE_NATIVE Then
+            Err.Raise vbObjectError + 5100, "EngineManager.EngineMode", _
+                "Red-Line Policy Violation: External engine mode '" & newMode & _
+                "' is prohibited. OpenAccess Studio operates exclusively on NATIVE."
+        End If
+        m_engineMode = ENGINE_MODE_NATIVE
+    End Property
+
+
+    Public Function GetRequestedEngineMode() As String
+        GetRequestedEngineMode = ENGINE_MODE_NATIVE
+    End Function
+
+End Module

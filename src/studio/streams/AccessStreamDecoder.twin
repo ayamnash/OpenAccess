@@ -1,0 +1,2268 @@
+' File: src/studio/streams/AccessStreamDecoder.twin
+' Native Microsoft Access Storage (MSysAccessStorage) Form & Report Binary Stream Decoder
+[ Description ("Microsoft Access Storage (MSysAccessStorage) Form & Report Binary Stream Decoder") ]
+Module AccessStreamDecoder
+    Option Explicit
+
+    ' =========================================================================
+    ' Binary Layout Parser Constants & Types
+    ' =========================================================================
+Private Const BLOB_MARK_NEXT_OR_END As Long = &HFD&
+    Private Const BLOB_MARK_ONE_CHILD As Long = &HFE&
+    Private Const BLOB_MARK_CHILDREN As Long = &HFF&
+    Private Const BLOB_RECORD_HEADER As Long = 18
+    Private Const BLOB_MAX_DEPTH As Long = 32
+    Private Const BLOB_MAX_CONTROLS As Long = 2000
+    Private Const BLOB_KIND_ROOT As Long = 0
+    Private Const BLOB_KIND_SECTION As Long = 1
+    Private Const BLOB_KIND_TEMPLATE As Long = 2
+    Private Const BLOB_KIND_CONTROL As Long = 3
+    Private Const BLOB_DEFAULT_BACK_COLOR As Long = &HFFFFFF&
+    Private Const BLOB_DEFAULT_VIEW As Long = 1   ' oracle: Customers stores no DefaultView and is Continuous
+
+    ' SaveAsText parsing constants
+    Private Const SAT_MAX_OBJ_DEPTH As Long = 32
+    Private Const SAT_MAX_NEST_DEPTH As Long = 64
+    Private Const SAT_NEST_GROUP As Long = 0
+    Private Const SAT_NEST_OBJECT As Long = 1
+    Private Const SAT_NEST_SKIP As Long = 2
+    Private Const SAT_KIND_BOUND As Long = 4
+
+    ' Property slots of a scratch object (text 0..10, integer 11..25, Boolean 26..28).
+    Private Const SLOT_NAME As Long = 0
+    Private Const SLOT_CAPTION As Long = 1
+    Private Const SLOT_CONTROL_SOURCE As Long = 2
+    Private Const SLOT_ROW_SOURCE As Long = 3
+    Private Const SLOT_COLUMN_WIDTHS As Long = 4
+    Private Const SLOT_SOURCE_OBJECT As Long = 5
+    Private Const SLOT_LINK_MASTER As Long = 6
+    Private Const SLOT_LINK_CHILD As Long = 7
+    Private Const SLOT_ON_CLICK As Long = 8
+    Private Const SLOT_RECORD_SOURCE As Long = 9
+    Private Const SLOT_FONT_NAME As Long = 10
+    Private Const SLOT_LEFT As Long = 11
+    Private Const SLOT_TOP As Long = 12
+    Private Const SLOT_WIDTH As Long = 13
+    Private Const SLOT_HEIGHT As Long = 14
+    Private Const SLOT_BOUND_COLUMN As Long = 15
+    Private Const SLOT_COLUMN_COUNT As Long = 16
+    Private Const SLOT_DEFAULT_VIEW As Long = 17
+    Private Const SLOT_BACK_COLOR As Long = 18
+    Private Const SLOT_FORE_COLOR As Long = 19
+    Private Const SLOT_FONT_SIZE As Long = 20
+    Private Const SLOT_FONT_WEIGHT As Long = 21
+    Private Const SLOT_CACHED_LEFT As Long = 22
+    Private Const SLOT_CACHED_TOP As Long = 23
+    Private Const SLOT_CACHED_RIGHT As Long = 24
+    Private Const SLOT_CACHED_BOTTOM As Long = 25
+    Private Const SLOT_RECORD_SELECTORS As Long = 26
+    Private Const SLOT_NAVIGATION_BUTTONS As Long = 27
+    Private Const SLOT_ALLOW_ADDITIONS As Long = 28
+    Private Const SLOT_RIGHT_TO_LEFT As Long = 29
+    Private Const SLOT_LAST As Long = 29
+    Private Const SLOT_KIND_TEXT As Long = 1
+    Private Const SLOT_KIND_INT As Long = 2
+    Private Const SLOT_KIND_BOOL As Long = 3
+
+    Private Type BlobObjScratch
+        TypeCode As Long
+        Kind As Long
+        SectionIdx As Long
+        ParentName As String
+        Has(0 To 29) As Boolean
+        IntVal(0 To 29) As Long
+        TextVal(0 To 29) As String
+    End Type
+
+    ' Properties of the last parsed Blob layout that took a hard-coded Access
+    ' default (comma-separated, one entry per control; form level separately).
+    Private m_blobDefaulted() As String
+    Private m_blobDefaultedCount As Long
+    Private m_blobFormDefaulted As String
+
+    ' Last layout status for the status bar. Studio never starts Microsoft Access to
+    ' read a layout (plan7 WS0-A): Blob -> Cache -> TypeInfo fallback only.
+
+Private Const TI_FB_STEP As Long = 300
+    Private Const TI_FB_LABEL_LEFT As Long = 300
+    Private Const TI_FB_LABEL_WIDTH As Long = 1440
+    Private Const TI_FB_CTL_LEFT As Long = 1860
+    Private Const TI_FB_CTL_WIDTH As Long = 2880
+    Private Const TI_FB_ROW_HEIGHT As Long = 270
+
+
+    Public Sub ResetNativeFormLayout(ByRef outLayout As NativeFormLayout, ByVal formName As String)
+        Dim emptyLayout As NativeFormLayout
+        outLayout = emptyLayout
+        outLayout.FormName = formName
+        outLayout.RecordSource = vbNullString
+        outLayout.DefaultView = 0
+        outLayout.RecordSelectors = True
+        outLayout.NavigationButtons = True
+        outLayout.AllowAdditions = True
+        outLayout.FormWidthTw = 0
+        outLayout.CtlCount = 0
+        outLayout.LayoutSource = vbNullString
+        outLayout.RightToLeft = False
+    End Sub
+
+    Public Function CountBlobDefaultedProperties() As Long
+        Dim k As Long
+        Dim n As Long
+        Dim parts() As String
+
+        n = 0
+        If Len(m_blobFormDefaulted) > 0 Then
+            parts = Split(m_blobFormDefaulted, ",")
+            n = n + UBound(parts) + 1
+        End If
+        For k = 0 To m_blobDefaultedCount - 1
+            If Len(m_blobDefaulted(k)) > 0 Then
+                parts = Split(m_blobDefaulted(k), ",")
+                n = n + UBound(parts) + 1
+            End If
+        Next k
+        CountBlobDefaultedProperties = n
+    End Function
+
+    Public Function CaptureBlobDefaults(ByVal ctlCount As Long) As String
+        Dim packed As String
+        Dim k As Long
+
+        packed = m_blobFormDefaulted
+        For k = 0 To ctlCount - 1
+            packed = packed & vbLf
+            If k < m_blobDefaultedCount Then packed = packed & m_blobDefaulted(k)
+        Next k
+        CaptureBlobDefaults = packed
+    End Function
+
+    Public Sub RestoreBlobDefaults(ByVal packed As String, ByVal ctlCount As Long)
+        Dim parts() As String
+        Dim emptyDefaults() As String
+        Dim partCount As Long
+        Dim k As Long
+
+        m_blobDefaulted = emptyDefaults
+        m_blobDefaultedCount = 0
+        m_blobFormDefaulted = vbNullString
+        parts = Split(packed, vbLf)
+        partCount = UBound(parts) + 1
+        If partCount > 0 Then m_blobFormDefaulted = parts(0)
+        If ctlCount > 0 Then
+            ReDim m_blobDefaulted(0 To ctlCount - 1)
+            For k = 0 To ctlCount - 1
+                If k + 1 < partCount Then m_blobDefaulted(k) = parts(k + 1)
+            Next k
+            m_blobDefaultedCount = ctlCount
+        End If
+    End Sub
+
+    Private Function ExtractUtf16StringsFromBlob(ByRef buf() As Byte) As Collection
+        Set ExtractUtf16StringsFromBlob = VbaProjectStore.ExtractUtf16StringsFromBlob(buf)
+    End Function
+
+
+Public Function AppendStreamBytes(ByRef dest() As Byte, ByRef srcVal As Variant) As Byte()
+        Dim dLen As Long, sLen As Long
+        Dim src() As Byte
+        Dim res() As Byte
+        Dim i As Long
+        On Error Resume Next
+        If IsNull(srcVal) Or IsEmpty(srcVal) Then
+            AppendStreamBytes = dest
+            Exit Function
+        End If
+        src = srcVal
+        sLen = UBound(src) - LBound(src) + 1
+        If Err.Number <> 0 Or sLen <= 0 Then
+            Err.Clear
+            AppendStreamBytes = dest
+            Exit Function
+        End If
+        dLen = UBound(dest) - LBound(dest) + 1
+        If Err.Number <> 0 Then
+            dLen = 0
+            Err.Clear
+        End If
+        On Error GoTo 0
+        If dLen = 0 Then
+            AppendStreamBytes = src
+        Else
+            ReDim res(0 To dLen + sLen - 1)
+            For i = 0 To dLen - 1
+                res(i) = dest(LBound(dest) + i)
+            Next i
+            For i = 0 To sLen - 1
+                res(dLen + i) = src(LBound(src) + i)
+            Next i
+            AppendStreamBytes = res
+        End If
+    End Function
+
+Public Function InspectNativeAccessForm(ByVal db As Object, ByVal formName As String, ByRef outRecordSource As String, ByRef outControls As Collection, ByRef outButtonName As String, ByRef outButtonCaption As String, ByRef outFormVbaCode As String, ByRef outInspectLayout As NativeFormLayout, ByRef outInspectLayoutValid As Boolean) As Boolean
+        Dim rs As Object
+        Dim formsFolderId As Long
+        Dim dirBytes() As Byte
+        Dim storageFolderName As String
+        Dim formStorageId As Long
+        Dim typeBytes() As Byte
+        Dim blobBytes() As Byte
+        Dim pos As Long
+        Dim maxIdx As Long
+        Dim cType As Long
+        Dim cName As String
+        Dim cTypeStr As String
+        Dim blobStrings As Collection
+        Dim sIdx As Long
+        Dim candStr As String
+        Dim tblNames As Collection
+        Dim qryNames As Collection
+        Dim typeInfoCtrls As Collection
+        Dim formLayout As NativeFormLayout
+        Dim blobParsed As Boolean
+        Dim lIdx As Long
+        Dim dMax As Long
+        Dim dPos As Long
+        Dim recLen As Long
+        Dim nameBytesLen As Long
+        Dim chIdx As Long
+        Dim codeUnit As Long
+        Dim folderNum As Long
+        Dim entryName As String
+        Dim vDir As Variant
+        Dim vStm As Variant
+
+        InspectNativeAccessForm = False
+        outInspectLayoutValid = False
+        outRecordSource = vbNullString
+        Set outControls = New Collection
+        Set typeInfoCtrls = New Collection
+        outButtonName = vbNullString
+        outButtonCaption = vbNullString
+        outFormVbaCode = vbNullString
+
+        If db Is Nothing Or Len(Trim$(formName)) = 0 Then Exit Function
+
+        outFormVbaCode = VbaProjectStore.GetNativeVbaModuleCode(db, "Form_" & Trim$(formName))
+        formsFolderId = -1
+
+        On Error Resume Next
+        Set rs = db.OpenRecordset("SELECT [Id] FROM [MSysAccessStorage] WHERE [Name] = 'Forms';")
+        If Err.Number = 0 And Not rs Is Nothing Then
+            If Not rs.EOF Then formsFolderId = CLng(rs.Fields(0).Value)
+            rs.Close
+        End If
+
+        If formsFolderId <= 0 Then
+            On Error GoTo 0
+            Exit Function
+        End If
+
+        ' Find storage subfolder name ("0", "1", ...) from DirData or first available subfolder
+        storageFolderName = "0"
+        Set rs = db.OpenRecordset("SELECT [Name], [Lv] FROM [MSysAccessStorage] WHERE [ParentId] = " & CStr(formsFolderId) & ";")
+        If Err.Number = 0 And Not rs Is Nothing Then
+            Do Until rs.EOF
+                If InStr(1, CStr(rs.Fields(0).Value), "DirData", vbTextCompare) > 0 And InStr(1, CStr(rs.Fields(0).Value), "Copy", vbTextCompare) = 0 Then
+                    vDir = rs.Fields(1).Value
+                    If Not IsNull(vDir) Then
+                        dirBytes = AppendStreamBytes(dirBytes, vDir)
+                    End If
+                End If
+                rs.MoveNext
+            Loop
+            rs.Close
+        End If
+
+        On Error Resume Next
+        dMax = -1
+        dMax = UBound(dirBytes)
+        On Error GoTo 0
+        If dMax >= 9 Then
+            dPos = 4
+            Do While (dPos + 5) <= dMax
+                recLen = CLng(dirBytes(dPos + 1))
+                If recLen <= 4 Or (dPos + 1 + recLen) > dMax Then Exit Do
+                nameBytesLen = recLen - 4
+                entryName = vbNullString
+                For chIdx = 0 To (nameBytesLen \ 2) - 1
+                    codeUnit = CLng(dirBytes(dPos + 2 + (chIdx * 2))) Or (CLng(dirBytes(dPos + 3 + (chIdx * 2))) * 256&)
+                    If codeUnit >= 32768 Then codeUnit = codeUnit - 65536
+                    entryName = entryName & ChrW$(codeUnit)
+                Next chIdx
+                folderNum = CLng(dirBytes(dPos + 2 + nameBytesLen)) Or (CLng(dirBytes(dPos + 3 + nameBytesLen)) * 256&) Or (CLng(dirBytes(dPos + 4 + nameBytesLen)) * 65536&)
+                If UCase$(Trim$(entryName)) = UCase$(Trim$(formName)) Then
+                    storageFolderName = CStr(folderNum)
+                    Exit Do
+                End If
+                dPos = dPos + 2 + recLen
+            Loop
+        End If
+
+        formStorageId = -1
+        Set rs = db.OpenRecordset("SELECT [Id] FROM [MSysAccessStorage] WHERE [ParentId] = " & CStr(formsFolderId) & " AND [Name] = '" & storageFolderName & "';")
+        If Err.Number = 0 And Not rs Is Nothing Then
+            If Not rs.EOF Then
+                formStorageId = CLng(rs.Fields(0).Value)
+            End If
+            rs.Close
+        End If
+
+        If formStorageId <= 0 Then
+            On Error GoTo 0
+            Exit Function
+        End If
+
+        ' Read TypeInfo and Blob streams under formStorageId
+        Set rs = db.OpenRecordset("SELECT [Name], [Lv] FROM [MSysAccessStorage] WHERE [ParentId] = " & CStr(formStorageId) & ";")
+        If Err.Number = 0 And Not rs Is Nothing Then
+            Do Until rs.EOF
+                vStm = rs.Fields(1).Value
+                If UCase$(CStr(rs.Fields(0).Value)) = "TYPEINFO" And Not IsNull(vStm) Then
+                    typeBytes = AppendStreamBytes(typeBytes, vStm)
+                ElseIf UCase$(CStr(rs.Fields(0).Value)) = "BLOB" And Not IsNull(vStm) Then
+                    blobBytes = AppendStreamBytes(blobBytes, vStm)
+                End If
+                rs.MoveNext
+            Loop
+            rs.Close
+        End If
+        On Error GoTo 0
+
+        ' Parse TypeInfo controls starting at offset 32
+        On Error Resume Next
+        maxIdx = -1
+        maxIdx = UBound(typeBytes)
+        On Error GoTo 0
+
+        If maxIdx >= 40 Then
+            pos = 32
+            Do While (pos + 8) <= maxIdx
+                cType = CLng(typeBytes(pos)) Or (CLng(typeBytes(pos + 1)) * 256&)
+                pos = pos + 8
+                cName = vbNullString
+                Do While pos <= maxIdx
+                    If typeBytes(pos) = 0 Then
+                        pos = pos + 1
+                        Exit Do
+                    End If
+                    cName = cName & Chr$(typeBytes(pos))
+                    pos = pos + 1
+                Loop
+                ' Double-null terminator after ASCII control name: advance by 1 extra byte
+                pos = pos + 1
+
+                If Len(cName) > 0 Then
+                    Select Case cType
+                        Case &H1898&, &H1899&, &H189A&: cTypeStr = "Section"
+                        Case &H126D&: cTypeStr = "TextBox"
+                        Case &H0C64&, &H0D64&: cTypeStr = "Label"
+                        Case &H0B68&
+                            cTypeStr = "CommandButton"
+                            If Len(outButtonName) = 0 Then outButtonName = cName
+                        Case &H126E&, &H136F&: cTypeStr = "ComboBox"
+                        Case &H126F&: cTypeStr = "ListBox"
+                        Case Else: cTypeStr = "Control"
+                    End Select
+                    typeInfoCtrls.Add cTypeStr & "|" & cName
+                End If
+            Loop
+        End If
+
+        ' Layout model from the Blob property stream (Tier 1 parser).
+        ResetNativeFormLayout formLayout, Trim$(formName)
+        blobParsed = ParseFormBlobProperties(blobBytes, typeBytes, formLayout)
+
+        If blobParsed Then
+            ' Real controls of the form ("Type|Name"), in Blob order
+            For lIdx = 0 To formLayout.CtlCount - 1
+                If Len(formLayout.Ctls(lIdx).CtlName) > 0 Then
+                    cTypeStr = formLayout.Ctls(lIdx).CtlType
+                    If Len(cTypeStr) = 0 Then cTypeStr = "Control"
+                    outControls.Add cTypeStr & "|" & formLayout.Ctls(lIdx).CtlName
+                End If
+            Next lIdx
+            ' RecordSource property of the form; empty means an unbound form
+            outRecordSource = Trim$(formLayout.RecordSource)
+            outInspectLayout = formLayout
+            outInspectLayoutValid = True
+        Else
+            Set outControls = typeInfoCtrls
+        End If
+
+        ' Parse Blob UTF-16LE strings to discover the Button Caption (and the
+        ' RecordSource only when the Blob property stream could not be parsed)
+        Set blobStrings = ExtractUtf16StringsFromBlob(blobBytes)
+        Set tblNames = GetTableNames()
+        Set qryNames = GetQueryNames()
+
+        For sIdx = 1 To blobStrings.Count
+            candStr = CStr(blobStrings(sIdx))
+            If Len(outRecordSource) = 0 And Not blobParsed Then
+                If CollectionContainsText(tblNames, candStr) Or CollectionContainsText(qryNames, candStr) Or Left$(UCase$(Trim$(candStr)), 7) = "SELECT " Then
+                    outRecordSource = candStr
+                End If
+            End If
+            If Len(outButtonName) > 0 And Len(outButtonCaption) = 0 Then
+                If UCase$(Trim$(candStr)) = UCase$(Trim$(outButtonName)) And sIdx < blobStrings.Count Then
+                    Dim nextStr As String
+                    nextStr = CStr(blobStrings(sIdx + 1))
+                    If Left$(nextStr, 1) <> "[" Then
+                        outButtonCaption = nextStr
+                    End If
+                End If
+            End If
+        Next sIdx
+
+        If Len(outButtonName) > 0 And Len(outButtonCaption) = 0 Then
+            outButtonCaption = outButtonName
+        End If
+
+        ' No "first query / first table" guess: no RecordSource -> unbound form.
+
+        InspectNativeAccessForm = True
+    End Function
+
+    ' Single entry point for the native form renderer. Tries, in order:
+    '   Tier 1 - Blob property stream ("Blob"); missing properties take Access defaults
+    '   Tier 3 - TypeInfo control list stacked vertically ("TypeInfoFallback")
+    ' (Tier 2, Access.Application.SaveAsText, was removed by plan7 WS0-A: Studio never
+    ' starts msaccess.exe. SaveAsText stays a developer-only oracle in tools/.)
+    ' On success outLayout.LayoutSource names the tier that produced the layout.
+    ' Before the tiers run, the in-memory cache and then the disk cache
+    ' (%LOCALAPPDATA%\OpenAccessStudio\layoutcache, LayoutSource "Cache") are
+    ' checked; complete Tier 1 results are stored in both. Cache entries written by
+    ' older builds from the SaveAsText fallback are ignored.
+
+Public Function TryNativeFormLayoutFromBlob(ByVal db As Object, ByVal formName As String, ByRef outLayout As NativeFormLayout, ByRef outErrorMsg As String, ByRef outIncomplete As Boolean) As Boolean
+        Dim typeBytes() As Byte
+        Dim blobBytes() As Byte
+        Dim readMsg As String
+
+        TryNativeFormLayoutFromBlob = False
+        outErrorMsg = vbNullString
+        outIncomplete = False
+
+        If Not ReadNativeFormStreams(db, formName, typeBytes, blobBytes, readMsg) Then
+            outErrorMsg = readMsg
+            Exit Function
+        End If
+
+        If ParseFormBlobProperties(blobBytes, typeBytes, outLayout) Then
+            TryNativeFormLayoutFromBlob = True
+            outIncomplete = BlobLayoutIsIncomplete(db, blobBytes, outLayout)
+        Else
+            outErrorMsg = "The form Blob holds no sections or controls (typeBytes=" & CStr(UBound(typeBytes) + 1) & ", blobBytes=" & CStr(UBound(blobBytes) + 1) & ")"
+        End If
+    End Function
+
+    ' Approximate-layout check. True when a visible control took a hard-coded default for
+    ' Left/Top/Width/Height, or when the layout has no RecordSource although a
+    ' Blob string names a table/query (or holds SELECT SQL) that no control uses.
+    ' DefaultView is not checked: a missing DefaultView record is the normal
+    ' encoding of the stored default (Customers form), not missing data.
+    Public Function BlobLayoutIsIncomplete(ByVal db As Object, ByRef blobBytes() As Byte, ByRef layout As NativeFormLayout) As Boolean
+        Dim k As Long
+        Dim d As String
+        Dim blobStrings As Collection
+        Dim itemVal As Variant
+        Dim s As String
+        Dim usedByControl As Boolean
+
+        BlobLayoutIsIncomplete = False
+
+        For k = 0 To layout.CtlCount - 1
+            If layout.Ctls(k).Visible And k < m_blobDefaultedCount Then
+                d = "," & m_blobDefaulted(k) & ","
+                If InStr(1, d, ",Left,", vbBinaryCompare) > 0 Or InStr(1, d, ",Top,", vbBinaryCompare) > 0 Or _
+                   InStr(1, d, ",Width,", vbBinaryCompare) > 0 Or InStr(1, d, ",Height,", vbBinaryCompare) > 0 Then
+                    BlobLayoutIsIncomplete = True
+                    Exit Function
+                End If
+            End If
+        Next k
+
+        If Len(Trim$(layout.RecordSource)) > 0 Then Exit Function
+
+        Set blobStrings = ExtractUtf16StringsFromBlob(blobBytes)
+        If blobStrings Is Nothing Then Exit Function
+        For Each itemVal In blobStrings
+            s = Trim$(CStr(itemVal))
+            If Len(s) > 0 Then
+                usedByControl = False
+                For k = 0 To layout.CtlCount - 1
+                    If StrComp(s, layout.Ctls(k).RowSource, vbTextCompare) = 0 Or _
+                       StrComp(s, layout.Ctls(k).ControlSource, vbTextCompare) = 0 Or _
+                       StrComp(s, layout.Ctls(k).SourceObject, vbTextCompare) = 0 Or _
+                       StrComp(s, layout.Ctls(k).CtlName, vbTextCompare) = 0 Or _
+                       StrComp(s, layout.Ctls(k).Caption, vbTextCompare) = 0 Then
+                        usedByControl = True
+                        Exit For
+                    End If
+                Next k
+                If Not usedByControl Then
+                    If UCase$(Left$(s, 7)) = "SELECT " Or DatabaseHasTableOrQuery(db, s) Then
+                        BlobLayoutIsIncomplete = True
+                        Exit Function
+                    End If
+                End If
+            End If
+        Next itemVal
+    End Function
+
+    ' True when the open database has a TableDef or QueryDef with this name.
+    Public Function DatabaseHasTableOrQuery(ByVal db As Object, ByVal objName As String) As Boolean
+        Dim probe As Object
+
+        DatabaseHasTableOrQuery = False
+        If db Is Nothing Or Len(objName) = 0 Or Len(objName) > 64 Then Exit Function
+        On Error Resume Next
+        Set probe = db.TableDefs(objName)
+        If Err.Number = 0 And Not probe Is Nothing Then DatabaseHasTableOrQuery = True
+        Err.Clear
+        If Not DatabaseHasTableOrQuery Then
+            Set probe = Nothing
+            Set probe = db.QueryDefs(objName)
+            If Err.Number = 0 And Not probe Is Nothing Then DatabaseHasTableOrQuery = True
+            Err.Clear
+        End If
+        Set probe = Nothing
+        On Error GoTo 0
+    End Function
+
+    ' Reads the TypeInfo and Blob streams of a native form from MSysAccessStorage
+    ' (same DirData walk as InspectNativeAccessForm, which stays unchanged).
+    Public Function ReadNativeFormStreams(ByVal db As Object, ByVal formName As String, ByRef outTypeBytes() As Byte, ByRef outBlobBytes() As Byte, ByRef outErrorMsg As String) As Boolean
+        Dim rs As Object
+        Dim formsFolderId As Long
+        Dim formStorageId As Long
+        Dim storageFolderName As String
+        Dim dirBytes() As Byte
+        Dim vVal As Variant
+        Dim dMax As Long
+        Dim dPos As Long
+        Dim recLen As Long
+        Dim nameBytesLen As Long
+        Dim chIdx As Long
+        Dim entryName As String
+        Dim streamName As String
+        Dim hasBlob As Boolean
+        Dim emptyBytes() As Byte
+        Dim codeUnit2 As Long
+        Dim folderNum2 As Long
+
+        ReadNativeFormStreams = False
+        outErrorMsg = vbNullString
+        outTypeBytes = emptyBytes
+        outBlobBytes = emptyBytes
+        hasBlob = False
+        formsFolderId = -1
+        formStorageId = -1
+        storageFolderName = vbNullString
+
+        If db Is Nothing Or Len(Trim$(formName)) = 0 Then
+            outErrorMsg = "No database is open."
+            Exit Function
+        End If
+
+        On Error Resume Next
+        Set rs = db.OpenRecordset("SELECT [Id] FROM [MSysAccessStorage] WHERE [Name] = 'Forms';")
+        If Err.Number = 0 And Not rs Is Nothing Then
+            If Not rs.EOF Then formsFolderId = CLng(rs.Fields(0).Value)
+            rs.Close
+        End If
+        Err.Clear
+        Set rs = Nothing
+
+        If formsFolderId <= 0 Then
+            On Error GoTo 0
+            outErrorMsg = "MSysAccessStorage has no Forms folder."
+            Exit Function
+        End If
+
+        Set rs = db.OpenRecordset("SELECT [Name], [Lv] FROM [MSysAccessStorage] WHERE [ParentId] = " & CStr(formsFolderId) & ";")
+        If Err.Number = 0 And Not rs Is Nothing Then
+            Do Until rs.EOF
+                If InStr(1, CStr(rs.Fields(0).Value), "DirData", vbTextCompare) > 0 And InStr(1, CStr(rs.Fields(0).Value), "Copy", vbTextCompare) = 0 Then
+                    vVal = rs.Fields(1).Value
+                    If Not IsNull(vVal) Then
+                        dirBytes = AppendStreamBytes(dirBytes, vVal)
+                    End If
+                End If
+                rs.MoveNext
+            Loop
+            rs.Close
+        End If
+        Err.Clear
+        Set rs = Nothing
+
+        On Error Resume Next
+        dMax = -1
+        dMax = UBound(dirBytes)
+        On Error GoTo 0
+        If dMax >= 9 Then
+            dPos = 4
+            Do While (dPos + 5) <= dMax
+                recLen = CLng(dirBytes(dPos + 1))
+                If recLen <= 4 Or (dPos + 1 + recLen) > dMax Then Exit Do
+                nameBytesLen = recLen - 4
+                entryName = vbNullString
+                For chIdx = 0 To (nameBytesLen \ 2) - 1
+                    codeUnit2 = CLng(dirBytes(dPos + 2 + (chIdx * 2))) Or (CLng(dirBytes(dPos + 3 + (chIdx * 2))) * 256&)
+                    If codeUnit2 >= 32768 Then codeUnit2 = codeUnit2 - 65536
+                    entryName = entryName & ChrW$(codeUnit2)
+                Next chIdx
+                folderNum2 = CLng(dirBytes(dPos + 2 + nameBytesLen)) Or (CLng(dirBytes(dPos + 3 + nameBytesLen)) * 256&) Or (CLng(dirBytes(dPos + 4 + nameBytesLen)) * 65536&)
+                If UCase$(Trim$(entryName)) = UCase$(Trim$(formName)) Then
+                    storageFolderName = CStr(folderNum2)
+                    Exit Do
+                End If
+                dPos = dPos + 2 + recLen
+            Loop
+        End If
+
+        If Len(storageFolderName) = 0 Then
+            On Error GoTo 0
+            outErrorMsg = "Form [" & formName & "] is not listed in DirData."
+            Exit Function
+        End If
+
+        Set rs = db.OpenRecordset("SELECT [Id] FROM [MSysAccessStorage] WHERE [ParentId] = " & CStr(formsFolderId) & " AND [Name] = '" & storageFolderName & "';")
+        If Err.Number = 0 And Not rs Is Nothing Then
+            If Not rs.EOF Then formStorageId = CLng(rs.Fields(0).Value)
+            rs.Close
+        End If
+        Err.Clear
+        Set rs = Nothing
+
+        If formStorageId <= 0 Then
+            On Error GoTo 0
+            outErrorMsg = "Storage folder of form [" & formName & "] not found."
+            Exit Function
+        End If
+
+        Set rs = db.OpenRecordset("SELECT [Name], [Lv] FROM [MSysAccessStorage] WHERE [ParentId] = " & CStr(formStorageId) & ";")
+        If Err.Number = 0 And Not rs Is Nothing Then
+            Do Until rs.EOF
+                streamName = UCase$(CStr(rs.Fields(0).Value))
+                vVal = rs.Fields(1).Value
+                If Not IsNull(vVal) Then
+                    If streamName = "TYPEINFO" Then
+                        outTypeBytes = AppendStreamBytes(outTypeBytes, vVal)
+                    ElseIf streamName = "BLOB" Then
+                        outBlobBytes = AppendStreamBytes(outBlobBytes, vVal)
+                        hasBlob = True
+                    End If
+                End If
+                rs.MoveNext
+            Loop
+            rs.Close
+        End If
+        Err.Clear
+        On Error GoTo 0
+
+        If Not hasBlob Then
+            outErrorMsg = "Form [" & formName & "] has no Blob stream."
+            Exit Function
+        End If
+        ReadNativeFormStreams = True
+    End Function
+
+    Public Function ReadNativeReportStreams(ByVal db As Object, ByRef reportName As String, ByRef outTypeBytes() As Byte, ByRef outBlobBytes() As Byte, ByRef outErrorMsg As String) As Boolean
+        Dim rs As Object
+        Dim reportsFolderId As Long
+        Dim reportStorageId As Long
+        Dim storageFolderName As String
+        Dim dirBytes() As Byte
+        Dim vVal As Variant
+        Dim dMax As Long
+        Dim dPos As Long
+        Dim recLen As Long
+        Dim nameBytesLen As Long
+        Dim chIdx As Long
+        Dim entryName As String
+        Dim streamName As String
+        Dim hasBlob As Boolean
+        Dim emptyBytes() As Byte
+        Dim codeUnitR As Long
+        Dim folderNumR As Long
+
+        ReadNativeReportStreams = False
+        outErrorMsg = vbNullString
+        outTypeBytes = emptyBytes
+        outBlobBytes = emptyBytes
+        hasBlob = False
+        reportsFolderId = -1
+        reportStorageId = -1
+        storageFolderName = vbNullString
+
+        If db Is Nothing Then
+            outErrorMsg = "No database is open."
+            Exit Function
+        End If
+
+        On Error Resume Next
+        Set rs = db.OpenRecordset("SELECT [Id] FROM [MSysAccessStorage] WHERE [Name] = 'Reports';")
+        If Err.Number = 0 And Not rs Is Nothing Then
+            If Not rs.EOF Then reportsFolderId = CLng(rs.Fields(0).Value)
+            rs.Close
+        End If
+        Err.Clear
+        Set rs = Nothing
+
+        If reportsFolderId <= 0 Then
+            On Error GoTo 0
+            outErrorMsg = "MSysAccessStorage has no Reports folder."
+            Exit Function
+        End If
+
+        Set rs = db.OpenRecordset("SELECT [Name], [Lv] FROM [MSysAccessStorage] WHERE [ParentId] = " & CStr(reportsFolderId) & ";")
+        If Err.Number = 0 And Not rs Is Nothing Then
+            Do Until rs.EOF
+                If InStr(1, CStr(rs.Fields(0).Value), "DirData", vbTextCompare) > 0 And InStr(1, CStr(rs.Fields(0).Value), "Copy", vbTextCompare) = 0 Then
+                    vVal = rs.Fields(1).Value
+                    If Not IsNull(vVal) Then
+                        dirBytes = AppendStreamBytes(dirBytes, vVal)
+                    End If
+                End If
+                rs.MoveNext
+            Loop
+            rs.Close
+        End If
+        Err.Clear
+        Set rs = Nothing
+
+        On Error Resume Next
+        dMax = -1
+        dMax = UBound(dirBytes)
+        On Error GoTo 0
+        If dMax >= 9 Then
+            dPos = 4
+            Do While (dPos + 5) <= dMax
+                recLen = CLng(dirBytes(dPos + 1))
+                If recLen <= 4 Or (dPos + 1 + recLen) > dMax Then Exit Do
+                nameBytesLen = recLen - 4
+                entryName = vbNullString
+                For chIdx = 0 To (nameBytesLen \ 2) - 1
+                    codeUnitR = CLng(dirBytes(dPos + 2 + (chIdx * 2))) Or (CLng(dirBytes(dPos + 3 + (chIdx * 2))) * 256&)
+                    If codeUnitR >= 32768 Then codeUnitR = codeUnitR - 65536
+                    entryName = entryName & ChrW$(codeUnitR)
+                Next chIdx
+                folderNumR = CLng(dirBytes(dPos + 2 + nameBytesLen)) Or (CLng(dirBytes(dPos + 3 + nameBytesLen)) * 256&) Or (CLng(dirBytes(dPos + 4 + nameBytesLen)) * 65536&)
+                If UCase$(Trim$(entryName)) = UCase$(Trim$(reportName)) Or Len(Trim$(reportName)) = 0 Or UCase$(Trim$(reportName)) = "FIRST" Then
+                    storageFolderName = CStr(folderNumR)
+                    reportName = entryName
+                    Exit Do
+                End If
+                dPos = dPos + 2 + recLen
+            Loop
+        End If
+
+        If Len(storageFolderName) = 0 Then
+            On Error GoTo 0
+            outErrorMsg = "Report [" & reportName & "] is not listed in DirData."
+            Exit Function
+        End If
+
+        Set rs = db.OpenRecordset("SELECT [Id] FROM [MSysAccessStorage] WHERE [ParentId] = " & CStr(reportsFolderId) & " AND [Name] = '" & storageFolderName & "';")
+        If Err.Number = 0 And Not rs Is Nothing Then
+            If Not rs.EOF Then reportStorageId = CLng(rs.Fields(0).Value)
+            rs.Close
+        End If
+        Err.Clear
+        Set rs = Nothing
+
+        If reportStorageId <= 0 Then
+            On Error GoTo 0
+            outErrorMsg = "Storage folder of report [" & reportName & "] not found."
+            Exit Function
+        End If
+
+        Set rs = db.OpenRecordset("SELECT [Name], [Lv] FROM [MSysAccessStorage] WHERE [ParentId] = " & CStr(reportStorageId) & ";")
+        If Err.Number = 0 And Not rs Is Nothing Then
+            Do Until rs.EOF
+                streamName = UCase$(CStr(rs.Fields(0).Value))
+                vVal = rs.Fields(1).Value
+                If Not IsNull(vVal) Then
+                    If streamName = "TYPEINFO" Then
+                        outTypeBytes = AppendStreamBytes(outTypeBytes, vVal)
+                    ElseIf streamName = "BLOB" Then
+                        outBlobBytes = AppendStreamBytes(outBlobBytes, vVal)
+                        hasBlob = True
+                    End If
+                End If
+                rs.MoveNext
+            Loop
+            rs.Close
+        End If
+        Err.Clear
+        On Error GoTo 0
+
+        If Not hasBlob Then
+            outErrorMsg = "Report [" & reportName & "] has no Blob stream."
+            Exit Function
+        End If
+        ReadNativeReportStreams = True
+    End Function
+
+    Public Function GetNativeReportLayout(ByVal db As Object, ByRef reportName As String, ByRef outLayout As NativeFormLayout, ByRef outErrorMsg As String) As Boolean
+        Dim cleanName As String
+        Dim typeBytes() As Byte
+        Dim blobBytes() As Byte
+
+        GetNativeReportLayout = False
+        outErrorMsg = vbNullString
+        cleanName = Trim$(reportName)
+        ResetNativeFormLayout outLayout, cleanName
+
+        If Len(cleanName) = 0 Then
+            outErrorMsg = "No report name specified."
+            Exit Function
+        End If
+        If db Is Nothing Then
+            outErrorMsg = "No database is open."
+            Exit Function
+        End If
+
+        If Not ReadNativeReportStreams(db, cleanName, typeBytes, blobBytes, outErrorMsg) Then
+            Exit Function
+        End If
+
+        If ParseFormBlobProperties(blobBytes, typeBytes, outLayout) Then
+            outLayout.LayoutSource = "Blob"
+            GetNativeReportLayout = True
+        Else
+            outErrorMsg = "Failed to parse report Blob layout."
+        End If
+    End Function
+
+    ' =====================================================================
+    ' Form Blob property parser (Tier 1). Python mirror:
+    ' tools/studio_render_model.py parse_form_blob_properties.
+    '
+    ' The Blob is a tree of objects (form -> type templates / sections ->
+    ' controls -> attached labels):
+    '   bytes 0..7 header, u16 at 8 = root type (&H96 Form), records from 10
+    '   record: [u32 ordinal][u16 propId][u32 dataType][u32 maxSize][u32 byteLen][data]
+    '   &HFF marker: [u32 FF][u16 childCount][u16 firstChildType]
+    '   &HFE marker: [u32 FE][u16 childType]   (exactly one child)
+    '   &HFD marker: [u32 FD] ends the current object; when the parent expects
+    '                more children the next sibling's [u16 type] follows.
+    ' A parent has no records after its children, so an object is complete
+    ' when its first child starts. Inside one object the records are sorted by
+    ' ordinal: Left/Top/Width/Height come right before Name, Caption/OnClick
+    ' follow it; all of them belong to that object.
+    ' Every propId was confirmed by tools/form_layout_oracle.py (task 4.2).
+    ' =====================================================================
+
+    ' Returns the defaulted property names of control ctlIndex of the last
+    ' Blob layout, or of the form itself when ctlIndex < 0.
+    Public Function GetLastBlobLayoutDefaults(ByVal ctlIndex As Long) As String
+        GetLastBlobLayoutDefaults = vbNullString
+        If ctlIndex < 0 Then
+            GetLastBlobLayoutDefaults = m_blobFormDefaulted
+        ElseIf ctlIndex < m_blobDefaultedCount Then
+            GetLastBlobLayoutDefaults = m_blobDefaulted(ctlIndex)
+        End If
+    End Function
+
+    ' The single propId table. Returns the scratch slot (-1 = not used) and its kind.
+    Private Function BlobPropSlot(ByVal propId As Long, ByRef outKind As Long) As Long
+        outKind = SLOT_KIND_INT
+        Select Case propId
+            Case &H14&: BlobPropSlot = SLOT_NAME: outKind = SLOT_KIND_TEXT
+            Case &H11&: BlobPropSlot = SLOT_CAPTION: outKind = SLOT_KIND_TEXT
+            Case &H1B&: BlobPropSlot = SLOT_CONTROL_SOURCE: outKind = SLOT_KIND_TEXT
+            Case &H5B&: BlobPropSlot = SLOT_ROW_SOURCE: outKind = SLOT_KIND_TEXT
+            Case &H12&: BlobPropSlot = SLOT_COLUMN_WIDTHS: outKind = SLOT_KIND_TEXT
+            Case &H84&: BlobPropSlot = SLOT_SOURCE_OBJECT: outKind = SLOT_KIND_TEXT
+            Case &H32&: BlobPropSlot = SLOT_LINK_MASTER: outKind = SLOT_KIND_TEXT
+            Case &H31&: BlobPropSlot = SLOT_LINK_CHILD: outKind = SLOT_KIND_TEXT
+            Case &H7E&: BlobPropSlot = SLOT_ON_CLICK: outKind = SLOT_KIND_TEXT
+            Case &H9C&: BlobPropSlot = SLOT_RECORD_SOURCE: outKind = SLOT_KIND_TEXT
+            Case &H22&: BlobPropSlot = SLOT_FONT_NAME: outKind = SLOT_KIND_TEXT
+            Case &H36&: BlobPropSlot = SLOT_LEFT
+            Case &H8D&: BlobPropSlot = SLOT_TOP
+            Case &H96&: BlobPropSlot = SLOT_WIDTH
+            Case &H2C&: BlobPropSlot = SLOT_HEIGHT
+            Case &HD&: BlobPropSlot = SLOT_BOUND_COLUMN      ' stored zero-based
+            Case &H46&: BlobPropSlot = SLOT_COLUMN_COUNT
+            Case &H93&: BlobPropSlot = SLOT_DEFAULT_VIEW
+            Case &H1C&: BlobPropSlot = SLOT_BACK_COLOR       ' controls and sections
+            Case &HCC&: BlobPropSlot = SLOT_FORE_COLOR
+            Case &H23&: BlobPropSlot = SLOT_FONT_SIZE
+            Case &H25&: BlobPropSlot = SLOT_FONT_WEIGHT
+            Case &H24A&: BlobPropSlot = SLOT_CACHED_LEFT     ' LayoutCachedLeft
+            Case &H24B&: BlobPropSlot = SLOT_CACHED_TOP      ' LayoutCachedTop
+            Case &H24C&: BlobPropSlot = SLOT_CACHED_RIGHT    ' LayoutCachedWidth = right edge
+            Case &H24D&: BlobPropSlot = SLOT_CACHED_BOTTOM   ' LayoutCachedHeight = bottom edge
+            Case &H13&: BlobPropSlot = SLOT_RECORD_SELECTORS: outKind = SLOT_KIND_BOOL
+            Case &H117&: BlobPropSlot = SLOT_NAVIGATION_BUTTONS: outKind = SLOT_KIND_BOOL
+            Case &H146&: BlobPropSlot = SLOT_ALLOW_ADDITIONS: outKind = SLOT_KIND_BOOL
+            Case &H13B&, &H16A&: BlobPropSlot = SLOT_RIGHT_TO_LEFT: outKind = SLOT_KIND_BOOL
+            Case Else: BlobPropSlot = -1
+        End Select
+    End Function
+
+    Private Function BlobU16(ByRef b() As Byte, ByVal p As Long) As Long
+        BlobU16 = CLng(b(p)) Or (CLng(b(p + 1)) * 256&)
+    End Function
+
+    ' u32 at p, saturated to &H7FFFFFFF when the top bit is set (callers only
+    ' compare it with small limits, so a Long never overflows).
+    Private Function BlobU32(ByRef b() As Byte, ByVal p As Long) As Long
+        If (CLng(b(p + 3)) And &H80&) <> 0 Then
+            BlobU32 = &H7FFFFFFF&
+        Else
+            BlobU32 = CLng(b(p)) Or (CLng(b(p + 1)) * 256&) Or (CLng(b(p + 2)) * 65536&) Or ((CLng(b(p + 3)) And &H7F&) * 16777216&)
+        End If
+    End Function
+
+    Private Function BlobIsKnownDataType(ByVal dataType As Long) As Boolean
+        BlobIsKnownDataType = (dataType >= 1 And dataType <= 20)
+    End Function
+
+    Private Function BlobPlausibleRecord(ByRef b() As Byte, ByVal p As Long, ByVal n As Long) As Boolean
+        Dim ordinal As Long
+        Dim dataType As Long
+        Dim maxSize As Long
+        Dim byteLen As Long
+
+        BlobPlausibleRecord = False
+        If p < 0 Or p + BLOB_RECORD_HEADER > n Then Exit Function
+        ordinal = BlobU32(b, p)
+        dataType = BlobU32(b, p + 6)
+        maxSize = BlobU32(b, p + 10)
+        byteLen = BlobU32(b, p + 14)
+        If ordinal >= &H1000& Then Exit Function
+        If Not BlobIsKnownDataType(dataType) Then Exit Function
+        If maxSize > &H100000& Then Exit Function
+        If byteLen > n - p - BLOB_RECORD_HEADER Then Exit Function
+        BlobPlausibleRecord = True
+    End Function
+
+    Private Function BlobIsMarker(ByVal v As Long) As Boolean
+        BlobIsMarker = (v = BLOB_MARK_CHILDREN Or v = BLOB_MARK_ONE_CHILD Or v = BLOB_MARK_NEXT_OR_END)
+    End Function
+
+    ' Signed value of a 1/2/4-byte integer record.
+    Private Function BlobIntValue(ByRef b() As Byte, ByVal p As Long, ByVal byteLen As Long, ByRef outOk As Boolean) As Long
+        Dim v As Long
+
+        outOk = True
+        v = 0
+        Select Case byteLen
+            Case 1
+                v = CLng(b(p))
+            Case 2
+                v = CLng(b(p)) Or (CLng(b(p + 1)) * 256&)
+                If (v And &H8000&) <> 0 Then v = v - &H10000&
+            Case 4
+                v = CLng(b(p)) Or (CLng(b(p + 1)) * 256&) Or (CLng(b(p + 2)) * 65536&) Or ((CLng(b(p + 3)) And &H7F&) * 16777216&)
+                If (CLng(b(p + 3)) And &H80&) <> 0 Then v = v - 2147483647 - 1
+            Case Else
+                outOk = False
+        End Select
+        BlobIntValue = v
+    End Function
+
+    Private Function BlobTextValue(ByRef b() As Byte, ByVal p As Long, ByVal byteLen As Long) As String
+        Dim k As Long
+        Dim s As String
+
+        s = vbNullString
+        For k = 0 To (byteLen \ 2) - 1
+            s = s & ChrW$(CLng(b(p + 2 * k)) Or (CLng(b(p + 2 * k + 1)) * 256&))
+        Next k
+        BlobTextValue = s
+    End Function
+
+    ' Stores one record of the current object in its scratch slot.
+    Private Sub BlobApplyRecord(ByRef scr As BlobObjScratch, ByRef b() As Byte, ByVal p As Long, ByVal propId As Long, ByVal dataType As Long, ByVal byteLen As Long)
+        Dim slot As Long
+        Dim slotKind As Long
+        Dim v As Long
+        Dim ok As Boolean
+
+        slot = BlobPropSlot(propId, slotKind)
+        If slot < 0 Then Exit Sub
+        Select Case slotKind
+            Case SLOT_KIND_TEXT
+                If dataType = 10 Or dataType = 12 Then
+                    scr.TextVal(slot) = BlobTextValue(b, p, byteLen)
+                    scr.Has(slot) = True
+                End If
+            Case SLOT_KIND_BOOL
+                If dataType = 1 Then
+                    ' Zero length = "NotDefault" flag; every Bool read here defaults to True.
+                    If byteLen = 0 Then
+                        scr.IntVal(slot) = 0
+                    ElseIf b(p) <> 0 Then
+                        scr.IntVal(slot) = 1
+                    Else
+                        scr.IntVal(slot) = 0
+                    End If
+                    scr.Has(slot) = True
+                End If
+            Case SLOT_KIND_INT
+                If dataType >= 2 And dataType <= 4 Then
+                    v = BlobIntValue(b, p, byteLen, ok)
+                    If ok Then
+                        scr.IntVal(slot) = v
+                        scr.Has(slot) = True
+                    End If
+                End If
+        End Select
+    End Sub
+
+    ' Access ControlType constant -> type name ("" when not a control type).
+    Private Function AccessControlTypeName(ByVal code As Long) As String
+        Select Case code
+            Case 100: AccessControlTypeName = "Label"
+            Case 101: AccessControlTypeName = "Rectangle"
+            Case 102: AccessControlTypeName = "Line"
+            Case 103: AccessControlTypeName = "Image"
+            Case 104: AccessControlTypeName = "CommandButton"
+            Case 105: AccessControlTypeName = "OptionButton"
+            Case 106: AccessControlTypeName = "CheckBox"
+            Case 107: AccessControlTypeName = "OptionGroup"
+            Case 108: AccessControlTypeName = "BoundObjectFrame"
+            Case 109: AccessControlTypeName = "TextBox"
+            Case 110: AccessControlTypeName = "ListBox"
+            Case 111: AccessControlTypeName = "ComboBox"
+            Case 112: AccessControlTypeName = "Subform"
+            Case 114: AccessControlTypeName = "ObjectFrame"
+            Case 118: AccessControlTypeName = "PageBreak"
+            Case 119: AccessControlTypeName = "CustomControl"
+            Case 122: AccessControlTypeName = "ToggleButton"
+            Case 123: AccessControlTypeName = "TabCtl"
+            Case 124: AccessControlTypeName = "Page"
+            Case 126: AccessControlTypeName = "Attachment"
+            Case 127: AccessControlTypeName = "EmptyCell"
+            Case 128: AccessControlTypeName = "WebBrowser"
+            Case 129: AccessControlTypeName = "NavigationControl"
+            Case 130: AccessControlTypeName = "NavigationButton"
+            Case 131: AccessControlTypeName = "Chart"
+            Case 132: AccessControlTypeName = "Edge"
+            Case Else: AccessControlTypeName = vbNullString
+        End Select
+    End Function
+
+    ' Blob section object type -> section index (-1 = not a section).
+    ' &H98/&H99/&H9A confirmed by the oracle; &H9B/&H9C (page header/footer) assumed.
+    Private Function BlobSectionIndex(ByVal typeCode As Long) As Long
+        Select Case typeCode
+            Case &H98&: BlobSectionIndex = 0
+            Case &H99&: BlobSectionIndex = 1
+            Case &H9A&: BlobSectionIndex = 2
+            Case &H9B&: BlobSectionIndex = 3
+            Case &H9C&: BlobSectionIndex = 4
+            Case Else: BlobSectionIndex = -1
+        End Select
+    End Function
+
+    Private Function InferBlobControlType(ByRef scr As BlobObjScratch) As String
+        If scr.Has(SLOT_SOURCE_OBJECT) And Len(scr.TextVal(SLOT_SOURCE_OBJECT)) > 0 Then
+            InferBlobControlType = "Subform"
+        ElseIf Len(scr.TextVal(SLOT_ROW_SOURCE)) > 0 And Len(scr.TextVal(SLOT_COLUMN_WIDTHS)) > 0 Then
+            InferBlobControlType = "ComboBox"
+        ElseIf Len(scr.TextVal(SLOT_ON_CLICK)) > 0 And Len(scr.TextVal(SLOT_CAPTION)) > 0 And Len(scr.TextVal(SLOT_CONTROL_SOURCE)) = 0 Then
+            InferBlobControlType = "CommandButton"
+        ElseIf Len(scr.TextVal(SLOT_CONTROL_SOURCE)) > 0 Then
+            InferBlobControlType = "TextBox"
+        ElseIf Len(scr.TextVal(SLOT_CAPTION)) > 0 Then
+            InferBlobControlType = "Label"
+        Else
+            InferBlobControlType = "Unknown"
+        End If
+    End Function
+
+    Private Sub AppendDefaulted(ByRef listText As String, ByVal propName As String)
+        If Len(listText) > 0 Then listText = listText & ","
+        listText = listText & propName
+    End Sub
+
+    ' Geometry: own record -> LayoutCached rectangle -> type template -> Access default (flagged).
+    Private Function BlobGeometry(ByRef scr As BlobObjScratch, ByRef tpl As BlobObjScratch, ByVal hasTpl As Boolean, ByVal slot As Long, ByVal cachedSlot As Long, ByVal baseSlot As Long, ByVal typeDefault As Long, ByRef defaultedList As String, ByVal propName As String) As Long
+        If scr.Has(slot) Then
+            BlobGeometry = scr.IntVal(slot)
+            Exit Function
+        End If
+        If scr.Has(cachedSlot) Then
+            If baseSlot < 0 Then
+                BlobGeometry = scr.IntVal(cachedSlot)
+                Exit Function
+            End If
+            If scr.Has(baseSlot) Then
+                BlobGeometry = scr.IntVal(cachedSlot) - scr.IntVal(baseSlot)
+                Exit Function
+            End If
+        End If
+        If hasTpl Then
+            If tpl.Has(slot) Then
+                BlobGeometry = tpl.IntVal(slot)
+                Exit Function
+            End If
+        End If
+        AppendDefaulted defaultedList, propName
+        BlobGeometry = typeDefault
+    End Function
+
+    ' Integer style property: own record -> type template -> Access default (flagged).
+    Private Function BlobPickInt(ByRef scr As BlobObjScratch, ByRef tpl As BlobObjScratch, ByVal hasTpl As Boolean, ByVal slot As Long, ByVal fallback As Long, ByRef defaultedList As String, ByVal propName As String) As Long
+        If scr.Has(slot) Then
+            BlobPickInt = scr.IntVal(slot)
+            Exit Function
+        End If
+        If hasTpl Then
+            If tpl.Has(slot) Then
+                BlobPickInt = tpl.IntVal(slot)
+                Exit Function
+            End If
+        End If
+        AppendDefaulted defaultedList, propName
+        BlobPickInt = fallback
+    End Function
+
+    Private Function BlobPickText(ByRef scr As BlobObjScratch, ByRef tpl As BlobObjScratch, ByVal hasTpl As Boolean, ByVal slot As Long, ByVal fallback As String, ByRef defaultedList As String, ByVal propName As String) As String
+        If scr.Has(slot) Then
+            BlobPickText = scr.TextVal(slot)
+            Exit Function
+        End If
+        If hasTpl Then
+            If tpl.Has(slot) Then
+                BlobPickText = tpl.TextVal(slot)
+                Exit Function
+            End If
+        End If
+        AppendDefaulted defaultedList, propName
+        BlobPickText = fallback
+    End Function
+
+    ' Access default size (twips) of a control type with no size record.
+    Private Function BlobDefaultSize(ByVal ctlType As String, ByVal captionText As String, ByVal wantWidth As Boolean) As Long
+        Dim w As Long
+        Dim h As Long
+        Dim chars As Long
+
+        h = 315
+        Select Case ctlType
+            Case "TextBox", "ComboBox": w = 1440
+            Case "ListBox": w = 1440: h = 1440
+            Case "CommandButton": w = 1440: h = 360
+            Case "CheckBox", "OptionButton": w = 260: h = 240
+            Case "Subform": w = 4320: h = 2880
+            Case Else
+                chars = Len(captionText)
+                If chars < 1 Then chars = 1
+                w = chars * 120 + 60
+        End Select
+        If wantWidth Then
+            BlobDefaultSize = w
+        Else
+            BlobDefaultSize = h
+        End If
+    End Function
+
+    Private Sub BlobStartChild(ByRef scr As BlobObjScratch, ByVal typeCode As Long, ByVal parentKind As Long, ByVal parentSection As Long, ByVal parentName As String)
+        Dim emptyScr As BlobObjScratch
+        Dim secIdx As Long
+
+        scr = emptyScr
+        scr.TypeCode = typeCode
+        secIdx = BlobSectionIndex(typeCode)
+        If secIdx >= 0 Then
+            scr.Kind = BLOB_KIND_SECTION
+            scr.SectionIdx = secIdx
+            scr.ParentName = vbNullString
+        ElseIf parentKind = BLOB_KIND_ROOT Then
+            scr.Kind = BLOB_KIND_TEMPLATE
+            scr.SectionIdx = parentSection
+            scr.ParentName = vbNullString
+        Else
+            scr.Kind = BLOB_KIND_CONTROL
+            scr.SectionIdx = parentSection
+            If parentKind = BLOB_KIND_CONTROL Then
+                scr.ParentName = parentName
+            Else
+                scr.ParentName = vbNullString
+            End If
+        End If
+    End Sub
+
+    Private Function HasArabicUnicode(ByVal s As String) As Boolean
+        Dim i As Long
+        Dim ch As Long
+        For i = 1 To Len(s)
+            ch = AscW(Mid$(s, i, 1))
+            If ch >= &H600& And ch <= &H6FF& Then
+                HasArabicUnicode = True
+                Exit Function
+            End If
+        Next i
+        HasArabicUnicode = False
+    End Function
+
+    ' Writes a completed scratch object into the layout.
+    Private Sub BlobFinalizeObject(ByRef scr As BlobObjScratch, ByRef outLayout As NativeFormLayout, ByRef templates() As BlobObjScratch, ByRef tplPresent() As Boolean, ByRef tiNames() As String, ByRef tiTypes() As String, ByVal tiCount As Long)
+        Dim ctl As NativeControlDef
+        Dim tpl As BlobObjScratch
+        Dim hasTpl As Boolean
+        Dim ctlName As String
+        Dim ctlType As String
+        Dim defaultedList As String
+        Dim k As Long
+        Dim idx As Long
+
+        Select Case scr.Kind
+            Case BLOB_KIND_ROOT
+                If scr.Has(SLOT_RECORD_SOURCE) Then outLayout.RecordSource = scr.TextVal(SLOT_RECORD_SOURCE)
+                If scr.Has(SLOT_RIGHT_TO_LEFT) Then outLayout.RightToLeft = (scr.IntVal(SLOT_RIGHT_TO_LEFT) <> 0)
+                If scr.Has(SLOT_DEFAULT_VIEW) Then
+                    outLayout.DefaultView = scr.IntVal(SLOT_DEFAULT_VIEW)
+                Else
+                    outLayout.DefaultView = BLOB_DEFAULT_VIEW
+                    AppendDefaulted m_blobFormDefaulted, "DefaultView"
+                End If
+                If scr.Has(SLOT_RECORD_SELECTORS) Then outLayout.RecordSelectors = (scr.IntVal(SLOT_RECORD_SELECTORS) <> 0)
+                If scr.Has(SLOT_NAVIGATION_BUTTONS) Then outLayout.NavigationButtons = (scr.IntVal(SLOT_NAVIGATION_BUTTONS) <> 0)
+                If scr.Has(SLOT_ALLOW_ADDITIONS) Then outLayout.AllowAdditions = (scr.IntVal(SLOT_ALLOW_ADDITIONS) <> 0)
+                If scr.Has(SLOT_WIDTH) Then outLayout.FormWidthTw = scr.IntVal(SLOT_WIDTH)
+                Exit Sub
+
+            Case BLOB_KIND_SECTION
+                idx = scr.SectionIdx
+                If idx < 0 Or idx > 4 Then Exit Sub
+                outLayout.SectionPresent(idx) = True
+                If scr.Has(SLOT_HEIGHT) Then outLayout.SectionHeightTw(idx) = scr.IntVal(SLOT_HEIGHT)
+                If scr.Has(SLOT_BACK_COLOR) Then
+                    outLayout.SectionBackColor(idx) = scr.IntVal(SLOT_BACK_COLOR)
+                Else
+                    outLayout.SectionBackColor(idx) = BLOB_DEFAULT_BACK_COLOR
+                End If
+                Exit Sub
+        End Select
+
+        ctlName = vbNullString
+        If scr.Has(SLOT_NAME) Then ctlName = scr.TextVal(SLOT_NAME)
+        If Len(ctlName) = 0 Then
+            ' Unnamed children of the form object hold per-type default properties.
+            If scr.Kind = BLOB_KIND_TEMPLATE And scr.TypeCode >= 0 And scr.TypeCode <= 255 Then
+                templates(scr.TypeCode) = scr
+                tplPresent(scr.TypeCode) = True
+            End If
+            Exit Sub
+        End If
+        If outLayout.CtlCount >= BLOB_MAX_CONTROLS Then Exit Sub
+
+        hasTpl = False
+        If scr.TypeCode >= 0 And scr.TypeCode <= 255 Then
+            If tplPresent(scr.TypeCode) Then
+                tpl = templates(scr.TypeCode)
+                hasTpl = True
+            End If
+        End If
+
+        ' Control type: TypeInfo catalog by name, then Blob object type, then inference.
+        ctlType = vbNullString
+        For k = 0 To tiCount - 1
+            If UCase$(Trim$(tiNames(k))) = UCase$(Trim$(ctlName)) Then
+                ctlType = tiTypes(k)
+                Exit For
+            End If
+        Next k
+        If Len(ctlType) = 0 Then ctlType = AccessControlTypeName(scr.TypeCode)
+        If Len(ctlType) = 0 Then ctlType = InferBlobControlType(scr)
+
+        defaultedList = vbNullString
+        ctl.CtlType = ctlType
+        ctl.CtlName = ctlName
+        ctl.Section = scr.SectionIdx
+        ctl.Caption = scr.TextVal(SLOT_CAPTION)
+        ctl.LeftTw = BlobGeometry(scr, tpl, hasTpl, SLOT_LEFT, SLOT_CACHED_LEFT, -1, 0, defaultedList, "Left")
+        ctl.TopTw = BlobGeometry(scr, tpl, hasTpl, SLOT_TOP, SLOT_CACHED_TOP, -1, 0, defaultedList, "Top")
+        ctl.WidthTw = BlobGeometry(scr, tpl, hasTpl, SLOT_WIDTH, SLOT_CACHED_RIGHT, SLOT_CACHED_LEFT, BlobDefaultSize(ctlType, ctl.Caption, True), defaultedList, "Width")
+        ctl.HeightTw = BlobGeometry(scr, tpl, hasTpl, SLOT_HEIGHT, SLOT_CACHED_BOTTOM, SLOT_CACHED_TOP, BlobDefaultSize(ctlType, ctl.Caption, False), defaultedList, "Height")
+        ctl.ControlSource = scr.TextVal(SLOT_CONTROL_SOURCE)
+        ctl.RowSource = scr.TextVal(SLOT_ROW_SOURCE)
+        If scr.Has(SLOT_BOUND_COLUMN) Then
+            ctl.BoundColumn = scr.IntVal(SLOT_BOUND_COLUMN) + 1
+        Else
+            ctl.BoundColumn = 1
+        End If
+        ctl.ColumnWidths = scr.TextVal(SLOT_COLUMN_WIDTHS)
+        If scr.Has(SLOT_COLUMN_COUNT) Then
+            ctl.ColumnCount = scr.IntVal(SLOT_COLUMN_COUNT)
+        Else
+            ctl.ColumnCount = 1
+        End If
+        ctl.SourceObject = scr.TextVal(SLOT_SOURCE_OBJECT)
+        ctl.LinkMaster = scr.TextVal(SLOT_LINK_MASTER)
+        ctl.LinkChild = scr.TextVal(SLOT_LINK_CHILD)
+        ctl.OnClick = scr.TextVal(SLOT_ON_CLICK)
+        If ctlType = "Label" Then
+            ctl.ParentLabelOf = scr.ParentName
+        Else
+            ctl.ParentLabelOf = vbNullString
+        End If
+        ctl.BackColor = BlobPickInt(scr, tpl, hasTpl, SLOT_BACK_COLOR, BLOB_DEFAULT_BACK_COLOR, defaultedList, "BackColor")
+        ctl.ForeColor = BlobPickInt(scr, tpl, hasTpl, SLOT_FORE_COLOR, 0, defaultedList, "ForeColor")
+        ctl.FontName = BlobPickText(scr, tpl, hasTpl, SLOT_FONT_NAME, "Calibri", defaultedList, "FontName")
+        ctl.FontSize = BlobPickInt(scr, tpl, hasTpl, SLOT_FONT_SIZE, 11, defaultedList, "FontSize")
+        ctl.FontBold = (BlobPickInt(scr, tpl, hasTpl, SLOT_FONT_WEIGHT, 400, defaultedList, "FontWeight") >= 700)
+        ctl.Visible = True
+        If HasArabicUnicode(ctl.Caption) Then
+            outLayout.RightToLeft = True
+            ctl.RightToLeft = True
+        End If
+
+        idx = outLayout.CtlCount
+        ReDim Preserve outLayout.Ctls(0 To idx)
+        outLayout.Ctls(idx) = ctl
+        outLayout.CtlCount = idx + 1
+        ReDim Preserve m_blobDefaulted(0 To idx)
+        m_blobDefaulted(idx) = defaultedList
+        m_blobDefaultedCount = idx + 1
+    End Sub
+
+    ' Tier 1 parser. Fills outLayout from a form Blob; TypeInfo (may be empty)
+    ' supplies control types by name. Never reads outside the stream: an
+    ' implausible record (byteLen past the end, unknown dataType) is skipped one
+    ' byte at a time until the next plausible record or marker.
+    ' Returns True when at least one section or control was found.
+    Public Function ParseFormBlobProperties(ByRef blobBytes() As Byte, ByRef typeInfoBytes() As Byte, ByRef outLayout As NativeFormLayout, Optional ByVal db As Object = Nothing) As Boolean
+        Dim n As Long
+        Dim maxIdx As Long
+        Dim p As Long
+        Dim v As Long
+        Dim cnt As Long
+        Dim t As Long
+        Dim propId As Long
+        Dim dataType As Long
+        Dim byteLen As Long
+        Dim scr As BlobObjScratch
+        Dim templates(0 To 255) As BlobObjScratch
+        Dim tplPresent(0 To 255) As Boolean
+        Dim stkKind(0 To 31) As Long
+        Dim stkRemain(0 To 31) As Long
+        Dim stkSection(0 To 31) As Long
+        Dim stkName(0 To 31) As String
+        Dim depth As Long
+        Dim openObj As Boolean
+        Dim doneWalk As Boolean
+        Dim tiNames() As String
+        Dim tiTypes() As String
+        Dim tiCount As Long
+        Dim tiMax As Long
+        Dim tiPos As Long
+        Dim tiCode As Long
+        Dim tiName As String
+        Dim tiType As String
+        Dim k As Long
+        Dim emptyDefaults() As String
+        Dim sp As Long
+        Dim spPropId As Long
+        Dim spDataType As Long
+        Dim spByteLen As Long
+        Dim spName As String
+        Dim spType As String
+        Dim spExists As Boolean
+        Dim spIdx As Long
+        Dim newCtlDef As NativeControlDef
+        Dim emptyCtlDef As NativeControlDef
+        Dim sweepBlobStrings As Collection
+        Dim swItem As Variant
+        Dim swCand As String
+
+        ParseFormBlobProperties = False
+        m_blobDefaulted = emptyDefaults
+        m_blobDefaultedCount = 0
+        m_blobFormDefaulted = vbNullString
+        For k = 0 To 4
+            outLayout.SectionBackColor(k) = BLOB_DEFAULT_BACK_COLOR
+        Next k
+
+        On Error Resume Next
+        maxIdx = -1
+        maxIdx = UBound(blobBytes)
+        If Err.Number <> 0 Then maxIdx = -1
+        Err.Clear
+        tiMax = -1
+        tiMax = UBound(typeInfoBytes)
+        If Err.Number <> 0 Then tiMax = -1
+        Err.Clear
+        On Error GoTo 0
+
+        n = maxIdx + 1
+        If n < 10 Then Exit Function
+
+        ' TypeInfo catalog (same walk as InspectNativeAccessForm); the low byte of
+        ' the type code is the Access ControlType (&H126D TextBox, &H136F ComboBox,
+        ' &H0B68 CommandButton, &H0C64/&H0D64 Label, &H106E ListBox, &H066A CheckBox,
+        ' &H1470 Subform - confirmed by the oracle). Sections (&H1898..) and the
+        ' &H1EFF field-name entries map to "" and are ignored.
+        tiCount = 0
+        If tiMax >= 40 Then
+            ReDim tiNames(0 To 63)
+            ReDim tiTypes(0 To 63)
+            tiPos = 32
+            Do While (tiPos + 8) <= tiMax
+                tiCode = CLng(typeInfoBytes(tiPos)) Or (CLng(typeInfoBytes(tiPos + 1)) * 256&)
+                tiPos = tiPos + 8
+                tiName = vbNullString
+                Do While tiPos <= tiMax
+                    If typeInfoBytes(tiPos) = 0 Then
+                        tiPos = tiPos + 1
+                        Exit Do
+                    End If
+                    tiName = tiName & Chr$(typeInfoBytes(tiPos))
+                    tiPos = tiPos + 1
+                Loop
+                tiPos = tiPos + 1
+                tiType = AccessControlTypeName(tiCode And &HFF&)
+                If Len(tiName) > 0 And Len(tiType) > 0 Then
+                    If tiCount > UBound(tiNames) Then
+                        ReDim Preserve tiNames(0 To tiCount * 2)
+                        ReDim Preserve tiTypes(0 To tiCount * 2)
+                    End If
+                    tiNames(tiCount) = tiName
+                    tiTypes(tiCount) = tiType
+                    tiCount = tiCount + 1
+                End If
+            Loop
+        End If
+
+        scr.TypeCode = BlobU16(blobBytes, 8)
+        scr.Kind = BLOB_KIND_ROOT
+        scr.SectionIdx = 0
+        depth = 0
+        openObj = True
+        doneWalk = False
+        p = 10
+
+        Do While (p + 4) <= n And Not doneWalk
+            If BlobPlausibleRecord(blobBytes, p, n) Then
+                propId = BlobU16(blobBytes, p + 4)
+                dataType = BlobU32(blobBytes, p + 6)
+                byteLen = BlobU32(blobBytes, p + 14)
+                BlobApplyRecord scr, blobBytes, p + BLOB_RECORD_HEADER, propId, dataType, byteLen
+                p = p + BLOB_RECORD_HEADER + byteLen
+
+            Else
+                v = BlobU32(blobBytes, p)
+
+                If v = BLOB_MARK_CHILDREN And (p + 8) <= n And depth < BLOB_MAX_DEPTH Then
+                    cnt = BlobU16(blobBytes, p + 4)
+                    t = BlobU16(blobBytes, p + 6)
+                    BlobFinalizeObject scr, outLayout, templates, tplPresent, tiNames, tiTypes, tiCount
+                    stkKind(depth) = scr.Kind
+                    stkRemain(depth) = cnt
+                    stkSection(depth) = scr.SectionIdx
+                    stkName(depth) = scr.TextVal(SLOT_NAME)
+                    depth = depth + 1
+                    BlobStartChild scr, t, stkKind(depth - 1), stkSection(depth - 1), stkName(depth - 1)
+                    p = p + 8
+
+                ElseIf v = BLOB_MARK_ONE_CHILD And (p + 6) <= n And depth < BLOB_MAX_DEPTH Then
+                    t = BlobU16(blobBytes, p + 4)
+                    BlobFinalizeObject scr, outLayout, templates, tplPresent, tiNames, tiTypes, tiCount
+                    stkKind(depth) = scr.Kind
+                    stkRemain(depth) = 1
+                    stkSection(depth) = scr.SectionIdx
+                    stkName(depth) = scr.TextVal(SLOT_NAME)
+                    depth = depth + 1
+                    BlobStartChild scr, t, stkKind(depth - 1), stkSection(depth - 1), stkName(depth - 1)
+                    p = p + 6
+
+                ElseIf v = BLOB_MARK_NEXT_OR_END Then
+                    BlobFinalizeObject scr, outLayout, templates, tplPresent, tiNames, tiTypes, tiCount
+                    openObj = False
+                    p = p + 4
+                    Do While depth > 0
+                        stkRemain(depth - 1) = stkRemain(depth - 1) - 1
+                        If stkRemain(depth - 1) > 0 Then
+                            If (p + 2) > n Then
+                                depth = 0       ' sibling type expected at end of stream
+                                Exit Do
+                            End If
+                            t = BlobU16(blobBytes, p)
+                            BlobStartChild scr, t, stkKind(depth - 1), stkSection(depth - 1), stkName(depth - 1)
+                            openObj = True
+                            p = p + 2
+                            Exit Do
+                        End If
+                        depth = depth - 1
+                    Loop
+                    If depth = 0 And Not openObj Then doneWalk = True
+
+                Else
+                    ' Resynchronize on the next plausible record or marker.
+                    p = p + 1
+                    Do While (p + 4) <= n
+                        If BlobPlausibleRecord(blobBytes, p, n) Then Exit Do
+                        v = BlobU32(blobBytes, p)
+                        If BlobIsMarker(v) Then Exit Do
+                        p = p + 1
+                    Loop
+                End If
+            End If
+        Loop
+
+        ' Truncated stream: keep what was read for the open object.
+        If openObj Then
+            BlobFinalizeObject scr, outLayout, templates, tplPresent, tiNames, tiTypes, tiCount
+        End If
+
+        ' Post-Walk Full-Stream Sweep (Phase 3.1)
+        ' 1. Linear scan across blobBytes to capture PID_RECORD_SOURCE (&H9C) and any missed PID_NAME (&H14) controls
+
+        If n >= BLOB_RECORD_HEADER Then
+            For sp = 0 To n - BLOB_RECORD_HEADER
+                If BlobPlausibleRecord(blobBytes, sp, n) Then
+                    spPropId = BlobU16(blobBytes, sp + 4)
+                    spDataType = BlobU32(blobBytes, sp + 6)
+                    spByteLen = BlobU32(blobBytes, sp + 14)
+                    If spPropId = &H9C& Then
+                        ' PID_RECORD_SOURCE
+                        If Len(Trim$(outLayout.RecordSource)) = 0 And (spDataType = 10 Or spDataType = 12) And spByteLen > 0 Then
+                            outLayout.RecordSource = Trim$(BlobTextValue(blobBytes, sp + BLOB_RECORD_HEADER, spByteLen))
+                        End If
+                    ElseIf spPropId = &H14& Then
+                        ' PID_NAME
+                        If (spDataType = 10 Or spDataType = 12) And spByteLen > 0 Then
+                            spName = Trim$(BlobTextValue(blobBytes, sp + BLOB_RECORD_HEADER, spByteLen))
+                            If Len(spName) > 0 And spName <> "Detail" And spName <> "FormHeader" And spName <> "FormFooter" And spName <> "PageHeader" And spName <> "PageFooter" Then
+                                spExists = False
+                                For spIdx = 0 To outLayout.CtlCount - 1
+                                    If StrComp(outLayout.Ctls(spIdx).CtlName, spName, vbTextCompare) = 0 Then
+                                        spExists = True
+                                        Exit For
+                                    End If
+                                Next spIdx
+                                If Not spExists And outLayout.CtlCount < BLOB_MAX_CONTROLS Then
+                                    spType = vbNullString
+                                    For spIdx = 0 To tiCount - 1
+                                        If StrComp(tiNames(spIdx), spName, vbTextCompare) = 0 Then
+                                            spType = tiTypes(spIdx)
+                                            Exit For
+                                        End If
+                                    Next spIdx
+                                    If Len(spType) = 0 Then spType = "TextBox"
+                                    If outLayout.CtlCount = 0 Then
+                                        ReDim outLayout.Ctls(0 To 63)
+                                    ElseIf outLayout.CtlCount > UBound(outLayout.Ctls) Then
+                                        ReDim Preserve outLayout.Ctls(0 To outLayout.CtlCount * 2)
+                                    End If
+                                    newCtlDef = emptyCtlDef
+                                    newCtlDef.CtlName = spName
+                                    newCtlDef.CtlType = spType
+                                    newCtlDef.Section = 0
+                                    newCtlDef.Visible = True
+                                    newCtlDef.LeftTw = 300
+                                    newCtlDef.TopTw = 300 + (outLayout.CtlCount * 300)
+                                    newCtlDef.WidthTw = BlobDefaultSize(spType, spName, True)
+                                    newCtlDef.HeightTw = BlobDefaultSize(spType, spName, False)
+                                    outLayout.Ctls(outLayout.CtlCount) = newCtlDef
+                                    outLayout.CtlCount = outLayout.CtlCount + 1
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            Next sp
+        End If
+
+        ' 2. Merge any remaining TypeInfo controls not yet in outLayout.Ctls
+        For spIdx = 0 To tiCount - 1
+            spName = Trim$(tiNames(spIdx))
+            If Len(spName) > 0 And spName <> "Detail" And spName <> "FormHeader" And spName <> "FormFooter" And spName <> "PageHeader" And spName <> "PageFooter" Then
+                spExists = False
+                For k = 0 To outLayout.CtlCount - 1
+                    If StrComp(outLayout.Ctls(k).CtlName, spName, vbTextCompare) = 0 Then
+                        spExists = True
+                        Exit For
+                    End If
+                Next k
+                If Not spExists And outLayout.CtlCount < BLOB_MAX_CONTROLS Then
+                    If outLayout.CtlCount = 0 Then
+                        ReDim outLayout.Ctls(0 To 63)
+                    ElseIf outLayout.CtlCount > UBound(outLayout.Ctls) Then
+                        ReDim Preserve outLayout.Ctls(0 To outLayout.CtlCount * 2)
+                    End If
+                    newCtlDef = emptyCtlDef
+                    newCtlDef.CtlName = spName
+                    newCtlDef.CtlType = tiTypes(spIdx)
+                    If Len(newCtlDef.CtlType) = 0 Then newCtlDef.CtlType = "TextBox"
+                    newCtlDef.Section = 0
+                    newCtlDef.Visible = True
+                    newCtlDef.LeftTw = 300
+                    newCtlDef.TopTw = 300 + (outLayout.CtlCount * 300)
+                    newCtlDef.WidthTw = BlobDefaultSize(newCtlDef.CtlType, spName, True)
+                    newCtlDef.HeightTw = BlobDefaultSize(newCtlDef.CtlType, spName, False)
+                    outLayout.Ctls(outLayout.CtlCount) = newCtlDef
+                    outLayout.CtlCount = outLayout.CtlCount + 1
+                End If
+            End If
+        Next spIdx
+
+        ' 3. Fallback extraction of RecordSource from Blob strings if still empty
+        If Len(Trim$(outLayout.RecordSource)) = 0 Then
+            Set sweepBlobStrings = ExtractUtf16StringsFromBlob(blobBytes)
+            If Not sweepBlobStrings Is Nothing Then
+                For Each swItem In sweepBlobStrings
+                    swCand = Trim$(CStr(swItem))
+                    If Len(swCand) > 0 Then
+                        If UCase$(Left$(swCand, 7)) = "SELECT " Or (Not db Is Nothing And DatabaseHasTableOrQuery(db, swCand)) Then
+                            outLayout.RecordSource = swCand
+                            Exit For
+                        End If
+                    End If
+                Next swItem
+            End If
+        End If
+
+        If Not outLayout.SectionPresent(0) Then
+            For k = 0 To outLayout.CtlCount - 1
+                If outLayout.Ctls(k).Section = 0 Then
+                    outLayout.SectionPresent(0) = True
+                    Exit For
+                End If
+            Next k
+        End If
+
+        For k = 0 To 4
+            If outLayout.SectionPresent(k) Then ParseFormBlobProperties = True
+        Next k
+        If outLayout.CtlCount > 0 Then ParseFormBlobProperties = True
+    End Function
+
+    ' =====================================================================
+    ' SaveAsText text parser (pure text parsing, no Access process). Used for
+    ' exported .txt form files; Python mirror of the parser:
+    ' tools/studio_render_model.py parse_saveastext_layout.
+    ' =====================================================================
+
+    ' Opens a form's RecordSource as the active recordset (task 7.1).
+    ' Table and saved query names go through OpenTable, so m_activeRecordset,
+    ' navigation and CRUD behave exactly as for a table opened from the
+    ' Navigation Pane. SQL sources (SELECT / TRANSFORM / PARAMETERS) run the
+    ' same way ExecuteSqlQuery does, but m_activeTableName keeps the
+    ' RecordSource text instead of "SQL Query Result".
+    ' An empty RecordSource is an unbound form: the active recordset is closed
+    ' and the function returns True with no recordset.
+
+Public Function ReadSaveAsTextFile(ByVal filePath As String, ByRef outErrorMsg As String) As String
+        Dim fileNum As Integer
+        Dim byteCount As Long
+        Dim buf() As Byte
+
+        ReadSaveAsTextFile = vbNullString
+        outErrorMsg = vbNullString
+        On Error Resume Next
+        fileNum = FreeFile()
+        Open filePath For Binary Access Read Shared As #fileNum
+        If Err.Number <> 0 Then
+            outErrorMsg = Err.Description
+            Err.Clear
+            On Error GoTo 0
+            Exit Function
+        End If
+        byteCount = LOF(fileNum)
+        If byteCount > 0 Then
+            ReDim buf(0 To byteCount - 1)
+            Get #fileNum, 1, buf
+        End If
+        Close #fileNum
+        If Err.Number <> 0 Then
+            outErrorMsg = Err.Description
+            Err.Clear
+            On Error GoTo 0
+            Exit Function
+        End If
+        On Error GoTo 0
+        If byteCount <= 0 Then
+            outErrorMsg = "empty file"
+            Exit Function
+        End If
+        ReadSaveAsTextFile = DecodeSaveAsTextBytes(buf)
+    End Function
+
+    ' UTF-16LE when the bytes start with the FF FE BOM, else ANSI.
+    Public Function DecodeSaveAsTextBytes(ByRef raw() As Byte) As String
+        Dim maxIdx As Long
+        Dim n As Long
+        Dim k As Long
+        Dim tail() As Byte
+
+        DecodeSaveAsTextBytes = vbNullString
+        On Error Resume Next
+        maxIdx = -1
+        maxIdx = UBound(raw)
+        If Err.Number <> 0 Then maxIdx = -1
+        Err.Clear
+        On Error GoTo 0
+        n = maxIdx + 1
+        If n <= 0 Then Exit Function
+
+        If n >= 2 Then
+            If raw(0) = &HFF& And raw(1) = &HFE& Then
+                n = ((n - 2) \ 2) * 2
+                If n <= 0 Then Exit Function
+                ReDim tail(0 To n - 1)
+                For k = 0 To n - 1
+                    tail(k) = raw(k + 2)
+                Next k
+                DecodeSaveAsTextBytes = tail
+                Exit Function
+            End If
+        End If
+        DecodeSaveAsTextBytes = StrConv(raw, vbUnicode)
+    End Function
+
+    ' Trims spaces and tabs.
+    Private Function SatTrim(ByVal s As String) As String
+        Dim a As Long
+        Dim b As Long
+        Dim ch As String
+
+        a = 1
+        b = Len(s)
+        Do While a <= b
+            ch = Mid$(s, a, 1)
+            If ch <> " " And ch <> vbTab Then Exit Do
+            a = a + 1
+        Loop
+        Do While b >= a
+            ch = Mid$(s, b, 1)
+            If ch <> " " And ch <> vbTab Then Exit Do
+            b = b - 1
+        Loop
+        If b < a Then
+            SatTrim = vbNullString
+        Else
+            SatTrim = Mid$(s, a, b - a + 1)
+        End If
+    End Function
+
+    ' SaveAsText block name -> Blob object type (sections &H98.., Access
+    ' ControlType for controls, 0 when unknown).
+    Private Function SatTypeCode(ByVal kindName As String) As Long
+        Dim code As Long
+
+        Select Case kindName
+            Case "Section": SatTypeCode = &H98&
+            Case "FormHeader": SatTypeCode = &H99&
+            Case "FormFooter": SatTypeCode = &H9A&
+            Case "PageHeader": SatTypeCode = &H9B&
+            Case "PageFooter": SatTypeCode = &H9C&
+            Case "SubForm": SatTypeCode = 112
+            Case "Tab": SatTypeCode = 123
+            Case "UnboundObjectFrame": SatTypeCode = 114
+            Case Else
+                SatTypeCode = 0
+                For code = 100 To 132
+                    If StrComp(AccessControlTypeName(code), kindName, vbBinaryCompare) = 0 Then
+                        SatTypeCode = code
+                        Exit For
+                    End If
+                Next code
+        End Select
+    End Function
+
+    ' SaveAsText key -> scratch slot (-1 = not used) and its kind.
+    Private Function SatPropSlot(ByVal keyName As String, ByRef outKind As Long) As Long
+        outKind = SLOT_KIND_INT
+        Select Case keyName
+            Case "Name": SatPropSlot = SLOT_NAME: outKind = SLOT_KIND_TEXT
+            Case "Caption": SatPropSlot = SLOT_CAPTION: outKind = SLOT_KIND_TEXT
+            Case "ControlSource": SatPropSlot = SLOT_CONTROL_SOURCE: outKind = SLOT_KIND_TEXT
+            Case "RowSource": SatPropSlot = SLOT_ROW_SOURCE: outKind = SLOT_KIND_TEXT
+            Case "ColumnWidths": SatPropSlot = SLOT_COLUMN_WIDTHS: outKind = SLOT_KIND_TEXT
+            Case "SourceObject": SatPropSlot = SLOT_SOURCE_OBJECT: outKind = SLOT_KIND_TEXT
+            Case "LinkMasterFields": SatPropSlot = SLOT_LINK_MASTER: outKind = SLOT_KIND_TEXT
+            Case "LinkChildFields": SatPropSlot = SLOT_LINK_CHILD: outKind = SLOT_KIND_TEXT
+            Case "OnClick": SatPropSlot = SLOT_ON_CLICK: outKind = SLOT_KIND_TEXT
+            Case "RecordSource": SatPropSlot = SLOT_RECORD_SOURCE: outKind = SLOT_KIND_TEXT
+            Case "FontName": SatPropSlot = SLOT_FONT_NAME: outKind = SLOT_KIND_TEXT
+            Case "Left": SatPropSlot = SLOT_LEFT
+            Case "Top": SatPropSlot = SLOT_TOP
+            Case "Width": SatPropSlot = SLOT_WIDTH
+            Case "Height": SatPropSlot = SLOT_HEIGHT
+            Case "BoundColumn": SatPropSlot = SLOT_BOUND_COLUMN: outKind = SAT_KIND_BOUND
+            Case "ColumnCount": SatPropSlot = SLOT_COLUMN_COUNT
+            Case "DefaultView": SatPropSlot = SLOT_DEFAULT_VIEW
+            Case "BackColor": SatPropSlot = SLOT_BACK_COLOR
+            Case "ForeColor": SatPropSlot = SLOT_FORE_COLOR
+            Case "FontSize": SatPropSlot = SLOT_FONT_SIZE
+            Case "FontWeight": SatPropSlot = SLOT_FONT_WEIGHT
+            Case "LayoutCachedLeft": SatPropSlot = SLOT_CACHED_LEFT
+            Case "LayoutCachedTop": SatPropSlot = SLOT_CACHED_TOP
+            Case "LayoutCachedWidth": SatPropSlot = SLOT_CACHED_RIGHT
+            Case "LayoutCachedHeight": SatPropSlot = SLOT_CACHED_BOTTOM
+            Case "RecordSelectors": SatPropSlot = SLOT_RECORD_SELECTORS: outKind = SLOT_KIND_BOOL
+            Case "NavigationButtons": SatPropSlot = SLOT_NAVIGATION_BUTTONS: outKind = SLOT_KIND_BOOL
+            Case "AllowAdditions": SatPropSlot = SLOT_ALLOW_ADDITIONS: outKind = SLOT_KIND_BOOL
+            Case "RightToLeft": SatPropSlot = SLOT_RIGHT_TO_LEFT: outKind = SLOT_KIND_BOOL
+            Case Else: SatPropSlot = -1
+        End Select
+    End Function
+
+    ' Integer value of a SaveAsText scalar ("95.0" -> 95), truncated like Fix.
+    Private Function SatParseLong(ByVal s As String, ByRef outOk As Boolean) As Long
+        Dim d As Double
+        Dim first As String
+
+        outOk = False
+        SatParseLong = 0
+        s = SatTrim(s)
+        If Len(s) = 0 Then Exit Function
+        first = Left$(s, 1)
+        If Not ((first >= "0" And first <= "9") Or first = "-" Or first = "+" Or first = ".") Then Exit Function
+        d = Val(s)
+        If d > 2147483647# Or d < -2147483648# Then Exit Function
+        SatParseLong = CLng(Fix(d))
+        outOk = True
+    End Function
+
+    ' Stores one SaveAsText property of the current object in its scratch slot.
+    Private Sub SatApplyProperty(ByRef scr As BlobObjScratch, ByVal keyName As String, ByVal valueText As String, ByVal isQuoted As Boolean)
+        Dim slot As Long
+        Dim slotKind As Long
+        Dim v As Long
+        Dim ok As Boolean
+
+        slot = SatPropSlot(keyName, slotKind)
+        If slot < 0 Then Exit Sub
+        Select Case slotKind
+            Case SLOT_KIND_TEXT
+                scr.TextVal(slot) = valueText
+                scr.Has(slot) = True
+            Case SLOT_KIND_BOOL
+                If valueText = "NotDefault" And Not isQuoted Then
+                    scr.IntVal(slot) = 0             ' every Bool read here defaults to True
+                    scr.Has(slot) = True
+                Else
+                    v = SatParseLong(valueText, ok)
+                    If ok Then
+                        If v <> 0 Then
+                            scr.IntVal(slot) = 1
+                        Else
+                            scr.IntVal(slot) = 0
+                        End If
+                        scr.Has(slot) = True
+                    End If
+                End If
+            Case Else
+                v = SatParseLong(valueText, ok)
+                If ok Then
+                    If slotKind = SAT_KIND_BOUND Then v = v - 1   ' stored zero-based like the Blob
+                    scr.IntVal(slot) = v
+                    scr.Has(slot) = True
+                End If
+        End Select
+    End Sub
+
+    ' Reads a quoted value starting after the opening quote of lines(lineIdx).
+    ' Handles \" and \\ escapes, continuation lines that start with a quote, and
+    ' values that continue on the next line (joined with vbCrLf). lineIdx is
+    ' left on the last line consumed.
+    Private Function SatReadQuoted(ByRef lines() As String, ByRef lineIdx As Long, ByVal lineCount As Long, ByVal startText As String) As String
+        Dim buf As String
+        Dim txt As String
+        Dim j As Long
+        Dim txtLen As Long
+        Dim ch As String
+        Dim nx As String
+        Dim closed As Boolean
+        Dim handled As Boolean
+
+        buf = vbNullString
+        txt = startText
+        Do
+            j = 1
+            txtLen = Len(txt)
+            closed = False
+            Do While j <= txtLen
+                ch = Mid$(txt, j, 1)
+                handled = False
+                If ch = "\" And j < txtLen Then
+                    nx = Mid$(txt, j + 1, 1)
+                    If nx = """" Or nx = "\" Then
+                        buf = buf & nx
+                        j = j + 2
+                        handled = True
+                    End If
+                End If
+                If Not handled Then
+                    If ch = """" Then
+                        closed = True
+                        Exit Do
+                    End If
+                    buf = buf & ch
+                    j = j + 1
+                End If
+            Loop
+            If closed Then
+                If lineIdx + 1 < lineCount Then
+                    If Left$(SatTrim(lines(lineIdx + 1)), 1) = """" Then
+                        lineIdx = lineIdx + 1
+                        txt = Mid$(SatTrim(lines(lineIdx)), 2)
+                    Else
+                        Exit Do
+                    End If
+                Else
+                    Exit Do
+                End If
+            Else
+                If lineIdx + 1 >= lineCount Then Exit Do
+                buf = buf & vbCrLf
+                lineIdx = lineIdx + 1
+                txt = lines(lineIdx)
+            End If
+        Loop
+        SatReadQuoted = buf
+    End Function
+
+    ' SaveAsText parser. Fills outLayout from Access SaveAsText form text. Every
+    ' object becomes a Blob scratch object and goes through BlobFinalizeObject,
+    ' so the result follows the same rules as Tier 1 (type templates,
+    ' LayoutCached geometry, Access defaults recorded in GetLastBlobLayoutDefaults).
+    ' Binary blocks (Key = Begin ... End: PrtMip, GUID, NameMap, RecSrcDt) are
+    ' skipped; parsing stops when the Form object closes (CodeBehindForm).
+    ' Returns True when at least one section or control was found.
+    Public Function ParseSaveAsTextLayout(ByVal textContent As String, ByRef outLayout As NativeFormLayout) As Boolean
+        Dim lines() As String
+        Dim lineCount As Long
+        Dim i As Long
+        Dim rawLine As String
+        Dim lineText As String
+        Dim kindName As String
+        Dim typeCode As Long
+        Dim objStack(0 To 31) As BlobObjScratch
+        Dim objDone(0 To 31) As Boolean
+        Dim objDepth As Long
+        Dim nestKind(0 To 63) As Long
+        Dim nestDepth As Long
+        Dim rootSeen As Boolean
+        Dim templates(0 To 255) As BlobObjScratch
+        Dim tplPresent(0 To 255) As Boolean
+        Dim tiNames() As String
+        Dim tiTypes() As String
+        Dim emptyDefaults() As String
+        Dim emptyScr As BlobObjScratch
+        Dim eqPos As Long
+        Dim rawEq As Long
+        Dim quotePos As Long
+        Dim keyName As String
+        Dim valText As String
+        Dim isQuoted As Boolean
+        Dim parentName As String
+        Dim k As Long
+
+        ParseSaveAsTextLayout = False
+        m_blobDefaulted = emptyDefaults
+        m_blobDefaultedCount = 0
+        m_blobFormDefaulted = vbNullString
+        For k = 0 To 4
+            outLayout.SectionBackColor(k) = BLOB_DEFAULT_BACK_COLOR
+        Next k
+
+        If Len(textContent) = 0 Then Exit Function
+        If AscW(Left$(textContent, 1)) = &HFEFF& Then textContent = Mid$(textContent, 2)
+        textContent = Replace(textContent, vbCrLf, vbLf)
+        textContent = Replace(textContent, vbCr, vbLf)
+        lines = Split(textContent, vbLf)
+        lineCount = UBound(lines) + 1
+
+        objDepth = 0
+        nestDepth = 0
+        rootSeen = False
+        i = 0
+        Do While i < lineCount
+            rawLine = lines(i)
+            lineText = SatTrim(rawLine)
+
+            If Len(lineText) > 0 Then
+                If rootSeen And nestDepth = 0 Then Exit Do
+
+                If lineText = "Begin" Then
+                    If nestDepth >= SAT_MAX_NEST_DEPTH Then Exit Do
+                    nestKind(nestDepth) = SAT_NEST_GROUP
+                    nestDepth = nestDepth + 1
+
+                ElseIf Left$(lineText, 6) = "Begin " Then
+                    If nestDepth >= SAT_MAX_NEST_DEPTH Then Exit Do
+                    kindName = SatTrim(Mid$(lineText, 7))
+                    If Not rootSeen Then
+                        If kindName = "Form" Then
+                            objStack(0) = emptyScr
+                            objStack(0).TypeCode = &H96&
+                            objStack(0).Kind = BLOB_KIND_ROOT
+                            objStack(0).SectionIdx = 0
+                            objDone(0) = False
+                            objDepth = 1
+                            rootSeen = True
+                            nestKind(nestDepth) = SAT_NEST_OBJECT
+                        Else
+                            nestKind(nestDepth) = SAT_NEST_SKIP
+                        End If
+                    ElseIf objDepth = 0 Or objDepth >= SAT_MAX_OBJ_DEPTH Then
+                        nestKind(nestDepth) = SAT_NEST_SKIP
+                    Else
+                        ' A parent's properties all precede its children.
+                        If Not objDone(objDepth - 1) Then
+                            BlobFinalizeObject objStack(objDepth - 1), outLayout, templates, tplPresent, tiNames, tiTypes, 0
+                            objDone(objDepth - 1) = True
+                        End If
+                        typeCode = SatTypeCode(kindName)
+                        parentName = objStack(objDepth - 1).TextVal(SLOT_NAME)
+                        BlobStartChild objStack(objDepth), typeCode, objStack(objDepth - 1).Kind, objStack(objDepth - 1).SectionIdx, parentName
+                        objDone(objDepth) = False
+                        objDepth = objDepth + 1
+                        nestKind(nestDepth) = SAT_NEST_OBJECT
+                    End If
+                    nestDepth = nestDepth + 1
+
+                ElseIf lineText = "End" Then
+                    If nestDepth > 0 Then
+                        nestDepth = nestDepth - 1
+                        If nestKind(nestDepth) = SAT_NEST_OBJECT And objDepth > 0 Then
+                            If Not objDone(objDepth - 1) Then
+                                BlobFinalizeObject objStack(objDepth - 1), outLayout, templates, tplPresent, tiNames, tiTypes, 0
+                                objDone(objDepth - 1) = True
+                            End If
+                            objDepth = objDepth - 1
+                        End If
+                    End If
+
+                Else
+                    eqPos = InStr(1, lineText, "=", vbBinaryCompare)
+                    If eqPos > 0 And objDepth > 0 And nestDepth > 0 Then
+                        If nestKind(nestDepth - 1) = SAT_NEST_OBJECT Then
+                            keyName = SatTrim(Left$(lineText, eqPos - 1))
+                            valText = SatTrim(Mid$(lineText, eqPos + 1))
+                            If valText = "Begin" Then
+                                ' Binary block: skip to its End line.
+                                i = i + 1
+                                Do While i < lineCount
+                                    If SatTrim(lines(i)) = "End" Then Exit Do
+                                    i = i + 1
+                                Loop
+                            Else
+                                isQuoted = (Left$(valText, 1) = """")
+                                If isQuoted Then
+                                    rawEq = InStr(1, rawLine, "=", vbBinaryCompare)
+                                    quotePos = InStr(rawEq, rawLine, """", vbBinaryCompare)
+                                    valText = SatReadQuoted(lines, i, lineCount, Mid$(rawLine, quotePos + 1))
+                                End If
+                                SatApplyProperty objStack(objDepth - 1), keyName, valText, isQuoted
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+            i = i + 1
+        Loop
+
+        ' Truncated text: keep what was read for the open objects.
+        Do While objDepth > 0
+            If Not objDone(objDepth - 1) Then
+                BlobFinalizeObject objStack(objDepth - 1), outLayout, templates, tplPresent, tiNames, tiTypes, 0
+                objDone(objDepth - 1) = True
+            End If
+            objDepth = objDepth - 1
+        Loop
+
+        If Not outLayout.SectionPresent(0) Then
+            For k = 0 To outLayout.CtlCount - 1
+                If outLayout.Ctls(k).Section = 0 Then
+                    outLayout.SectionPresent(0) = True
+                    Exit For
+                End If
+            Next k
+        End If
+
+        For k = 0 To 4
+            If outLayout.SectionPresent(k) Then ParseSaveAsTextLayout = True
+        Next k
+        If outLayout.CtlCount > 0 Then ParseSaveAsTextLayout = True
+    End Function
+
+    ' Tier 3 - TypeInfo control list stacked vertically (approximate layout).
+    ' Uses only the controls listed in the form's TypeInfo stream, in TypeInfo
+    ' order; sections (&H1898..) and &H1EFF field-name entries are skipped (their
+    ' low byte is not an Access ControlType). A Label directly followed by a
+    ' non-Label control forms one row (label left, control right); every other
+    ' entry takes a row of its own. Rows advance in 300-twip steps; ListBox and
+    ' Subform take several steps. No generic or table-derived fields are added.
+    ' Mirrored by build_typeinfo_fallback_layout in tools/studio_render_model.py.
+    Public Function BuildTypeInfoFallbackLayout(ByVal db As Object, ByVal formName As String, ByRef outLayout As NativeFormLayout, ByRef outErrorMsg As String) As Boolean
+        Dim typeBytes() As Byte
+        Dim blobBytes() As Byte
+        Dim readMsg As String
+        Dim tiMax As Long
+        Dim tiPos As Long
+        Dim tiCode As Long
+        Dim tiName As String
+        Dim tiType As String
+        Dim tiNames() As String
+        Dim tiTypes() As String
+        Dim tiCount As Long
+        Dim dup As Boolean
+        Dim i As Long
+        Dim k As Long
+        Dim topTw As Long
+        Dim ctlHeight As Long
+        Dim steps As Long
+        Dim pairCtl As Boolean
+        Dim lbl As NativeControlDef
+        Dim ctl As NativeControlDef
+        Dim emptyCtl As NativeControlDef
+
+        BuildTypeInfoFallbackLayout = False
+        outErrorMsg = vbNullString
+
+        If Not ReadNativeFormStreams(db, formName, typeBytes, blobBytes, readMsg) Then
+            outErrorMsg = readMsg
+            Exit Function
+        End If
+
+        On Error Resume Next
+        tiMax = -1
+        tiMax = UBound(typeBytes)
+        If Err.Number <> 0 Then tiMax = -1
+        Err.Clear
+        On Error GoTo 0
+
+        ' TypeInfo catalog (same walk as InspectNativeAccessForm / ParseFormBlobProperties)
+        tiCount = 0
+        If tiMax >= 40 Then
+            ReDim tiNames(0 To 63)
+            ReDim tiTypes(0 To 63)
+            tiPos = 32
+            Do While (tiPos + 8) <= tiMax
+                tiCode = CLng(typeBytes(tiPos)) Or (CLng(typeBytes(tiPos + 1)) * 256&)
+                tiPos = tiPos + 8
+                tiName = vbNullString
+                Do While tiPos <= tiMax
+                    If typeBytes(tiPos) = 0 Then
+                        tiPos = tiPos + 1
+                        Exit Do
+                    End If
+                    tiName = tiName & Chr$(typeBytes(tiPos))
+                    tiPos = tiPos + 1
+                Loop
+                tiPos = tiPos + 1
+                tiType = AccessControlTypeName(tiCode And &HFF&)
+                If Len(tiName) > 0 And Len(tiType) > 0 Then
+                    dup = False
+                    For k = 0 To tiCount - 1
+                        If StrComp(tiNames(k), tiName, vbTextCompare) = 0 Then
+                            dup = True
+                            Exit For
+                        End If
+                    Next k
+                    If Not dup Then
+                        If tiCount > UBound(tiNames) Then
+                            ReDim Preserve tiNames(0 To tiCount * 2)
+                            ReDim Preserve tiTypes(0 To tiCount * 2)
+                        End If
+                        tiNames(tiCount) = tiName
+                        tiTypes(tiCount) = tiType
+                        tiCount = tiCount + 1
+                    End If
+                End If
+            Loop
+        End If
+
+        If tiCount = 0 Then
+            outErrorMsg = "The form TypeInfo stream lists no controls."
+            Exit Function
+        End If
+
+        outLayout.DefaultView = 0
+        outLayout.SectionPresent(0) = True
+        outLayout.SectionBackColor(0) = BLOB_DEFAULT_BACK_COLOR
+        outLayout.FormWidthTw = TI_FB_CTL_LEFT + TI_FB_CTL_WIDTH + TI_FB_STEP
+        outLayout.CtlCount = 0
+        ReDim outLayout.Ctls(0 To tiCount - 1)
+
+        topTw = TI_FB_STEP
+        i = 0
+        Do While i < tiCount
+            ctl = emptyCtl
+            ctl.Section = 0
+            ctl.BoundColumn = 1
+            ctl.ColumnCount = 1
+            ctl.BackColor = BLOB_DEFAULT_BACK_COLOR
+            ctl.ForeColor = 0
+            ctl.FontName = "Calibri"
+            ctl.FontSize = 11
+            ctl.FontBold = False
+            ctl.Visible = True
+            lbl = ctl
+
+            pairCtl = False
+            If tiTypes(i) = "Label" And (i + 1) < tiCount Then
+                If tiTypes(i + 1) <> "Label" Then pairCtl = True
+            End If
+
+            If tiTypes(i) = "Label" And Not pairCtl Then
+                ' Stand-alone label
+                lbl.CtlType = "Label"
+                lbl.CtlName = tiNames(i)
+                lbl.Caption = tiNames(i)
+                lbl.LeftTw = TI_FB_LABEL_LEFT
+                lbl.TopTw = topTw
+                lbl.WidthTw = TI_FB_LABEL_WIDTH
+                lbl.HeightTw = TI_FB_ROW_HEIGHT
+                outLayout.Ctls(outLayout.CtlCount) = lbl
+                outLayout.CtlCount = outLayout.CtlCount + 1
+                topTw = topTw + TI_FB_STEP
+                i = i + 1
+            Else
+                If pairCtl Then k = i + 1 Else k = i
+                ctl.CtlType = tiTypes(k)
+                ctl.CtlName = tiNames(k)
+                Select Case ctl.CtlType
+                    Case "ListBox": ctlHeight = 1170
+                    Case "Subform": ctlHeight = 2670
+                    Case Else: ctlHeight = TI_FB_ROW_HEIGHT
+                End Select
+                Select Case ctl.CtlType
+                    Case "CheckBox", "OptionButton": ctl.WidthTw = 260
+                    Case "CommandButton", "ToggleButton": ctl.WidthTw = TI_FB_LABEL_WIDTH
+                    Case Else: ctl.WidthTw = TI_FB_CTL_WIDTH
+                End Select
+                If ctl.CtlType = "CommandButton" Or ctl.CtlType = "ToggleButton" Then ctl.Caption = ctl.CtlName
+                ctl.LeftTw = TI_FB_CTL_LEFT
+                ctl.TopTw = topTw
+                ctl.HeightTw = ctlHeight
+
+                If pairCtl Then
+                    lbl.CtlType = "Label"
+                    lbl.CtlName = tiNames(i)
+                    lbl.Caption = ctl.CtlName
+                    lbl.ParentLabelOf = ctl.CtlName
+                    lbl.LeftTw = TI_FB_LABEL_LEFT
+                    lbl.TopTw = topTw
+                    lbl.WidthTw = TI_FB_LABEL_WIDTH
+                    lbl.HeightTw = TI_FB_ROW_HEIGHT
+                    outLayout.Ctls(outLayout.CtlCount) = lbl
+                    outLayout.CtlCount = outLayout.CtlCount + 1
+                End If
+                outLayout.Ctls(outLayout.CtlCount) = ctl
+                outLayout.CtlCount = outLayout.CtlCount + 1
+
+                steps = (ctlHeight + 30 + TI_FB_STEP - 1) \ TI_FB_STEP
+                topTw = topTw + (steps * TI_FB_STEP)
+                i = k + 1
+            End If
+        Loop
+
+        outLayout.SectionHeightTw(0) = topTw + TI_FB_STEP
+        BuildTypeInfoFallbackLayout = (outLayout.CtlCount > 0)
+    End Function
+
+End Module

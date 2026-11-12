@@ -1,0 +1,825 @@
+Option Explicit
+
+Public Module RowDecoder
+
+    Private Const PAGE_SIZE_JET4 As Long = 4096
+    Private Const ROW_FLAG_DELETED As Long = &H8000&
+    Private Const ROW_FLAG_LOOKUP As Long = &H4000&
+    Private Const ROW_OFFSET_MASK As Long = &H1FFF&
+
+    Public Type PhysicalRowLocation
+        PageNumber As Long
+        SlotIndex As Integer
+    End Type
+
+    #If Win64 Then
+        Private Declare PtrSafe Sub CopyMemory Lib "kernel32" Alias "RtlMoveMemory" (ByVal Destination As LongPtr, ByVal Source As LongPtr, ByVal Length As LongLong)
+    #Else
+        Private Declare Sub CopyMemory Lib "kernel32" Alias "RtlMoveMemory" (ByVal Destination As LongPtr, ByVal Source As LongPtr, ByVal Length As Long)
+    #End If
+
+    Public Function ReadDataPageRows(ByVal fileNum As Integer, ByVal totalPages As Long, ByRef tdef As TableDefDescriptor, Optional ByRef outLocations As Collection = Nothing) As Collection
+        Dim results As New Collection
+        Set outLocations = New Collection
+
+        Dim dPages As Collection
+        Set dPages = CatalogReader.FindAllDataPages(fileNum, totalPages, tdef.TdefPageNumber)
+        If dPages.Count = 0 And tdef.PrimaryDataPage > 0 And tdef.PrimaryDataPage < totalPages Then
+            dPages.Add tdef.PrimaryDataPage
+        End If
+
+        Dim pageVal As Variant
+        For Each pageVal In dPages
+            Dim curPage As Long
+            curPage = CLng(pageVal)
+            Dim dp() As Byte
+            dp = CatalogReader.ReadPageBytes(fileNum, totalPages, curPage)
+            If dp(0) = &H1& Then
+                Dim numRows As Long
+                numRows = ReadUInt16LE_Local(dp, 12)
+
+                Dim r As Long
+                For r = 0 To numRows - 1
+                    Dim rawEntry As Long
+                    rawEntry = CLng(ReadUInt16LE_Local(dp, 14 + (r * 2)))
+                    Dim isDeleted As Boolean
+                    Dim isPointer As Boolean
+                    isDeleted = ((rawEntry And ROW_FLAG_DELETED) <> 0)
+                    isPointer = ((rawEntry And ROW_FLAG_LOOKUP) <> 0)
+                    Dim rowStart As Long
+                    Dim rowEnd As Long
+                    rowStart = CLng(rawEntry And ROW_OFFSET_MASK)
+                    rowEnd = PAGE_SIZE_JET4
+                    Dim sScan As Long
+                    Dim sEntry As Long
+                    Dim sOff As Long
+                    For sScan = 0 To numRows - 1
+                        If sScan <> r Then
+                            sEntry = CLng(ReadUInt16LE_Local(dp, 14 + (sScan * 2)))
+                            sOff = CLng(sEntry And ROW_OFFSET_MASK)
+                            If sOff > rowStart And sOff < rowEnd Then
+                                rowEnd = sOff
+                            End If
+                        End If
+                    Next sScan
+
+                    Dim rowLen As Long
+                    rowLen = rowEnd - rowStart
+                    If rowLen <= 0 Or rowStart <= 0 Or rowStart >= PAGE_SIZE_JET4 Then
+                        isDeleted = True
+                    End If
+                    Dim nullMaskLen As Long
+                    nullMaskLen = (CLng(tdef.ColumnCount) + 7) \ 8
+
+                    If Not isDeleted And rowStart < PAGE_SIZE_JET4 And rowEnd <= PAGE_SIZE_JET4 And rowStart < rowEnd Then
+                        Dim rowBytes() As Byte
+                        Dim hasRowBytes As Boolean
+                        hasRowBytes = False
+
+                        If Not isPointer Then
+                            If rowLen >= (2 + nullMaskLen) Then
+                                ReDim rowBytes(0 To rowLen - 1)
+                                Dim k As Long
+                                For k = 0 To rowLen - 1
+                                    rowBytes(k) = dp(rowStart + k)
+                                Next k
+                                hasRowBytes = True
+                            End If
+                        ElseIf rowLen >= 4 Then
+                            ' Follow Jet 4 / ACE 0x4000 overflow pointer to relocated target slot and page
+                            Dim targetSlot As Long
+                            Dim targetPage As Long
+                            targetSlot = CLng(dp(rowStart))
+                            targetPage = CLng(dp(rowStart + 1)) Or (CLng(dp(rowStart + 2)) * &H100&) Or (CLng(dp(rowStart + 3)) * &H10000&)
+                            If targetPage > 0 And targetPage < totalPages Then
+                                Dim tp() As Byte
+                                tp = CatalogReader.ReadPageBytes(fileNum, totalPages, targetPage)
+                                If tp(0) = &H1& Then
+                                    Dim tNumRows As Long
+                                    tNumRows = ReadUInt16LE_Local(tp, 12)
+                                    If targetSlot >= 0 And targetSlot < tNumRows Then
+                                        Dim tRaw As Long
+                                        Dim tRowStart As Long
+                                        Dim tRowEnd As Long
+                                        tRaw = CLng(ReadUInt16LE_Local(tp, 14 + (targetSlot * 2)))
+                                        tRowStart = CLng(tRaw And ROW_OFFSET_MASK)
+                                        tRowEnd = PAGE_SIZE_JET4
+                                        Dim tsScan As Long
+                                        Dim tsOff As Long
+                                        For tsScan = 0 To tNumRows - 1
+                                            If tsScan <> targetSlot Then
+                                                tsOff = CLng(ReadUInt16LE_Local(tp, 14 + (tsScan * 2)) And ROW_OFFSET_MASK)
+                                                If tsOff > tRowStart And tsOff < tRowEnd Then
+                                                    tRowEnd = tsOff
+                                                End If
+                                            End If
+                                        Next tsScan
+                                        Dim tRowLen As Long
+                                        tRowLen = tRowEnd - tRowStart
+                                        If tRowLen >= (2 + nullMaskLen) And tRowStart > 0 And tRowStart < PAGE_SIZE_JET4 And tRowEnd <= PAGE_SIZE_JET4 And tRowStart < tRowEnd Then
+                                            ReDim rowBytes(0 To tRowLen - 1)
+                                            Dim tk As Long
+                                            For tk = 0 To tRowLen - 1
+                                                rowBytes(tk) = tp(tRowStart + tk)
+                                            Next tk
+                                            hasRowBytes = True
+                                        End If
+                                    End If
+                                End If
+                            End If
+                        End If
+
+                        If hasRowBytes Then
+                            On Error Resume Next
+                            Dim decodedRow() As Variant
+                            decodedRow = CrackJet4Row(fileNum, totalPages, rowBytes, tdef)
+                            If Err.Number = 0 Then
+                                results.Add decodedRow
+                                outLocations.Add CStr(curPage) & "|" & CStr(r)
+                            End If
+                            Err.Clear
+                            On Error GoTo 0
+                        End If
+                    End If
+                Next r
+            End If
+        Next pageVal
+
+        Set ReadDataPageRows = results
+    End Function
+
+    Public Function CrackJet4Row(ByVal fileNum As Integer, ByVal totalPages As Long, ByRef rowBytes() As Byte, ByRef tdef As TableDefDescriptor) As Variant()
+        Dim rowLen As Long
+        Dim numCols As Integer
+        Dim nullMaskLen As Long
+        Dim nullMaskStart As Long
+        Dim varOffsets() As Long
+        Dim varLen As Long
+        Dim eod As Long
+        Dim varLenPos As Long
+        Dim eodPos As Long
+        Dim v As Long
+        Dim values() As Variant
+        Dim c As Integer
+        Dim colIdx As Long
+        Dim maskByte As Byte
+        Dim bitMask As Long
+        Dim bitSet As Boolean
+        Dim fPos As Long
+        Dim intVal As Long
+        Dim bLenFixed As Long
+        Dim binFixed() As Byte
+        Dim bi As Long
+        Dim vIdx As Integer
+        Dim sOff As Long
+        Dim eOff As Long
+        Dim vLen As Long
+        Dim rawSlice() As Byte
+        Dim bIdx As Long
+        Dim sInt As Long
+
+        rowLen = UBound(rowBytes) + 1
+        If rowLen < 2 Then
+            Err.Raise vbObjectError + 3203, "RowDecoder.CrackJet4Row", "Row buffer too short (< 2 bytes)."
+        End If
+
+        numCols = CInt(ReadUInt16LE_Local(rowBytes, 0))
+        nullMaskLen = (CLng(numCols) + 7) \ 8
+        If rowLen < 2 + nullMaskLen Then
+            Err.Raise vbObjectError + 3204, "RowDecoder.CrackJet4Row", "Row truncated before null_mask."
+        End If
+
+        nullMaskStart = rowLen - nullMaskLen
+
+        If tdef.VariableColumnCount > 0 Then
+            varLenPos = nullMaskStart - 2
+            If varLenPos >= 2 Then
+                varLen = ReadUInt16LE_Local(rowBytes, varLenPos)
+                eodPos = varLenPos - (varLen * 2) - 2
+                Dim varTblValid As Boolean
+                varTblValid = False
+                If varLen > 0 And varLen <= CLng(tdef.VariableColumnCount) And eodPos >= 2 Then
+                    If ReadUInt16LE_Local(rowBytes, eodPos) = eodPos Then
+                        varTblValid = True
+                    End If
+                End If
+                If Not varTblValid Then
+                    Dim minCandLen As Long
+                    Dim candLen As Long
+                    Dim cNullStart As Long
+                    Dim cVarLenPos As Long
+                    Dim cVarLen As Long
+                    Dim cEodPos As Long
+                    minCandLen = 2 + nullMaskLen + 4
+                    For candLen = rowLen - 1 To minCandLen Step -1
+                        If rowBytes(candLen) <> 0 Then Exit For
+                        cNullStart = candLen - nullMaskLen
+                        cVarLenPos = cNullStart - 2
+                        cVarLen = ReadUInt16LE_Local(rowBytes, cVarLenPos)
+                        If cVarLen > 0 And cVarLen <= CLng(tdef.VariableColumnCount) Then
+                            cEodPos = cVarLenPos - (cVarLen * 2) - 2
+                            If cEodPos >= 2 Then
+                                If ReadUInt16LE_Local(rowBytes, cEodPos) = cEodPos Then
+                                    rowLen = candLen
+                                    nullMaskStart = cNullStart
+                                    varLenPos = cVarLenPos
+                                    varLen = cVarLen
+                                    eodPos = cEodPos
+                                    Exit For
+                                End If
+                            End If
+                        End If
+                    Next candLen
+                End If
+                If eodPos >= 0 And eodPos < rowLen Then
+                    eod = ReadUInt16LE_Local(rowBytes, eodPos)
+                    If varLen > 0 And varLen <= CLng(tdef.VariableColumnCount) Then
+                        ReDim varOffsets(0 To varLen - 1)
+                        ' In Jet4, variable column offsets are stored in reverse order right before varLenPos:
+                        ' varIdx 0 is at (varLenPos - 2), varIdx (varLen - 1) is at (eodPos + 2)
+                        For v = 0 To varLen - 1
+                            varOffsets(v) = ReadUInt16LE_Local(rowBytes, varLenPos - 2 - (v * 2))
+                        Next v
+                    Else
+                        varLen = 0
+                    End If
+                Else
+                    varLen = 0
+                End If
+            End If
+        End If
+
+        ReDim values(0 To tdef.ColumnCount - 1)
+
+        For c = 0 To tdef.ColumnCount - 1
+            colIdx = CLng(tdef.Columns(c).ColNumber)
+            If colIdx < 0 Or colIdx >= numCols Then colIdx = c
+
+            maskByte = rowBytes(nullMaskStart + (colIdx \ 8))
+            bitMask = CLng(2 ^ (colIdx Mod 8))
+            bitSet = ((CLng(maskByte) And bitMask) <> 0)
+
+            If tdef.Columns(c).ColType = JetColumnType.ColBoolean Then
+                values(c) = bitSet
+            ElseIf Not bitSet Then
+                values(c) = Null
+            ElseIf tdef.Columns(c).IsFixed Then
+                fPos = 2 + CLng(tdef.Columns(c).FixedOffset)
+                If fPos < nullMaskStart Then
+                    Select Case tdef.Columns(c).ColType
+                        Case JetColumnType.ColByte
+                            values(c) = rowBytes(fPos)
+                        Case JetColumnType.ColInteger
+                            intVal = ReadUInt16LE_Local(rowBytes, fPos)
+                            If intVal >= &H8000& Then intVal = intVal - &H10000&
+                            values(c) = CInt(intVal)
+                        Case JetColumnType.ColLong, JetColumnType.ColComplex
+                            values(c) = ReadInt32LE_Local(rowBytes, fPos)
+                        Case JetColumnType.ColBigInt
+                            values(c) = DecodeJet4BigInt(rowBytes, fPos)
+                        Case JetColumnType.ColDecimal
+                            values(c) = DecodeJet4Decimal(rowBytes, fPos)
+                        Case JetColumnType.ColCurrency
+                            values(c) = DecodeJet4Currency(rowBytes, fPos)
+                        Case JetColumnType.ColSingle
+                            values(c) = DecodeJet4Single(rowBytes, fPos)
+                        Case JetColumnType.ColDouble
+                            values(c) = DecodeJet4Double(rowBytes, fPos)
+                        Case JetColumnType.ColDateTime
+                            values(c) = DecodeJet4Date(rowBytes, fPos)
+                        Case JetColumnType.ColGUID
+                            values(c) = DecodeJet4GUID(rowBytes, fPos)
+                        Case JetColumnType.ColBinary
+                            bLenFixed = CLng(tdef.Columns(c).ByteLength)
+                            If bLenFixed <= 0 Then bLenFixed = 1
+                            ReDim binFixed(0 To bLenFixed - 1)
+                            For bi = 0 To bLenFixed - 1
+                                binFixed(bi) = rowBytes(fPos + bi)
+                            Next bi
+                            values(c) = binFixed
+                        Case Else
+                            values(c) = Null
+                    End Select
+                Else
+                    values(c) = Null
+                End If
+            Else
+                vIdx = tdef.Columns(c).VarOffsetIndex
+                If vIdx >= 0 And vIdx < varLen Then
+                    sOff = CLng(varOffsets(vIdx))
+                    If (vIdx + 1) < varLen Then
+                        eOff = CLng(varOffsets(vIdx + 1))
+                    Else
+                        eOff = CLng(eod)
+                    End If
+                    vLen = eOff - sOff
+                    If vLen <= 0 Or sOff < 2 Or eOff > nullMaskStart Then
+                        Select Case tdef.Columns(c).ColType
+                            Case JetColumnType.ColText, JetColumnType.ColMemo
+                                values(c) = ""
+                            Case Else
+                                values(c) = Null
+                        End Select
+                    Else
+                        ReDim rawSlice(0 To vLen - 1)
+                        For bIdx = 0 To vLen - 1
+                            rawSlice(bIdx) = rowBytes(sOff + bIdx)
+                        Next bIdx
+                        Select Case tdef.Columns(c).ColType
+                            Case JetColumnType.ColText
+                                values(c) = DecodeJet4Text(rawSlice)
+                            Case JetColumnType.ColMemo
+                                values(c) = DecodeJet4Memo(fileNum, totalPages, rawSlice)
+                            Case JetColumnType.ColBinary
+                                values(c) = rawSlice
+                            Case JetColumnType.ColLongBinary
+                                values(c) = DecodeJet4Binary(fileNum, totalPages, rawSlice)
+                            Case JetColumnType.ColDateTime
+                                values(c) = DecodeJet4Date(rawSlice, 0)
+                            Case JetColumnType.ColSingle
+                                values(c) = DecodeJet4Single(rawSlice, 0)
+                            Case JetColumnType.ColDouble
+                                values(c) = DecodeJet4Double(rawSlice, 0)
+                            Case JetColumnType.ColCurrency
+                                values(c) = DecodeJet4Currency(rawSlice, 0)
+                            Case JetColumnType.ColGUID
+                                values(c) = DecodeJet4GUID(rawSlice, 0)
+                            Case JetColumnType.ColLong, JetColumnType.ColComplex
+                                If vLen >= 4 Then
+                                    values(c) = ReadInt32LE_Local(rawSlice, 0)
+                                Else
+                                    values(c) = 0&
+                                End If
+                            Case JetColumnType.ColBigInt
+                                values(c) = DecodeJet4BigInt(rawSlice, 0)
+                            Case JetColumnType.ColDecimal
+                                values(c) = DecodeJet4Decimal(rawSlice, 0)
+                            Case JetColumnType.ColInteger
+                                If vLen >= 2 Then
+                                    sInt = ReadUInt16LE_Local(rawSlice, 0)
+                                    If sInt >= &H8000& Then sInt = sInt - &H10000&
+                                    values(c) = CInt(sInt)
+                                Else
+                                    values(c) = 0
+                                End If
+                            Case JetColumnType.ColByte
+                                values(c) = rawSlice(0)
+                            Case Else
+                                values(c) = rawSlice
+                        End Select
+                    End If
+                Else
+                    values(c) = Null
+                End If
+            End If
+        Next c
+
+        CrackJet4Row = values
+    End Function
+
+    Public Function DecodeJet4Text(ByRef raw() As Byte) As String
+        Dim total As Long
+        Dim s As String
+        Dim i As Long
+        Dim isComp As Boolean
+        Dim codeUnit As Long
+        Dim outPos As Long
+
+        total = UBound(raw) + 1
+        If total >= 2 And raw(0) = &HFF& And raw(1) = &HFE& Then
+            s = Space$(total)
+            outPos = 0
+            isComp = True
+            i = 2
+            Do While i < total
+                If isComp Then
+                    If raw(i) = 0 Then
+                        isComp = False
+                        i = i + 1
+                    Else
+                        outPos = outPos + 1
+                        Mid$(s, outPos, 1) = ChrW$(CLng(raw(i)))
+                        i = i + 1
+                    End If
+                Else
+                    If raw(i) = 0 Then
+                        isComp = True
+                        i = i + 1
+                    ElseIf (i + 1) < total Then
+                        codeUnit = ReadUInt16LE_Local(raw, i)
+                        If codeUnit >= 32768 Then codeUnit = codeUnit - 65536
+                        outPos = outPos + 1
+                        Mid$(s, outPos, 1) = ChrW$(codeUnit)
+                        i = i + 2
+                    Else
+                        i = i + 1
+                    End If
+                End If
+            Loop
+            DecodeJet4Text = Left$(s, outPos)
+            Exit Function
+        End If
+        DecodeJet4Text = DecodeUcs2LE_Local(raw, 0, total)
+    End Function
+
+    Public Function DecodeJet4Memo(ByVal fileNum As Integer, ByVal totalPages As Long, ByRef raw() As Byte) As String
+        If UBound(raw) + 1 < 12 Then
+            DecodeJet4Memo = ""
+            Exit Function
+        End If
+        Dim flagByte As Byte
+        flagByte = raw(3)
+        Dim memoByteLen As Long
+        memoByteLen = CLng(raw(0)) Or (CLng(raw(1)) * &H100&) Or (CLng(raw(2)) * &H10000&)
+        If memoByteLen <= 0 Then
+            DecodeJet4Memo = ""
+            Exit Function
+        End If
+
+        If flagByte = &H80& Then
+            Dim availInline As Long
+            availInline = (UBound(raw) + 1) - 12
+            If memoByteLen > availInline Then memoByteLen = availInline
+            If memoByteLen <= 0 Then
+                DecodeJet4Memo = ""
+                Exit Function
+            End If
+            Dim inlineBytes() As Byte
+            ReDim inlineBytes(0 To memoByteLen - 1)
+            Dim i As Long
+            For i = 0 To memoByteLen - 1
+                inlineBytes(i) = raw(12 + i)
+            Next i
+            DecodeJet4Memo = DecodeJet4Text(inlineBytes)
+            Exit Function
+        ElseIf flagByte = &H40& Then
+            Dim lvalRow As Integer
+            Dim lvalPage As Long
+            lvalRow = raw(4)
+            lvalPage = CLng(raw(5)) Or (CLng(raw(6)) * &H100&) Or (CLng(raw(7)) * &H10000&)
+            If lvalPage <= 0 Or lvalPage >= totalPages Then
+                DecodeJet4Memo = ""
+                Exit Function
+            End If
+            Dim lp() As Byte
+            lp = CatalogReader.ReadPageBytes(fileNum, totalPages, lvalPage)
+            Dim rStart As Long
+            Dim rEnd As Long
+            rStart = CLng(ReadUInt16LE_Local(lp, 14 + (lvalRow * 2)) And ROW_OFFSET_MASK)
+            If lvalRow = 0 Then
+                rEnd = PAGE_SIZE_JET4
+            Else
+                rEnd = CLng(ReadUInt16LE_Local(lp, 14 + ((lvalRow - 1) * 2)) And ROW_OFFSET_MASK)
+            End If
+            If rStart + memoByteLen > rEnd Then memoByteLen = rEnd - rStart
+            If memoByteLen <= 0 Then
+                DecodeJet4Memo = ""
+                Exit Function
+            End If
+            Dim lvalSlice() As Byte
+            ReDim lvalSlice(0 To memoByteLen - 1)
+            Dim j As Long
+            For j = 0 To memoByteLen - 1
+                lvalSlice(j) = lp(rStart + j)
+            Next j
+            DecodeJet4Memo = DecodeJet4Text(lvalSlice)
+            Exit Function
+        ElseIf flagByte = &H00& Then
+            Dim memoBytes() As Byte
+            memoBytes = ReadLvalChainBytes(fileNum, totalPages, raw, memoByteLen)
+            DecodeJet4Memo = DecodeJet4Text(memoBytes)
+            Exit Function
+        Else
+            DecodeJet4Memo = ""
+        End If
+    End Function
+
+    Private Function ReadUInt16LE_Local(ByRef buf() As Byte, ByVal idx As Long) As Long
+        ReadUInt16LE_Local = CLng(buf(idx)) Or (CLng(buf(idx + 1)) * &H100&)
+    End Function
+
+    Private Function ReadInt32LE_Local(ByRef buf() As Byte, ByVal idx As Long) As Long
+        Dim res As Long
+        #If Win64 Then
+            CopyMemory VarPtr(res), VarPtr(buf(idx)), 4^
+        #Else
+            CopyMemory VarPtr(res), VarPtr(buf(idx)), 4&
+        #End If
+        ReadInt32LE_Local = res
+    End Function
+
+    Private Function DecodeUcs2LE_Local(ByRef buf() As Byte, ByVal startIdx As Long, ByVal byteLen As Long) As String
+        Dim chars As String
+        Dim maxChars As Long
+        Dim outPos As Long
+        Dim i As Long
+        Dim codeUnit As Long
+
+        If byteLen <= 1 Then
+            DecodeUcs2LE_Local = vbNullString
+            Exit Function
+        End If
+
+        maxChars = byteLen \ 2
+        chars = Space$(maxChars)
+        outPos = 0
+
+        For i = startIdx To startIdx + (maxChars * 2) - 2 Step 2
+            codeUnit = ReadUInt16LE_Local(buf, i)
+            If codeUnit >= 32768 Then codeUnit = codeUnit - 65536
+            outPos = outPos + 1
+            Mid$(chars, outPos, 1) = ChrW$(codeUnit)
+        Next i
+
+        DecodeUcs2LE_Local = Left$(chars, outPos)
+    End Function
+
+    Public Function DecodeJet4Binary(ByVal fileNum As Integer, ByVal totalPages As Long, ByRef raw() As Byte) As Byte()
+        Dim rawLen As Long
+        rawLen = UBound(raw) + 1
+        If rawLen < 12 Then
+            DecodeJet4Binary = raw
+            Exit Function
+        End If
+        Dim flagByte As Byte
+        flagByte = raw(3)
+        Dim byteLen As Long
+        byteLen = CLng(raw(0)) Or (CLng(raw(1)) * &H100&) Or (CLng(raw(2)) * &H10000&)
+
+        If flagByte = &H80& Then
+            If byteLen <= 0 Then
+                Dim emptyB() As Byte
+                DecodeJet4Binary = emptyB
+                Exit Function
+            End If
+            If 12 + byteLen > rawLen Then byteLen = rawLen - 12
+            Dim inlineBytes() As Byte
+            ReDim inlineBytes(0 To byteLen - 1)
+            Dim i As Long
+            For i = 0 To byteLen - 1
+                inlineBytes(i) = raw(12 + i)
+            Next i
+            DecodeJet4Binary = inlineBytes
+            Exit Function
+        ElseIf flagByte = &H40& Then
+            Dim lvalRow As Long
+            Dim lvalPage As Long
+            lvalRow = CLng(raw(4))
+            lvalPage = CLng(raw(5)) Or (CLng(raw(6)) * &H100&) Or (CLng(raw(7)) * &H10000&)
+            If lvalPage <= 0 Or lvalPage >= totalPages Then
+                DecodeJet4Binary = raw
+                Exit Function
+            End If
+            Dim lp() As Byte
+            lp = CatalogReader.ReadPageBytes(fileNum, totalPages, lvalPage)
+            Dim rStart As Long
+            rStart = CLng(ReadUInt16LE_Local(lp, 14 + (lvalRow * 2)) And ROW_OFFSET_MASK)
+            Dim rEnd As Long
+            If lvalRow = 0 Then
+                rEnd = PAGE_SIZE_JET4
+            Else
+                rEnd = CLng(ReadUInt16LE_Local(lp, 14 + ((lvalRow - 1) * 2)) And ROW_OFFSET_MASK)
+            End If
+            Dim avail As Long
+            avail = rEnd - rStart
+            If byteLen > avail Then byteLen = avail
+            If byteLen <= 0 Then
+                Dim emptyB2() As Byte
+                DecodeJet4Binary = emptyB2
+                Exit Function
+            End If
+            Dim lvalSlice() As Byte
+            ReDim lvalSlice(0 To byteLen - 1)
+            Dim j As Long
+            For j = 0 To byteLen - 1
+                lvalSlice(j) = lp(rStart + j)
+            Next j
+            DecodeJet4Binary = lvalSlice
+            Exit Function
+        ElseIf flagByte = &H00& Then
+            DecodeJet4Binary = ReadLvalChainBytes(fileNum, totalPages, raw, byteLen)
+            Exit Function
+        Else
+            DecodeJet4Binary = raw
+        End If
+    End Function
+
+    Private Function ReadLvalChainBytes(ByVal fileNum As Integer, ByVal totalPages As Long, ByRef raw() As Byte, ByVal targetLen As Long) As Byte()
+        If targetLen <= 0 Then
+            Dim emptyArr() As Byte
+            ReadLvalChainBytes = emptyArr
+            Exit Function
+        End If
+
+        Dim fullBuf() As Byte
+        ReDim fullBuf(0 To targetLen - 1)
+        Dim curRow As Long
+        Dim curPage As Long
+        curRow = CLng(raw(4))
+        curPage = CLng(raw(5)) Or (CLng(raw(6)) * &H100&) Or (CLng(raw(7)) * &H10000&)
+        Dim bufPos As Long
+        bufPos = 0
+        Dim remLen As Long
+        remLen = targetLen
+
+        Do While remLen > 0 And curPage > 0 And curPage < totalPages
+            Dim pageBytes() As Byte
+            pageBytes = CatalogReader.ReadPageBytes(fileNum, totalPages, curPage)
+            Dim pStart As Long
+            pStart = CLng(ReadUInt16LE_Local(pageBytes, 14 + (curRow * 2)) And ROW_OFFSET_MASK)
+            Dim pEnd As Long
+            If curRow = 0 Then
+                pEnd = PAGE_SIZE_JET4
+            Else
+                pEnd = CLng(ReadUInt16LE_Local(pageBytes, 14 + ((curRow - 1) * 2)) And ROW_OFFSET_MASK)
+            End If
+            Dim nextRow As Long
+            nextRow = CLng(pageBytes(pStart))
+            Dim nextPage As Long
+            nextPage = CLng(pageBytes(pStart + 1)) Or (CLng(pageBytes(pStart + 2)) * &H100&) Or (CLng(pageBytes(pStart + 3)) * &H10000&)
+
+            Dim chunkAvail As Long
+            chunkAvail = pEnd - (pStart + 4)
+            Dim toTake As Long
+            toTake = remLen
+            If toTake > chunkAvail Then toTake = chunkAvail
+            If toTake > 0 Then
+                Dim b As Long
+                For b = 0 To toTake - 1
+                    fullBuf(bufPos + b) = pageBytes(pStart + 4 + b)
+                Next b
+                bufPos = bufPos + toTake
+                remLen = remLen - toTake
+            End If
+            curRow = nextRow
+            curPage = nextPage
+        Loop
+
+        ReadLvalChainBytes = fullBuf
+    End Function
+
+    Public Function DecodeJet4Date(ByRef raw() As Byte, Optional ByVal startOffset As Long = 0) As Variant
+        Dim avail As Long
+        avail = (UBound(raw) - startOffset) + 1
+        If avail < 8 Then
+            DecodeJet4Date = Null
+            Exit Function
+        End If
+        Dim dblVal As Double
+        #If Win64 Then
+            CopyMemory VarPtr(dblVal), VarPtr(raw(startOffset)), 8^
+        #Else
+            CopyMemory VarPtr(dblVal), VarPtr(raw(startOffset)), 8&
+        #End If
+        On Error Resume Next
+        Dim dt As Date
+        dt = CDate(dblVal)
+        If Err.Number = 0 Then
+            If Fix(dblVal) = dblVal And dblVal <> 0# Then
+                DecodeJet4Date = Format$(dt, "yyyy-mm-dd")
+            ElseIf Fix(dblVal) = 0# Then
+                DecodeJet4Date = Format$(dt, "hh:nn:ss")
+            Else
+                DecodeJet4Date = Format$(dt, "yyyy-mm-dd hh:nn:ss")
+            End If
+        Else
+            DecodeJet4Date = CStr(dblVal)
+        End If
+        On Error GoTo 0
+    End Function
+
+    Public Function DecodeJet4Double(ByRef raw() As Byte, Optional ByVal startOffset As Long = 0) As Variant
+        Dim avail As Long
+        avail = (UBound(raw) - startOffset) + 1
+        If avail < 8 Then
+            DecodeJet4Double = Null
+            Exit Function
+        End If
+        Dim dblVal As Double
+        #If Win64 Then
+            CopyMemory VarPtr(dblVal), VarPtr(raw(startOffset)), 8^
+        #Else
+            CopyMemory VarPtr(dblVal), VarPtr(raw(startOffset)), 8&
+        #End If
+        DecodeJet4Double = dblVal
+    End Function
+
+    Public Function DecodeJet4Single(ByRef raw() As Byte, Optional ByVal startOffset As Long = 0) As Variant
+        Dim avail As Long
+        avail = (UBound(raw) - startOffset) + 1
+        If avail < 4 Then
+            DecodeJet4Single = Null
+            Exit Function
+        End If
+        Dim sngVal As Single
+        #If Win64 Then
+            CopyMemory VarPtr(sngVal), VarPtr(raw(startOffset)), 4^
+        #Else
+            CopyMemory VarPtr(sngVal), VarPtr(raw(startOffset)), 4&
+        #End If
+        DecodeJet4Single = sngVal
+    End Function
+
+    Public Function DecodeJet4BigInt(ByRef raw() As Byte, Optional ByVal startOffset As Long = 0) As Variant
+        Dim avail As Long
+        Dim llVal As LongLong
+
+        avail = (UBound(raw) - startOffset) + 1
+        If avail < 8 Then
+            DecodeJet4BigInt = Null
+            Exit Function
+        End If
+        #If Win64 Then
+            CopyMemory VarPtr(llVal), VarPtr(raw(startOffset)), 8^
+        #Else
+            CopyMemory VarPtr(llVal), VarPtr(raw(startOffset)), 8&
+        #End If
+        DecodeJet4BigInt = llVal
+    End Function
+
+    Public Function DecodeJet4Decimal(ByRef raw() As Byte, Optional ByVal startOffset As Long = 0) As Variant
+        Dim avail As Long
+        Dim signByte As Byte
+        Dim scaleByte As Byte
+        Dim lo32 As Long
+        Dim uLo As Double
+        Dim resDbl As Double
+
+        avail = (UBound(raw) - startOffset) + 1
+        If avail < 16 Then
+            DecodeJet4Decimal = Null
+            Exit Function
+        End If
+
+        If avail >= 17 Then
+            signByte = raw(startOffset)
+            scaleByte = 4
+            lo32 = ReadInt32LE_Local(raw, startOffset + 1)
+            If lo32 = 0 And ReadInt32LE_Local(raw, startOffset + 12) <> 0 Then
+                lo32 = ReadInt32LE_Local(raw, startOffset + 12)
+                scaleByte = raw(startOffset + 2)
+            End If
+        Else
+            signByte = raw(startOffset)
+            scaleByte = raw(startOffset + 2)
+            lo32 = ReadInt32LE_Local(raw, startOffset + 12)
+        End If
+
+        If lo32 < 0 Then
+            uLo = CDbl(lo32) + 4294967296#
+        Else
+            uLo = CDbl(lo32)
+        End If
+
+        resDbl = uLo
+        If scaleByte > 0 And scaleByte <= 28 Then
+            resDbl = resDbl / (10# ^ CDbl(scaleByte))
+        End If
+        If (signByte And &H80&) <> 0 Then
+            resDbl = -resDbl
+        End If
+        DecodeJet4Decimal = resDbl
+    End Function
+
+    Public Function DecodeJet4Currency(ByRef raw() As Byte, Optional ByVal startOffset As Long = 0) As Variant
+        Dim avail As Long
+        avail = (UBound(raw) - startOffset) + 1
+        If avail < 8 Then
+            DecodeJet4Currency = Null
+            Exit Function
+        End If
+        Dim curVal As Currency
+        #If Win64 Then
+            CopyMemory VarPtr(curVal), VarPtr(raw(startOffset)), 8^
+        #Else
+            CopyMemory VarPtr(curVal), VarPtr(raw(startOffset)), 8&
+        #End If
+        DecodeJet4Currency = curVal
+    End Function
+
+    Public Function DecodeJet4GUID(ByRef raw() As Byte, Optional ByVal startOffset As Long = 0) As Variant
+        Dim avail As Long
+        avail = (UBound(raw) - startOffset) + 1
+        If avail < 16 Then
+            DecodeJet4GUID = Null
+            Exit Function
+        End If
+        Dim d1 As Long
+        d1 = ReadInt32LE_Local(raw, startOffset)
+        Dim d2 As Long
+        d2 = ReadUInt16LE_Local(raw, startOffset + 4)
+        Dim d3 As Long
+        d3 = ReadUInt16LE_Local(raw, startOffset + 6)
+        Dim s As String
+        s = "{" & _
+            Right$("00000000" & Hex$(d1), 8) & "-" & _
+            Right$("0000" & Hex$(d2), 4) & "-" & _
+            Right$("0000" & Hex$(d3), 4) & "-" & _
+            Right$("00" & Hex$(raw(startOffset + 8)), 2) & Right$("00" & Hex$(raw(startOffset + 9)), 2) & "-" & _
+            Right$("00" & Hex$(raw(startOffset + 10)), 2) & Right$("00" & Hex$(raw(startOffset + 11)), 2) & _
+            Right$("00" & Hex$(raw(startOffset + 12)), 2) & Right$("00" & Hex$(raw(startOffset + 13)), 2) & _
+            Right$("00" & Hex$(raw(startOffset + 14)), 2) & Right$("00" & Hex$(raw(startOffset + 15)), 2) & "}"
+        DecodeJet4GUID = s
+    End Function
+
+End Module

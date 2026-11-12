@@ -1,0 +1,2793 @@
+' File: src/database-core/RecordWriter.twin
+' Bounds-Checked Jet 4 / ACE Row Packer, TDEF Page Builder, and Storage Record Writer
+Option Explicit
+
+Module RecordWriter
+
+    Private Const PAGE_SIZE_JET4 As Long = 4096
+    Private Const MAX_JET4_ROW_BYTES As Long = 4080
+    Private Const ROW_FLAG_DELETED As Long = &H8000&
+    Private Const ROW_FLAG_OVERFLOW As Long = &H4000&
+    Private Const ROW_OFFSET_MASK As Long = &H1FFF&
+
+    #If Win64 Then
+        Private Declare PtrSafe Sub CopyMemory Lib "kernel32" Alias "RtlMoveMemory" (ByVal Destination As LongPtr, ByVal Source As LongPtr, ByVal Length As LongLong)
+        Private Declare PtrSafe Function LCMapStringW Lib "kernel32" (ByVal Locale As Long, ByVal dwMapFlags As Long, ByVal lpSrcStr As LongPtr, ByVal cchSrc As Long, ByVal lpDestStr As LongPtr, ByVal cchDest As Long) As Long
+    #Else
+        Private Declare Sub CopyMemory Lib "kernel32" Alias "RtlMoveMemory" (ByVal Destination As LongPtr, ByVal Source As LongPtr, ByVal Length As Long)
+        Private Declare Function LCMapStringW Lib "kernel32" (ByVal Locale As Long, ByVal dwMapFlags As Long, ByVal lpSrcStr As LongPtr, ByVal cchSrc As Long, ByVal lpDestStr As LongPtr, ByVal cchDest As Long) As Long
+    #End If
+
+    Private m_idxWeightsInit As Boolean
+    Private m_idxSortMode As Long
+    Private m_idxCharKnown(0 To 127) As Boolean
+    Private m_idxKnown1(0 To 127) As Boolean
+    Private m_idxKnown2(0 To 127) As Boolean
+    Private m_idxCharHi1(0 To 127) As Byte
+    Private m_idxCharW1(0 To 127) As Byte
+    Private m_idxCharHi2(0 To 127) As Byte
+    Private m_idxCharW2(0 To 127) As Byte
+    Private m_defHi1(0 To 127) As Byte
+    Private m_defW1(0 To 127) As Byte
+    Private m_defHi2(0 To 127) As Byte
+    Private m_defW2(0 To 127) As Byte
+    Private m_idxUscoreLen1 As Long
+    Private m_idxUscoreHi1 As Byte
+    Private m_idxUscoreLen2 As Long
+
+    Public Function PackJet4Row(ByRef tdef As TableDefDescriptor, ByVal fieldValues As Variant, Optional ByVal fileNum As Integer = 0, Optional ByRef totalPages As Long = 0) As Byte()
+        Dim numCols As Integer
+        Dim fixedLen As Integer
+        Dim c As Integer
+        Dim fixedBuf() As Byte
+        Dim varPayload() As Byte
+        Dim varPayloadLen As Long
+        Dim varOffsets() As Integer
+        Dim vi As Integer
+        Dim nullMaskLen As Long
+        Dim nullMask() As Byte
+        Dim fieldVal As Variant
+        Dim colIdx As Integer
+        Dim maskIdx As Long
+        Dim bitVal As Byte
+        Dim fOff As Long
+        Dim dByte As Double
+        Dim dInt As Double
+        Dim iVal As Integer
+        Dim uIntVal As Long
+        Dim dLng As Double
+        Dim curVal As Currency
+        Dim dblDate As Double
+        Dim dblNum As Double
+        Dim sngNum As Single
+        Dim guidBytes() As Byte
+        Dim gb As Long
+        Dim binArr() As Byte
+        Dim maxBin As Long
+        Dim bi As Long
+        Dim llNum As LongLong
+        Dim dblDec As Double
+        Dim decScaled As Long
+        Dim targetV As Integer
+        Dim varColIdx As Integer
+        Dim vFieldVal As Variant
+        Dim strBytes() As Byte
+        Dim addBytesLen As Long
+        Dim binBytes() As Byte
+        Dim bLen As Long
+        Dim vbi As Long
+        Dim longBinBytes() As Byte
+        Dim lbLen As Long
+        Dim lbi As Long
+        Dim lbi2 As Long
+        Dim sMemo As String
+        Dim memoTextBytes() As Byte
+        Dim mLen As Long
+        Dim mb As Long
+        Dim oldPayloadLen As Long
+        Dim b As Long
+        Dim varTableBytes() As Byte
+        Dim varTableLen As Long
+        Dim eodOffset As Long
+        Dim v As Integer
+        Dim revIdx As Long
+        Dim vSlotOff As Long
+        Dim totalRowLen As Long
+        Dim result() As Byte
+        Dim curPos As Long
+        Dim f As Long
+        Dim vp As Long
+        Dim vt As Long
+        Dim nm As Long
+
+        numCols = tdef.ColumnCount
+
+        ' 1. Calculate fixed block size
+        fixedLen = 0
+        For c = 0 To numCols - 1
+            If tdef.Columns(c).IsFixed And tdef.Columns(c).ColType <> JetColumnType.ColBoolean Then
+                If tdef.Columns(c).FixedOffset + tdef.Columns(c).ByteLength > fixedLen Then
+                    fixedLen = tdef.Columns(c).FixedOffset + tdef.Columns(c).ByteLength
+                End If
+            End If
+        Next c
+
+        If fixedLen > 0 Then
+            ReDim fixedBuf(0 To fixedLen - 1)
+        Else
+            ReDim fixedBuf(0 To 0)
+        End If
+
+        ' 2. Pack variable columns
+        ReDim varPayload(0 To 0)
+        varPayloadLen = 0
+
+        If tdef.VariableColumnCount > 0 Then
+            ReDim varOffsets(0 To tdef.VariableColumnCount - 1)
+            For vi = 0 To tdef.VariableColumnCount - 1
+                varOffsets(vi) = CInt(2 + fixedLen)
+            Next vi
+        End If
+
+        ' 3. Prepare null mask and pack fixed columns (Pass 1)
+        nullMaskLen = (CLng(numCols) + 7) \ 8
+        ReDim nullMask(0 To nullMaskLen - 1)
+
+        For c = 0 To numCols - 1
+            fieldVal = fieldValues(c)
+            colIdx = tdef.Columns(c).ColNumber
+            If colIdx < 0 Or colIdx >= numCols Then colIdx = c
+
+            maskIdx = CLng(colIdx \ 8)
+            bitVal = BitMaskByte(colIdx Mod 8)
+
+            If tdef.Columns(c).ColType = JetColumnType.ColBoolean Then
+                If Not IsNull(fieldVal) And Not IsEmpty(fieldVal) Then
+                    If CBool(fieldVal) Then
+                        nullMask(maskIdx) = nullMask(maskIdx) Or bitVal
+                    End If
+                End If
+            ElseIf Not IsNull(fieldVal) And Not IsEmpty(fieldVal) Then
+                nullMask(maskIdx) = nullMask(maskIdx) Or bitVal
+
+                If tdef.Columns(c).IsFixed Then
+                    fOff = CLng(tdef.Columns(c).FixedOffset)
+                    Select Case tdef.Columns(c).ColType
+                        Case JetColumnType.ColByte
+                            If Not IsNumeric(fieldVal) Then
+                                Err.Raise 3421, "RecordWriter.PackJet4Row", "Data type conversion error."
+                            End If
+                            dByte = CDbl(fieldVal)
+                            If dByte < 0# Or dByte > 255# Then
+                                Err.Raise 6, "RecordWriter.PackJet4Row", "Overflow"
+                            End If
+                            fixedBuf(fOff) = CByte(dByte)
+                        Case JetColumnType.ColInteger
+                            If Not IsNumeric(fieldVal) Then
+                                Err.Raise 3421, "RecordWriter.PackJet4Row", "Data type conversion error."
+                            End If
+                            dInt = CDbl(fieldVal)
+                            If dInt < -32768# Or dInt > 32767# Then
+                                Err.Raise 6, "RecordWriter.PackJet4Row", "Overflow"
+                            End If
+                            iVal = CInt(dInt)
+                            If iVal < 0 Then
+                                uIntVal = CLng(iVal) + &H10000&
+                            Else
+                                uIntVal = CLng(iVal)
+                            End If
+                            PageWriter.WriteUInt16LE fixedBuf, fOff, uIntVal
+                        Case JetColumnType.ColLong, JetColumnType.ColComplex
+                            If Not IsNumeric(fieldVal) Then
+                                Err.Raise 3421, "RecordWriter.PackJet4Row", "Data type conversion error."
+                            End If
+                            dLng = CDbl(fieldVal)
+                            If dLng < -2147483648# Or dLng > 2147483647# Then
+                                Err.Raise 6, "RecordWriter.PackJet4Row", "Overflow"
+                            End If
+                            PageWriter.WriteInt32LE fixedBuf, fOff, CLng(dLng)
+                        Case JetColumnType.ColBigInt
+                            If Not IsNumeric(fieldVal) Then
+                                Err.Raise 3421, "RecordWriter.PackJet4Row", "Data type conversion error."
+                            End If
+                            llNum = CLngLng(fieldVal)
+                            #If Win64 Then
+                                CopyMemory VarPtr(fixedBuf(fOff)), VarPtr(llNum), 8^
+                            #Else
+                                CopyMemory VarPtr(fixedBuf(fOff)), VarPtr(llNum), 8&
+                            #End If
+                        Case JetColumnType.ColDecimal
+                            If Not IsNumeric(fieldVal) Then
+                                Err.Raise 3421, "RecordWriter.PackJet4Row", "Data type conversion error."
+                            End If
+                            dblDec = CDbl(fieldVal)
+                            If dblDec < 0# Then
+                                fixedBuf(fOff) = &H80&
+                                dblDec = -dblDec
+                            Else
+                                fixedBuf(fOff) = 0
+                            End If
+                            decScaled = CLng(VBA.Round(dblDec * 10000#, 0))
+                            If tdef.Columns(c).ByteLength >= 17 Then
+                                PageWriter.WriteInt32LE fixedBuf, fOff + 1, decScaled
+                            Else
+                                fixedBuf(fOff + 2) = 4 ' scale = 4
+                                PageWriter.WriteInt32LE fixedBuf, fOff + 12, decScaled
+                            End If
+                        Case JetColumnType.ColCurrency
+                            If Not IsNumeric(fieldVal) Then
+                                Err.Raise 3421, "RecordWriter.PackJet4Row", "Data type conversion error."
+                            End If
+                            curVal = CCur(fieldVal)
+                            #If Win64 Then
+                                CopyMemory VarPtr(fixedBuf(fOff)), VarPtr(curVal), 8^
+                            #Else
+                                CopyMemory VarPtr(fixedBuf(fOff)), VarPtr(curVal), 8&
+                            #End If
+                        Case JetColumnType.ColDateTime
+                            If Not IsDate(fieldVal) And Not IsNumeric(fieldVal) Then
+                                Err.Raise 3421, "RecordWriter.PackJet4Row", "Data type conversion error."
+                            End If
+                            If IsDate(fieldVal) Then
+                                dblDate = CDbl(CDate(fieldVal))
+                            Else
+                                dblDate = CDbl(fieldVal)
+                            End If
+                            #If Win64 Then
+                                CopyMemory VarPtr(fixedBuf(fOff)), VarPtr(dblDate), 8^
+                            #Else
+                                CopyMemory VarPtr(fixedBuf(fOff)), VarPtr(dblDate), 8&
+                            #End If
+                        Case JetColumnType.ColDouble
+                            If Not IsNumeric(fieldVal) Then
+                                Err.Raise 3421, "RecordWriter.PackJet4Row", "Data type conversion error."
+                            End If
+                            dblNum = CDbl(fieldVal)
+                            #If Win64 Then
+                                CopyMemory VarPtr(fixedBuf(fOff)), VarPtr(dblNum), 8^
+                            #Else
+                                CopyMemory VarPtr(fixedBuf(fOff)), VarPtr(dblNum), 8&
+                            #End If
+                        Case JetColumnType.ColSingle
+                            If Not IsNumeric(fieldVal) Then
+                                Err.Raise 3421, "RecordWriter.PackJet4Row", "Data type conversion error."
+                            End If
+                            sngNum = CSng(fieldVal)
+                            #If Win64 Then
+                                CopyMemory VarPtr(fixedBuf(fOff)), VarPtr(sngNum), 4^
+                            #Else
+                                CopyMemory VarPtr(fixedBuf(fOff)), VarPtr(sngNum), 4&
+                            #End If
+                        Case JetColumnType.ColGUID
+                            guidBytes = EncodeGuidBytes(CStr(fieldVal))
+                            For gb = 0 To 15
+                                If fOff + gb <= UBound(fixedBuf) Then
+                                    fixedBuf(fOff + gb) = guidBytes(gb)
+                                End If
+                            Next gb
+                        Case JetColumnType.ColBinary
+                            If VarType(fieldVal) = (vbArray Or vbByte) Then
+                                binArr = fieldVal
+                                maxBin = tdef.Columns(c).ByteLength
+                                For bi = 0 To UBound(binArr) - LBound(binArr)
+                                    If bi < maxBin And (fOff + bi) <= UBound(fixedBuf) Then
+                                        fixedBuf(fOff + bi) = binArr(LBound(binArr) + bi)
+                                    End If
+                                Next bi
+                            End If
+                    End Select
+                End If
+            End If
+        Next c
+
+        ' Pass 2: Pack variable-length columns ordered strictly by VarOffsetIndex (0 To VariableColumnCount - 1)
+        For targetV = 0 To tdef.VariableColumnCount - 1
+            varOffsets(targetV) = CInt(2 + CLng(fixedLen) + varPayloadLen)
+
+            varColIdx = -1
+            For c = 0 To numCols - 1
+                If Not tdef.Columns(c).IsFixed And tdef.Columns(c).VarOffsetIndex = targetV Then
+                    varColIdx = c
+                    Exit For
+                End If
+            Next c
+
+            If varColIdx >= 0 Then
+                vFieldVal = fieldValues(varColIdx)
+                If Not IsNull(vFieldVal) And Not IsEmpty(vFieldVal) Then
+                    addBytesLen = 0
+
+                    If tdef.Columns(varColIdx).ColType = JetColumnType.ColBinary Then
+                        If VarType(vFieldVal) = (vbArray Or vbByte) Then
+                            binBytes = vFieldVal
+                            bLen = UBound(binBytes) - LBound(binBytes) + 1
+                        Else
+                            binBytes = EncodeTextBytes(CStr(vFieldVal))
+                            bLen = UBound(binBytes) + 1
+                        End If
+                        If bLen > 0 Then
+                            ReDim strBytes(0 To bLen - 1)
+                            For vbi = 0 To bLen - 1
+                                strBytes(vbi) = binBytes(LBound(binBytes) + vbi)
+                            Next vbi
+                            addBytesLen = bLen
+                        End If
+                    ElseIf tdef.Columns(varColIdx).ColType = JetColumnType.ColLongBinary Then
+                        If VarType(vFieldVal) = (vbArray Or vbByte) Then
+                            longBinBytes = vFieldVal
+                            lbLen = UBound(longBinBytes) - LBound(longBinBytes) + 1
+                        Else
+                            longBinBytes = EncodeTextBytes(CStr(vFieldVal))
+                            lbLen = UBound(longBinBytes) + 1
+                        End If
+                        If lbLen > 0 Then
+                            strBytes = EncodeLvalDescriptorOrInline(fileNum, totalPages, tdef.TdefPageNumber, longBinBytes)
+                            addBytesLen = UBound(strBytes) + 1
+                        End If
+                    ElseIf tdef.Columns(varColIdx).ColType = JetColumnType.ColMemo Then
+                        sMemo = CStr(vFieldVal)
+                        memoTextBytes = EncodeTextBytes(sMemo, tdef.Columns(varColIdx).CompressedUnicode)
+                        mLen = UBound(memoTextBytes) + 1
+                        If mLen > 0 Then
+                            strBytes = EncodeLvalDescriptorOrInline(fileNum, totalPages, tdef.TdefPageNumber, memoTextBytes)
+                            addBytesLen = UBound(strBytes) + 1
+                        End If
+                    ElseIf tdef.Columns(varColIdx).ColType = JetColumnType.ColByte Then
+                        ReDim strBytes(0 To 0)
+                        strBytes(0) = CByte(CLng(vFieldVal) And &HFF&)
+                        addBytesLen = 1
+                    ElseIf tdef.Columns(varColIdx).ColType = JetColumnType.ColInteger Then
+                        ReDim strBytes(0 To 1)
+                        Dim vIntVal As Integer
+                        Dim vUIntVal As Long
+                        vIntVal = CInt(vFieldVal)
+                        If vIntVal < 0 Then vUIntVal = CLng(vIntVal) + &H10000& Else vUIntVal = CLng(vIntVal)
+                        PageWriter.WriteUInt16LE strBytes, 0, vUIntVal
+                        addBytesLen = 2
+                    ElseIf tdef.Columns(varColIdx).ColType = JetColumnType.ColLong Or tdef.Columns(varColIdx).ColType = JetColumnType.ColComplex Then
+                        ReDim strBytes(0 To 3)
+                        PageWriter.WriteInt32LE strBytes, 0, CLng(vFieldVal)
+                        addBytesLen = 4
+                    ElseIf tdef.Columns(varColIdx).ColType = JetColumnType.ColGUID Then
+                        strBytes = EncodeGuidBytes(CStr(vFieldVal))
+                        addBytesLen = 16
+                    Else
+                        strBytes = EncodeTextBytes(CStr(vFieldVal), tdef.Columns(varColIdx).CompressedUnicode)
+                        addBytesLen = UBound(strBytes) + 1
+                    End If
+
+                    If addBytesLen > 0 Then
+                        oldPayloadLen = varPayloadLen
+                        varPayloadLen = varPayloadLen + addBytesLen
+                        ReDim Preserve varPayload(0 To varPayloadLen - 1)
+                        For b = 0 To addBytesLen - 1
+                            varPayload(oldPayloadLen + b) = strBytes(LBound(strBytes) + b)
+                        Next b
+                    End If
+                End If
+            End If
+        Next targetV
+
+        ' 4. Assemble variable offset table (reverse order before varLen)
+        varTableLen = 0
+
+        If tdef.VariableColumnCount > 0 Then
+            varTableLen = (CLng(tdef.VariableColumnCount) * 2) + 4
+            ReDim varTableBytes(0 To varTableLen - 1)
+            eodOffset = 2 + CLng(fixedLen) + varPayloadLen
+
+            PageWriter.WriteUInt16LE varTableBytes, 0, CInt(eodOffset)
+            For v = tdef.VariableColumnCount - 1 To 0 Step -1
+                revIdx = CLng(tdef.VariableColumnCount) - 1 - CLng(v)
+                vSlotOff = 2 + (revIdx * 2)
+                PageWriter.WriteUInt16LE varTableBytes, vSlotOff, varOffsets(v)
+            Next v
+            PageWriter.WriteUInt16LE varTableBytes, varTableLen - 2, tdef.VariableColumnCount
+        End If
+
+        ' 5. Final Row Concatenation: NumCols(2) + FixedBuf + VarPayload + VarTable + NullMask
+        totalRowLen = 2 + fixedLen + varPayloadLen + varTableLen + nullMaskLen
+        If totalRowLen > MAX_JET4_ROW_BYTES Then
+            Err.Raise vbObjectError + 3047, "RecordWriter.PackJet4Row", "Record is too large (" & CStr(totalRowLen) & " bytes exceeds max page row size of " & CStr(MAX_JET4_ROW_BYTES) & " bytes)."
+        End If
+
+        ReDim result(0 To totalRowLen - 1)
+
+        PageWriter.WriteUInt16LE result, 0, numCols
+        curPos = 2
+
+        If fixedLen > 0 Then
+            For f = 0 To fixedLen - 1
+                result(curPos + f) = fixedBuf(f)
+            Next f
+            curPos = curPos + fixedLen
+        End If
+
+        If varPayloadLen > 0 Then
+            For vp = 0 To varPayloadLen - 1
+                result(curPos + vp) = varPayload(vp)
+            Next vp
+            curPos = curPos + varPayloadLen
+        End If
+
+        If varTableLen > 0 Then
+            For vt = 0 To varTableLen - 1
+                result(curPos + vt) = varTableBytes(vt)
+            Next vt
+            curPos = curPos + varTableLen
+        End If
+
+        For nm = 0 To nullMaskLen - 1
+            result(curPos + nm) = nullMask(nm)
+        Next nm
+
+        PackJet4Row = result
+    End Function
+
+    Private Function EncodeGuidBytes(ByVal guidStr As String) As Byte()
+        Dim g(0 To 15) As Byte
+        Dim clean As String
+        clean = Replace$(Replace$(Replace$(Trim$(guidStr), "{", ""), "}", ""), "-", "")
+        If Len(clean) = 32 Then
+            On Error Resume Next
+            ' Data1 (4 bytes little-endian)
+            g(3) = CByte(CLng("&H" & Mid$(clean, 1, 2)) And &HFF&)
+            g(2) = CByte(CLng("&H" & Mid$(clean, 3, 2)) And &HFF&)
+            g(1) = CByte(CLng("&H" & Mid$(clean, 5, 2)) And &HFF&)
+            g(0) = CByte(CLng("&H" & Mid$(clean, 7, 2)) And &HFF&)
+            ' Data2 (2 bytes little-endian)
+            g(5) = CByte(CLng("&H" & Mid$(clean, 9, 2)) And &HFF&)
+            g(4) = CByte(CLng("&H" & Mid$(clean, 11, 2)) And &HFF&)
+            ' Data3 (2 bytes little-endian)
+            g(7) = CByte(CLng("&H" & Mid$(clean, 13, 2)) And &HFF&)
+            g(6) = CByte(CLng("&H" & Mid$(clean, 15, 2)) And &HFF&)
+            ' Data4 (8 bytes big-endian)
+            Dim k As Long
+            For k = 0 To 7
+                g(8 + k) = CByte(CLng("&H" & Mid$(clean, 17 + (k * 2), 2)) And &HFF&)
+            Next k
+            On Error GoTo 0
+        End If
+        EncodeGuidBytes = g
+    End Function
+
+    Public Sub WriteLvalSingleChunk(ByVal fileNum As Integer, ByRef totalPages As Long, ByVal ownerTdefPage As Long, ByRef payload() As Byte, ByRef outLvalPage As Long, ByRef outLvalSlot As Integer)
+        Dim pLen As Long
+        Dim lvalPage As Long
+        Dim lp() As Byte
+        Dim rowStart As Long
+        Dim freeSpace As Long
+        Dim i As Long
+
+        pLen = UBound(payload) - LBound(payload) + 1
+        lvalPage = PageWriter.AllocateNewPage(fileNum, totalPages, &H1&, 0)
+        lp = CatalogReader.ReadPageBytes(fileNum, totalPages, lvalPage)
+
+        lp(0) = &H1& ' PAGE_TYPE_DATA (LVAL page)
+        lp(1) = &H1&
+        PageWriter.WriteInt32LE lp, 4, &H4C56414C ' ASCII "LVAL"
+        PageWriter.WriteUInt16LE lp, 12, 1 ' 1 slot
+
+        rowStart = PAGE_SIZE_JET4 - pLen
+        If rowStart < 16 Then rowStart = 16
+        For i = 0 To pLen - 1
+            If rowStart + i < PAGE_SIZE_JET4 Then
+                lp(rowStart + i) = payload(LBound(payload) + i)
+            End If
+        Next i
+
+        PageWriter.WriteUInt16LE lp, 14, rowStart
+        freeSpace = rowStart - 16
+        If freeSpace < 0 Then freeSpace = 0
+        PageWriter.WriteUInt16LE lp, 2, freeSpace
+
+        PageWriter.WritePageBytes fileNum, totalPages, lvalPage, lp
+        If ownerTdefPage > 0 Then
+            PageWriter.UpdateLvalUsageMapBit fileNum, totalPages, ownerTdefPage, lvalPage, True
+        End If
+        outLvalPage = lvalPage
+        outLvalSlot = 0
+    End Sub
+
+    Public Sub WriteLvalChainChunks(ByVal fileNum As Integer, ByRef totalPages As Long, ByVal ownerTdefPage As Long, ByRef payload() As Byte, ByRef outFirstPage As Long, ByRef outFirstSlot As Integer)
+        Const MAX_CHUNK_DATA As Long = 4000
+        Dim totalLen As Long
+        Dim numChunks As Long
+        Dim chunkPages() As Long
+        Dim cIdx As Long
+        Dim chunkOffset As Long
+        Dim chunkLen As Long
+        Dim recLen As Long
+        Dim rowStart As Long
+        Dim nextPage As Long
+        Dim nextSlot As Byte
+        Dim lp() As Byte
+        Dim i As Long
+        Dim freeSpace As Long
+
+        totalLen = UBound(payload) - LBound(payload) + 1
+        numChunks = (totalLen + MAX_CHUNK_DATA - 1) \ MAX_CHUNK_DATA
+        If numChunks <= 0 Then numChunks = 1
+        ReDim chunkPages(0 To numChunks - 1)
+
+        For cIdx = 0 To numChunks - 1
+            chunkPages(cIdx) = PageWriter.AllocateNewPage(fileNum, totalPages, &H1&, 0)
+        Next cIdx
+
+        For cIdx = 0 To numChunks - 1
+            chunkOffset = cIdx * MAX_CHUNK_DATA
+            chunkLen = totalLen - chunkOffset
+            If chunkLen > MAX_CHUNK_DATA Then chunkLen = MAX_CHUNK_DATA
+            recLen = 4 + chunkLen
+            rowStart = PAGE_SIZE_JET4 - recLen
+
+            If cIdx < numChunks - 1 Then
+                nextPage = chunkPages(cIdx + 1)
+                nextSlot = 0
+            Else
+                nextPage = 0
+                nextSlot = 0
+            End If
+
+            lp = CatalogReader.ReadPageBytes(fileNum, totalPages, chunkPages(cIdx))
+            lp(0) = &H1& ' PAGE_TYPE_DATA (LVAL page)
+            lp(1) = &H1&
+            PageWriter.WriteInt32LE lp, 4, &H4C56414C ' ASCII "LVAL"
+            PageWriter.WriteUInt16LE lp, 12, 1 ' 1 slot
+            PageWriter.WriteUInt16LE lp, 14, rowStart
+
+            ' 4-byte next chunk pointer (byte 0 = slot, bytes 1..3 = 24-bit page number)
+            lp(rowStart) = nextSlot
+            lp(rowStart + 1) = CByte(nextPage And &HFF&)
+            lp(rowStart + 2) = CByte((nextPage \ &H100&) And &HFF&)
+            lp(rowStart + 3) = CByte((nextPage \ &H10000&) And &HFF&)
+
+            For i = 0 To chunkLen - 1
+                lp(rowStart + 4 + i) = payload(LBound(payload) + chunkOffset + i)
+            Next i
+
+            freeSpace = rowStart - 16
+            If freeSpace < 0 Then freeSpace = 0
+            PageWriter.WriteUInt16LE lp, 2, freeSpace
+
+            PageWriter.WritePageBytes fileNum, totalPages, chunkPages(cIdx), lp
+            If ownerTdefPage > 0 Then
+                PageWriter.UpdateLvalUsageMapBit fileNum, totalPages, ownerTdefPage, chunkPages(cIdx), True
+            End If
+        Next cIdx
+
+        outFirstPage = chunkPages(0)
+        outFirstSlot = 0
+    End Sub
+
+    Public Function EncodeLvalDescriptorOrInline(ByVal fileNum As Integer, ByRef totalPages As Long, ByVal ownerTdefPage As Long, ByRef rawPayload() As Byte) As Byte()
+        Dim pLen As Long
+        Dim desc() As Byte
+        Dim lvPage As Long
+        Dim lvSlot As Integer
+        Dim i As Long
+
+        pLen = UBound(rawPayload) - LBound(rawPayload) + 1
+        If pLen <= 64 Or fileNum <= 0 Or totalPages <= 0 Then
+            ReDim desc(0 To 12 + pLen - 1)
+            desc(0) = CByte(pLen And &HFF&)
+            desc(1) = CByte((pLen \ &H100&) And &HFF&)
+            desc(2) = CByte((pLen \ &H10000&) And &HFF&)
+            desc(3) = &H80&
+            For i = 0 To pLen - 1
+                desc(12 + i) = rawPayload(LBound(rawPayload) + i)
+            Next i
+            EncodeLvalDescriptorOrInline = desc
+            Exit Function
+        ElseIf pLen <= 4000 Then
+            WriteLvalSingleChunk fileNum, totalPages, ownerTdefPage, rawPayload, lvPage, lvSlot
+            ReDim desc(0 To 11)
+            desc(0) = CByte(pLen And &HFF&)
+            desc(1) = CByte((pLen \ &H100&) And &HFF&)
+            desc(2) = CByte((pLen \ &H10000&) And &HFF&)
+            desc(3) = &H40&
+            desc(4) = CByte(lvSlot And &HFF&)
+            desc(5) = CByte(lvPage And &HFF&)
+            desc(6) = CByte((lvPage \ &H100&) And &HFF&)
+            desc(7) = CByte((lvPage \ &H10000&) And &HFF&)
+            EncodeLvalDescriptorOrInline = desc
+            Exit Function
+        Else
+            WriteLvalChainChunks fileNum, totalPages, ownerTdefPage, rawPayload, lvPage, lvSlot
+            ReDim desc(0 To 11)
+            desc(0) = CByte(pLen And &HFF&)
+            desc(1) = CByte((pLen \ &H100&) And &HFF&)
+            desc(2) = CByte((pLen \ &H10000&) And &HFF&)
+            desc(3) = &H0&
+            desc(4) = CByte(lvSlot And &HFF&)
+            desc(5) = CByte(lvPage And &HFF&)
+            desc(6) = CByte((lvPage \ &H100&) And &HFF&)
+            desc(7) = CByte((lvPage \ &H10000&) And &HFF&)
+            EncodeLvalDescriptorOrInline = desc
+            Exit Function
+        End If
+    End Function
+
+    Public Function WriteLvalPage(ByVal fileNum As Integer, ByRef totalPages As Long, ByVal tdefPage As Long, ByRef payload() As Byte) As Byte()
+        WriteLvalPage = EncodeLvalDescriptorOrInline(fileNum, totalPages, tdefPage, payload)
+    End Function
+
+    Public Function EncodeTextBytes(ByVal sText As String, Optional ByVal allowCompress As Boolean = True) As Byte()
+        Dim strBytes() As Byte
+        Dim nChars As Long
+        Dim canCompress As Boolean
+        Dim chIdx As Long
+        Dim chCode As Long
+        Dim uVal As Long
+
+        nChars = Len(sText)
+        If nChars = 0 Then
+            If allowCompress Then
+                ReDim strBytes(0 To 1)
+                strBytes(0) = &HFF&: strBytes(1) = &HFE&
+            Else
+                ReDim strBytes(0 To 0)
+                strBytes(0) = 0
+            End If
+            EncodeTextBytes = strBytes
+            Exit Function
+        End If
+
+        canCompress = allowCompress
+        If canCompress Then
+            For chIdx = 1 To nChars
+                chCode = CLng(AscW(Mid$(sText, chIdx, 1))) And &HFFFF&
+                If chCode > 255 Or chCode = 0 Then
+                    canCompress = False
+                    Exit For
+                End If
+            Next chIdx
+        End If
+
+        If canCompress Then
+            ReDim strBytes(0 To nChars + 1)
+            strBytes(0) = &HFF&
+            strBytes(1) = &HFE&
+            For chIdx = 1 To nChars
+                strBytes(chIdx + 1) = CByte(AscW(Mid$(sText, chIdx, 1)) And &HFF&)
+            Next chIdx
+        Else
+            ReDim strBytes(0 To (nChars * 2) - 1)
+            For chIdx = 1 To nChars
+                uVal = AscW(Mid$(sText, chIdx, 1)) And &HFFFF&
+                strBytes((chIdx - 1) * 2) = CByte(uVal And &HFF&)
+                strBytes((chIdx - 1) * 2 + 1) = CByte((uVal \ 256&) And &HFF&)
+            Next chIdx
+        End If
+        EncodeTextBytes = strBytes
+    End Function
+
+    Public Function AllocateUsageMapRecord(ByVal fileNum As Integer, ByRef totalPages As Long, ByVal initialPageBit As Long) As Long
+        Dim umapPage As Long
+        Dim up() As Byte
+        Dim pgScan As Long
+        Dim candBuf() As Byte
+        Dim numSlots As Long
+        Dim currRowTop As Long
+        Dim slotTableEnd As Long
+        Dim newRowStart As Long
+        Dim basePage As Long
+        Dim relPage As Long
+        Dim bClear As Long
+
+        umapPage = 0
+        For pgScan = 1 To totalPages - 1
+            candBuf = CatalogReader.ReadPageBytes(fileNum, totalPages, pgScan)
+            If candBuf(0) = &H1& And FormatProbe.ReadInt32LE(candBuf, 4) = 0 Then
+                numSlots = ReadUInt16LE_Local(candBuf, 12)
+                If numSlots > 0 And numSlots < 55 Then
+                    currRowTop = FindLowestRowOffset(candBuf, numSlots)
+                    slotTableEnd = 14 + (numSlots * 2)
+                    If (currRowTop - slotTableEnd) >= 71 Then
+                        umapPage = pgScan
+                        up = candBuf
+                        Exit For
+                    End If
+                End If
+            End If
+        Next pgScan
+
+        If umapPage = 0 Then
+            umapPage = PageWriter.AllocateNewPage(fileNum, totalPages, &H1&, 0)
+            up = CatalogReader.ReadPageBytes(fileNum, totalPages, umapPage)
+            up(0) = &H1&
+            up(1) = &H1&
+            PageWriter.WriteUInt16LE up, 2, 4082
+            PageWriter.WriteInt32LE up, 4, 0
+            PageWriter.WriteUInt16LE up, 12, 0
+            numSlots = 0
+            currRowTop = PAGE_SIZE_JET4
+            slotTableEnd = 14
+        End If
+
+        newRowStart = currRowTop - 69
+        For bClear = newRowStart To newRowStart + 68
+            up(bClear) = 0
+        Next bClear
+
+        up(newRowStart) = 0 ' Type 0 inline usage map (1 byte map_type=0 + 4 byte basePage + 64 byte bitmap)
+        basePage = 0
+        If initialPageBit >= 512 Then
+            basePage = (initialPageBit \ 8) * 8
+        End If
+        PageWriter.WriteInt32LE up, newRowStart + 1, basePage
+
+        If initialPageBit > 0 Then
+            relPage = initialPageBit - basePage
+            If relPage >= 0 And relPage < 512 Then
+                up(newRowStart + 5 + (relPage \ 8)) = up(newRowStart + 5 + (relPage \ 8)) Or BitMaskByte(CInt(relPage Mod 8))
+            End If
+        End If
+
+        PageWriter.WriteUInt16LE up, 14 + (numSlots * 2), newRowStart
+        PageWriter.WriteUInt16LE up, 12, numSlots + 1
+        PageWriter.WriteUInt16LE up, 2, newRowStart - (slotTableEnd + 2)
+        PageWriter.WritePageBytes fileNum, totalPages, umapPage, up
+
+        AllocateUsageMapRecord = (umapPage * 256&) Or (numSlots And &HFF&)
+    End Function
+
+    Public Sub CreateTableTdefPage(ByVal fileNum As Integer, ByRef totalPages As Long, ByRef tdef As TableDefDescriptor)
+        Dim autoTransStarted As Boolean
+        Dim savedErrNum As Long
+        Dim savedErrDesc As String
+        Dim savedErrSrc As String
+
+        autoTransStarted = PageWriter.BeginAutoTransaction(fileNum, totalPages)
+        On Error GoTo AutoTransErr
+
+        WriteCompleteJet4TdefPage fileNum, totalPages, tdef, True
+
+        If autoTransStarted Then PageWriter.CommitTransaction
+        Exit Sub
+
+AutoTransErr:
+        savedErrNum = Err.Number
+        savedErrDesc = Err.Description
+        savedErrSrc = Err.Source
+        If autoTransStarted Then
+            On Error Resume Next
+            PageWriter.RollbackTransaction totalPages
+            On Error GoTo 0
+        End If
+        Err.Raise savedErrNum, savedErrSrc, savedErrDesc
+    End Sub
+
+    Public Sub WriteTableTdefPage(ByVal fileNum As Integer, ByRef totalPages As Long, ByRef tdef As TableDefDescriptor)
+        If tdef.TdefPageNumber <= 0 Or tdef.TdefPageNumber >= totalPages Then Exit Sub
+        WriteCompleteJet4TdefPage fileNum, totalPages, tdef, False
+        CatalogReader.InvalidatePageDirectory
+    End Sub
+
+    Private Sub WriteCompleteJet4TdefPage(ByVal fileNum As Integer, ByRef totalPages As Long, ByRef tdef As TableDefDescriptor, ByVal isNewTable As Boolean)
+        Dim tdefPage As Long
+        Dim dataPage As Long
+        Dim usedPagesPtr As Long
+        Dim freePagesPtr As Long
+        Dim oldP() As Byte
+        Dim p(0 To 4095) As Byte
+        Dim p2() As Byte
+        Dim p2NumRealIdx As Long
+        Dim p2NumCols As Long
+        Dim p2ColOff As Long
+        Dim p2Scan As Long
+        Dim structureTag As Long
+        Dim realIdxTag As Long
+        Dim sortOrderLow As Long
+        Dim sortOrderHigh As Long
+        Dim hasAutoNum As Boolean
+        Dim numIdx As Long
+        Dim numRealIdx As Long
+        Dim off As Long
+        Dim i As Integer
+        Dim colFlags As Byte
+        Dim colByteLen As Long
+        Dim colName As String
+        Dim bLen As Long
+        Dim k As Long
+        Dim idxI As Long
+        Dim keySlot As Long
+        Dim targetColName As String
+        Dim matchedColNum As Integer
+        Dim cScan As Integer
+        Dim idxLeafPage As Long
+        Dim idxUmapPtr As Long
+        Dim ipg(0 To 4095) As Byte
+        Dim idxFlagsByte As Byte
+        Dim idxName As String
+        Dim idxNameLen As Long
+        Dim ik As Long
+        Dim lvalUsedPtr As Long
+        Dim lvalFreePtr As Long
+        Dim existingRows As Collection
+        Dim existingLocs As Collection
+        Dim rIdx As Long
+        Dim locStr As String
+        Dim locParts() As String
+        Dim rPageNum As Long
+        Dim rSlotIdx As Integer
+        Dim keyColNums(0 To 9) As Integer
+        Dim keyOrders(0 To 9) As Byte
+        Dim numKeys As Long
+
+        Dim fixedVarIdxFromP2 As Boolean
+        structureTag = 1625&
+        realIdxTag = 1923&
+        sortOrderLow = &H409&
+        sortOrderHigh = &H100&
+        fixedVarIdxFromP2 = False
+
+        If totalPages > 2 Then
+            p2 = CatalogReader.ReadPageBytes(fileNum, totalPages, 2)
+            If p2(0) = &H2& Then
+                If FormatProbe.ReadInt32LE(p2, 12) > 0 Then
+                    structureTag = FormatProbe.ReadInt32LE(p2, 12)
+                End If
+                p2NumRealIdx = FormatProbe.ReadInt32LE(p2, 51)
+                p2NumCols = FormatProbe.ReadUInt16LE(p2, 45)
+                p2ColOff = 63 + (12 * p2NumRealIdx)
+                If p2ColOff + 25 <= PAGE_SIZE_JET4 Then
+                    If (p2(p2ColOff + 15) And &H1&) <> 0 And FormatProbe.ReadUInt16LE(p2, p2ColOff + 7) > 0 Then
+                        fixedVarIdxFromP2 = True
+                    End If
+                End If
+                For p2Scan = 0 To p2NumCols - 1
+                    If p2ColOff + 25 <= PAGE_SIZE_JET4 Then
+                        If p2(p2ColOff) = &HA& Then
+                            If FormatProbe.ReadUInt16LE(p2, p2ColOff + 11) > 0 Then
+                                sortOrderLow = FormatProbe.ReadUInt16LE(p2, p2ColOff + 11)
+                                sortOrderHigh = FormatProbe.ReadUInt16LE(p2, p2ColOff + 13)
+                                Exit For
+                            End If
+                        End If
+                    End If
+                    p2ColOff = p2ColOff + 25
+                Next p2Scan
+            End If
+        End If
+
+        If isNewTable Then
+            tdefPage = PageWriter.AllocateNewPage(fileNum, totalPages, &H2&, 0)
+            dataPage = PageWriter.AllocateNewPage(fileNum, totalPages, &H1&, tdefPage)
+            tdef.TdefPageNumber = tdefPage
+            tdef.PrimaryDataPage = dataPage
+            usedPagesPtr = AllocateUsageMapRecord(fileNum, totalPages, dataPage)
+            freePagesPtr = AllocateUsageMapRecord(fileNum, totalPages, dataPage)
+        Else
+            tdefPage = tdef.TdefPageNumber
+            oldP = CatalogReader.ReadPageBytes(fileNum, totalPages, tdefPage)
+            If oldP(0) <> &H2& Then Exit Sub
+            usedPagesPtr = FormatProbe.ReadInt32LE(oldP, 55)
+            freePagesPtr = FormatProbe.ReadInt32LE(oldP, 59)
+            If usedPagesPtr < 256 Then
+                usedPagesPtr = AllocateUsageMapRecord(fileNum, totalPages, tdef.PrimaryDataPage)
+            End If
+            If freePagesPtr < 256 Then
+                freePagesPtr = AllocateUsageMapRecord(fileNum, totalPages, tdef.PrimaryDataPage)
+            End If
+        End If
+
+        If tdef.TableTypeByte = 0 Then tdef.TableTypeByte = &H4E& ' User table 'N'
+
+        hasAutoNum = False
+        For i = 0 To tdef.ColumnCount - 1
+            If tdef.Columns(i).IsAutoNumber Then
+                hasAutoNum = True
+                Exit For
+            End If
+        Next i
+        If hasAutoNum And tdef.AutoNumberNext <= 0 Then
+            tdef.AutoNumberNext = 1
+        End If
+
+        If Not isNewTable Then
+            On Error Resume Next
+            Set existingRows = RowDecoder.ReadDataPageRows(fileNum, totalPages, tdef, existingLocs)
+            If Err.Number = 0 And Not existingRows Is Nothing Then
+                tdef.RowCount = existingRows.Count
+            End If
+            Err.Clear
+            On Error GoTo 0
+        End If
+
+        Dim assignedRealIdx() As Long
+        Dim rSlot As Long
+        Dim hasReal0 As Boolean
+        numIdx = CLng(tdef.IndexCount)
+        If numIdx < 0 Then numIdx = 0
+        numRealIdx = 0
+        hasReal0 = False
+        If numIdx > 0 Then
+            ReDim assignedRealIdx(0 To numIdx - 1)
+            For idxI = 0 To numIdx - 1
+                If tdef.Indexes(idxI).IndexType = 2 And tdef.Indexes(idxI).RelTblType = 1 And hasReal0 Then
+                    assignedRealIdx(idxI) = 0
+                Else
+                    assignedRealIdx(idxI) = numRealIdx
+                    numRealIdx = numRealIdx + 1
+                    hasReal0 = True
+                End If
+            Next idxI
+        End If
+
+        p(0) = &H2& ' PAGE_TYPE_TDEF
+        p(1) = &H1&
+        PageWriter.WriteInt32LE p, 12, structureTag
+        PageWriter.WriteInt32LE p, 16, tdef.RowCount
+        If hasAutoNum Then
+            PageWriter.WriteInt32LE p, 20, tdef.AutoNumberNext
+            p(24) = &H1&
+        Else
+            PageWriter.WriteInt32LE p, 20, 0
+            p(24) = 0
+        End If
+        p(40) = tdef.TableTypeByte
+        PageWriter.WriteUInt16LE p, 41, tdef.ColumnCount
+        PageWriter.WriteUInt16LE p, 43, tdef.VariableColumnCount
+        PageWriter.WriteUInt16LE p, 45, tdef.ColumnCount
+        PageWriter.WriteInt32LE p, 47, numIdx
+        PageWriter.WriteInt32LE p, 51, numRealIdx
+        PageWriter.WriteInt32LE p, 55, usedPagesPtr
+        PageWriter.WriteInt32LE p, 59, freePagesPtr
+
+        off = 63
+        For idxI = 0 To numRealIdx - 1
+            PageWriter.WriteInt32LE p, off, 0
+            PageWriter.WriteInt32LE p, off + 4, tdef.RowCount
+            PageWriter.WriteInt32LE p, off + 8, 0
+            off = off + 12
+        Next idxI
+
+        For i = 0 To tdef.ColumnCount - 1
+            p(off) = CByte(tdef.Columns(i).ColType And &HFF&)
+            PageWriter.WriteInt32LE p, off + 1, structureTag
+            PageWriter.WriteUInt16LE p, off + 5, tdef.Columns(i).ColNumber
+            If tdef.Columns(i).IsFixed Then
+                If fixedVarIdxFromP2 Then
+                    PageWriter.WriteUInt16LE p, off + 7, tdef.VariableColumnCount
+                Else
+                    PageWriter.WriteUInt16LE p, off + 7, 0
+                End If
+            Else
+                PageWriter.WriteUInt16LE p, off + 7, tdef.Columns(i).VarOffsetIndex
+            End If
+            PageWriter.WriteUInt16LE p, off + 9, tdef.Columns(i).ColId
+
+            If tdef.Columns(i).ColType = JetColumnType.ColText Or tdef.Columns(i).ColType = JetColumnType.ColMemo Then
+                PageWriter.WriteUInt16LE p, off + 11, sortOrderLow
+                PageWriter.WriteUInt16LE p, off + 13, sortOrderHigh
+            ElseIf tdef.Columns(i).ColType = JetColumnType.ColDecimal Then
+                p(off + 11) = 18
+                p(off + 12) = 0
+            End If
+
+            colFlags = &H2& ' 0x02 = updatable column flag in Jet4/ACE
+            If tdef.Columns(i).IsFixed Then colFlags = colFlags Or &H1&
+            If tdef.Columns(i).IsAutoNumber Then colFlags = colFlags Or &H4&
+            p(off + 15) = colFlags
+
+            If (tdef.Columns(i).ColType = JetColumnType.ColText Or tdef.Columns(i).ColType = JetColumnType.ColMemo) And tdef.Columns(i).CompressedUnicode Then
+                p(off + 16) = &H1&
+            Else
+                p(off + 16) = 0
+            End If
+
+            If tdef.Columns(i).IsFixed Then
+                PageWriter.WriteUInt16LE p, off + 21, tdef.Columns(i).FixedOffset
+            Else
+                PageWriter.WriteUInt16LE p, off + 21, 0
+            End If
+
+            colByteLen = CLng(tdef.Columns(i).ByteLength)
+            If tdef.Columns(i).ColType = JetColumnType.ColText Then
+                If colByteLen <= 0 Then colByteLen = 510
+                If (colByteLen And 1&) <> 0 Then colByteLen = colByteLen * 2
+                If colByteLen > 510 Then colByteLen = 510
+                tdef.Columns(i).ByteLength = CInt(colByteLen)
+            ElseIf tdef.Columns(i).ColType = JetColumnType.ColMemo Or tdef.Columns(i).ColType = JetColumnType.ColLongBinary Or tdef.Columns(i).ColType = JetColumnType.ColBoolean Then
+                colByteLen = 0
+                tdef.Columns(i).ByteLength = 0
+            End If
+            PageWriter.WriteUInt16LE p, off + 23, colByteLen
+            off = off + 25
+        Next i
+
+        For i = 0 To tdef.ColumnCount - 1
+            colName = tdef.Columns(i).Name
+            bLen = Len(colName) * 2
+            PageWriter.WriteUInt16LE p, off, bLen
+            off = off + 2
+            For k = 1 To Len(colName)
+                PageWriter.WriteUInt16LE p, off, AscW(Mid$(colName, k, 1)) And &HFFFF&
+                off = off + 2
+            Next k
+        Next i
+
+        If numIdx > 0 Then
+            rSlot = 0
+            For idxI = 0 To numIdx - 1
+                If assignedRealIdx(idxI) = rSlot Then
+                    PageWriter.WriteInt32LE p, off, realIdxTag
+                    numKeys = 0
+                    For keySlot = 0 To 9
+                        If keySlot < tdef.Indexes(idxI).ColumnCount Then
+                            targetColName = tdef.Indexes(idxI).ColumnNames(keySlot)
+                            matchedColNum = 0
+                            For cScan = 0 To tdef.ColumnCount - 1
+                                If StrComp(tdef.Columns(cScan).Name, targetColName, vbTextCompare) = 0 Then
+                                    matchedColNum = tdef.Columns(cScan).ColNumber
+                                    Exit For
+                                End If
+                            Next cScan
+                            PageWriter.WriteUInt16LE p, off + 4 + (keySlot * 3), matchedColNum
+                            p(off + 6 + (keySlot * 3)) = &H1& ' 0x01 = ascending
+                            keyColNums(numKeys) = matchedColNum
+                            keyOrders(numKeys) = &H1&
+                            numKeys = numKeys + 1
+                        Else
+                            PageWriter.WriteUInt16LE p, off + 4 + (keySlot * 3), &HFFFF&
+                            p(off + 6 + (keySlot * 3)) = 0
+                        End If
+                    Next keySlot
+
+                    idxLeafPage = PageWriter.AllocateNewPage(fileNum, totalPages, &H4&, tdefPage)
+                    Erase ipg
+                    ipg(0) = &H4&
+                    ipg(1) = &H1&
+                    PageWriter.WriteUInt16LE ipg, 2, PAGE_SIZE_JET4 - &H1E0&
+                    PageWriter.WriteInt32LE ipg, 4, tdefPage
+                    PageWriter.WritePageBytes fileNum, totalPages, idxLeafPage, ipg
+
+                    idxUmapPtr = AllocateUsageMapRecord(fileNum, totalPages, idxLeafPage)
+                    PageWriter.WriteInt32LE p, off + 34, idxUmapPtr
+                    PageWriter.WriteInt32LE p, off + 38, idxLeafPage
+
+                    If tdef.Indexes(idxI).RealIdxFlags <> 0 Then
+                        idxFlagsByte = tdef.Indexes(idxI).RealIdxFlags
+                    Else
+                        idxFlagsByte = &H80&
+                        If tdef.Indexes(idxI).IsPrimary Then
+                            idxFlagsByte = idxFlagsByte Or &H1& Or &H8&
+                        ElseIf tdef.Indexes(idxI).IsUnique Then
+                            idxFlagsByte = idxFlagsByte Or &H1&
+                        ElseIf tdef.Indexes(idxI).IndexType = 2 Then
+                            idxFlagsByte = idxFlagsByte Or &H2&
+                        End If
+                    End If
+                    p(off + 46) = idxFlagsByte
+                    off = off + 52
+
+                    If Not isNewTable And tdef.RowCount > 0 And numKeys > 0 Then
+                        On Error Resume Next
+                        If Not existingRows Is Nothing Then
+                            For rIdx = 1 To existingRows.Count
+                                locStr = CStr(existingLocs(rIdx))
+                                locParts = Split(locStr, "|")
+                                If UBound(locParts) >= 1 Then
+                                    rPageNum = CLng(Val(locParts(0)))
+                                    rSlotIdx = CInt(Val(locParts(1)))
+                                    UpdateLeafIndexPage fileNum, totalPages, tdef, idxLeafPage, keyColNums, keyOrders, numKeys, idxFlagsByte, 1, existingRows(rIdx), rPageNum, rSlotIdx, 0, 0
+                                End If
+                            Next rIdx
+                        End If
+                        Err.Clear
+                        On Error GoTo 0
+                    End If
+                    rSlot = rSlot + 1
+                End If
+            Next idxI
+
+            For idxI = 0 To numIdx - 1
+                PageWriter.WriteInt32LE p, off, structureTag
+                PageWriter.WriteInt32LE p, off + 4, idxI
+                PageWriter.WriteInt32LE p, off + 8, assignedRealIdx(idxI)
+                If tdef.Indexes(idxI).IndexType = 2 Then
+                    p(off + 12) = tdef.Indexes(idxI).RelTblType
+                    PageWriter.WriteInt32LE p, off + 13, tdef.Indexes(idxI).RelIdxNum
+                    PageWriter.WriteInt32LE p, off + 17, tdef.Indexes(idxI).RelTblPage
+                    p(off + 21) = tdef.Indexes(idxI).CascadeUpdates
+                    p(off + 22) = tdef.Indexes(idxI).CascadeDeletes
+                    p(off + 23) = 2
+                Else
+                    p(off + 12) = 0
+                    PageWriter.WriteInt32LE p, off + 13, -1&
+                    PageWriter.WriteInt32LE p, off + 17, 0
+                    p(off + 21) = 0
+                    p(off + 22) = 0
+                    p(off + 23) = IIf(tdef.Indexes(idxI).IsPrimary, &H1&, 0)
+                End If
+                PageWriter.WriteInt32LE p, off + 24, 0
+                off = off + 28
+            Next idxI
+
+            For idxI = 0 To numIdx - 1
+                idxName = tdef.Indexes(idxI).Name
+                If Len(idxName) = 0 Then idxName = "PrimaryKey"
+                idxNameLen = Len(idxName) * 2
+                PageWriter.WriteUInt16LE p, off, idxNameLen
+                off = off + 2
+                For ik = 1 To Len(idxName)
+                    PageWriter.WriteUInt16LE p, off, AscW(Mid$(idxName, ik, 1)) And &HFFFF&
+                    off = off + 2
+                Next ik
+            Next idxI
+        End If
+
+        ' Standard Jet4/ACE 2-byte 0xFFFF TDEF trailer (matches Jackcess SIZE_TDEF_TRAILER = 2 and mdbtools)
+        PageWriter.WriteUInt16LE p, off, &HFFFF&
+        off = off + 2
+
+        PageWriter.WriteInt32LE p, 8, off
+        PageWriter.WriteUInt16LE p, 2, PAGE_SIZE_JET4 - off
+        PageWriter.WritePageBytes fileNum, totalPages, tdefPage, p
+    End Sub
+
+    Public Function InsertRecord(ByVal fileNum As Integer, ByRef totalPages As Long, ByRef tdef As TableDefDescriptor, ByVal fieldValues As Variant, Optional ByRef outPageNum As Long = 0, Optional ByRef outSlotIdx As Integer = 0, Optional ByVal isRelocatedUpdate As Boolean = False) As Boolean
+        InsertRecord = False
+        Dim rowBytes() As Byte
+        Dim rowLen As Long
+        Dim dPages As Collection
+        Dim targetPage As Long
+        Dim dp() As Byte
+        Dim numRows As Long
+        Dim currRowTop As Long
+        Dim slotTableEnd As Long
+        Dim freeSpace As Long
+        Dim pVar As Variant
+        Dim candPage As Long
+        Dim newRowStart As Long
+        Dim i As Long
+        Dim newSlotOff As Long
+        Dim newFreeSpace As Long
+        Dim tp() As Byte
+        Dim diskRowCount As Long
+        Dim diskAutoNum As Long
+        Dim initialRowCount As Long
+        Dim initialAutoNum As Long
+        Dim autoTransStarted As Boolean
+        Dim savedErrNum As Long
+        Dim savedErrDesc As String
+        Dim savedErrSrc As String
+
+        initialRowCount = tdef.RowCount
+        initialAutoNum = tdef.AutoNumberNext
+
+        autoTransStarted = PageWriter.BeginAutoTransaction(fileNum, totalPages)
+        On Error GoTo AutoTransErr
+
+        rowBytes = PackJet4Row(tdef, fieldValues, fileNum, totalPages)
+        rowLen = UBound(rowBytes) + 1
+
+        ' Find a data page owned by tdefPage with enough free space or allocate a new one
+        Set dPages = CatalogReader.FindAllDataPages(fileNum, totalPages, tdef.TdefPageNumber)
+        If dPages.Count = 0 And tdef.PrimaryDataPage > 0 And tdef.PrimaryDataPage < totalPages Then
+            Dim chkBuf() As Byte
+            chkBuf = CatalogReader.ReadPageBytes(fileNum, totalPages, tdef.PrimaryDataPage)
+            If chkBuf(0) = &H1& And FormatProbe.ReadInt32LE(chkBuf, 4) = tdef.TdefPageNumber Then
+                dPages.Add tdef.PrimaryDataPage
+            End If
+        End If
+
+        targetPage = -1
+        For Each pVar In dPages
+            candPage = CLng(pVar)
+            dp = CatalogReader.ReadPageBytes(fileNum, totalPages, candPage)
+            If dp(0) = &H1& And FormatProbe.ReadInt32LE(dp, 4) = tdef.TdefPageNumber Then
+                numRows = ReadUInt16LE_Local(dp, 12)
+                currRowTop = FindLowestRowOffset(dp, numRows)
+                slotTableEnd = 14 + (CLng(numRows + 1) * 2)
+                freeSpace = currRowTop - slotTableEnd
+                If freeSpace >= (rowLen + 2) Then
+                    targetPage = candPage
+                    Exit For
+                End If
+            End If
+        Next pVar
+
+        ' Allocate a new data page if none has enough space
+        If targetPage < 0 Then
+            targetPage = PageWriter.AllocateNewPage(fileNum, totalPages, &H1&, tdef.TdefPageNumber)
+            If tdef.PrimaryDataPage <= 0 Then tdef.PrimaryDataPage = targetPage
+            dp = CatalogReader.ReadPageBytes(fileNum, totalPages, targetPage)
+            numRows = 0
+            currRowTop = PAGE_SIZE_JET4
+        Else
+            ' Ensure targetPage is always marked in Table Usage Map (offset 55) & Free Space Map (offset 59)
+            PageWriter.UpdateTableUsageMapBit fileNum, totalPages, tdef.TdefPageNumber, targetPage, True
+        End If
+
+        ' Write new row payload
+        newRowStart = currRowTop - rowLen
+        For i = 0 To rowLen - 1
+            dp(newRowStart + i) = rowBytes(i)
+        Next i
+
+        ' Write new slot entry and update free space hint at offset 2
+        newSlotOff = 14 + (CLng(numRows) * 2)
+        PageWriter.WriteUInt16LE dp, newSlotOff, newRowStart
+        PageWriter.WriteUInt16LE dp, 12, numRows + 1
+        newFreeSpace = newRowStart - (14 + (CLng(numRows + 1) * 2))
+        If newFreeSpace < 0 Then newFreeSpace = 0
+        PageWriter.WriteUInt16LE dp, 2, newFreeSpace
+
+        ' Save data page back to file
+        PageWriter.WritePageBytes fileNum, totalPages, targetPage, dp
+        outPageNum = targetPage
+        outSlotIdx = CInt(numRows)
+
+        ' Update TDEF page row count (offset 16), AutoNumber (offset 20), and all Real B-Tree Indexes
+        If tdef.TdefPageNumber > 0 And tdef.TdefPageNumber < totalPages Then
+            tp = CatalogReader.ReadPageBytes(fileNum, totalPages, tdef.TdefPageNumber)
+            If tp(0) = &H2& Then
+                diskRowCount = FormatProbe.ReadInt32LE(tp, 16)
+                If diskRowCount > tdef.RowCount Then
+                    tdef.RowCount = diskRowCount
+                End If
+                If Not isRelocatedUpdate Then
+                    tdef.RowCount = tdef.RowCount + 1
+                End If
+                PageWriter.WriteInt32LE tp, 16, tdef.RowCount
+
+                diskAutoNum = FormatProbe.ReadInt32LE(tp, 20)
+                If diskAutoNum > tdef.AutoNumberNext Then
+                    tdef.AutoNumberNext = diskAutoNum
+                End If
+
+                For i = 0 To tdef.ColumnCount - 1
+                    If tdef.Columns(i).IsAutoNumber Then
+                        If IsNumeric(fieldValues(i)) Then
+                            If CLng(fieldValues(i)) >= tdef.AutoNumberNext Then
+                                tdef.AutoNumberNext = CLng(fieldValues(i)) + 1
+                            End If
+                        End If
+                        PageWriter.WriteInt32LE tp, 20, tdef.AutoNumberNext
+                        Exit For
+                    End If
+                Next i
+
+                If Not isRelocatedUpdate Then
+                    SyncTableRealIndexes fileNum, totalPages, tdef, tp, 1, fieldValues, targetPage, outSlotIdx, 0, 0
+                End If
+
+                PageWriter.WritePageBytes fileNum, totalPages, tdef.TdefPageNumber, tp
+            End If
+        End If
+
+        If autoTransStarted Then PageWriter.CommitTransaction
+        InsertRecord = True
+        Exit Function
+
+AutoTransErr:
+        savedErrNum = Err.Number
+        savedErrDesc = Err.Description
+        savedErrSrc = Err.Source
+        tdef.RowCount = initialRowCount
+        tdef.AutoNumberNext = initialAutoNum
+        If autoTransStarted Then
+            On Error Resume Next
+            PageWriter.RollbackTransaction totalPages
+            On Error GoTo 0
+        End If
+        Err.Raise savedErrNum, savedErrSrc, savedErrDesc
+    End Function
+
+    Public Function UpdateRecord(ByVal fileNum As Integer, ByRef totalPages As Long, ByRef tdef As TableDefDescriptor, ByVal pageNum As Long, ByVal slotIdx As Integer, ByVal fieldValues As Variant, Optional ByRef outNewPageNum As Long = 0, Optional ByRef outNewSlotIdx As Integer = 0) As Boolean
+        UpdateRecord = False
+        Dim dp() As Byte
+        Dim numRows As Long
+        Dim rawEntry As Long
+        Dim oldRowStart As Long
+        Dim oldRowEnd As Long
+        Dim s As Long
+        Dim otherEntry As Long
+        Dim otherOff As Long
+        Dim oldRowLen As Long
+        Dim newRowBytes() As Byte
+        Dim newRowLen As Long
+        Dim i As Long
+        Dim padIdx As Long
+        Dim r As Long
+        Dim slots() As Integer
+        Dim starts() As Long
+        Dim ends() As Long
+        Dim flags() As Long
+        Dim payloads() As Variant
+        Dim rowBuf() As Byte
+        Dim pLen As Long
+        Dim bIdx As Long
+        Dim slotTableEnd As Long
+        Dim totalNeeded As Long
+        Dim wTop As Long
+        Dim writeRow() As Byte
+        Dim wLen As Long
+        Dim newEntryVal As Long
+        Dim newFree As Long
+        Dim tp() As Byte
+        Dim autoTransStarted As Boolean
+        Dim savedErrNum As Long
+        Dim savedErrDesc As String
+        Dim savedErrSrc As String
+
+        If pageNum <= 0 Or pageNum >= totalPages Then Exit Function
+
+        autoTransStarted = PageWriter.BeginAutoTransaction(fileNum, totalPages)
+        On Error GoTo AutoTransErr
+
+        dp = CatalogReader.ReadPageBytes(fileNum, totalPages, pageNum)
+        If dp(0) <> &H1& Then
+            If autoTransStarted Then PageWriter.CommitTransaction
+            Exit Function
+        End If
+
+        numRows = ReadUInt16LE_Local(dp, 12)
+        If slotIdx < 0 Or slotIdx >= numRows Then
+            If autoTransStarted Then PageWriter.CommitTransaction
+            Exit Function
+        End If
+
+        rawEntry = ReadUInt16LE_Local(dp, 14 + (CLng(slotIdx) * 2))
+        If (rawEntry And ROW_FLAG_DELETED) <> 0 Then
+            If autoTransStarted Then PageWriter.CommitTransaction
+            Exit Function
+        End If
+
+        oldRowStart = rawEntry And ROW_OFFSET_MASK
+        oldRowEnd = PAGE_SIZE_JET4
+        For s = 0 To numRows - 1
+            If s <> slotIdx Then
+                otherEntry = ReadUInt16LE_Local(dp, 14 + (s * 2))
+                otherOff = otherEntry And ROW_OFFSET_MASK
+                If otherOff > oldRowStart And otherOff < oldRowEnd Then
+                    oldRowEnd = otherOff
+                End If
+            End If
+        Next s
+        oldRowLen = oldRowEnd - oldRowStart
+
+        newRowBytes = PackJet4Row(tdef, fieldValues, fileNum, totalPages)
+        newRowLen = UBound(newRowBytes) + 1
+
+        ' Compact the current page whenever updating a row so every active row on the page
+        ' is packed contiguously from PAGE_SIZE_JET4 downwards and ends at its exact NullMask boundary
+        ' without trailing zero-padding bytes.
+        ReDim slots(0 To numRows - 1)
+        ReDim starts(0 To numRows - 1)
+        ReDim ends(0 To numRows - 1)
+        ReDim flags(0 To numRows - 1)
+        ReDim payloads(0 To numRows - 1)
+
+        totalNeeded = 0
+        For r = 0 To numRows - 1
+            otherEntry = ReadUInt16LE_Local(dp, 14 + (r * 2))
+            flags(r) = otherEntry And (&H8000& Or &H4000&)
+            starts(r) = otherEntry And ROW_OFFSET_MASK
+            ends(r) = FindRowEndOnPage(dp, numRows, r, starts(r))
+
+            If r = slotIdx Then
+                flags(r) = 0
+                payloads(r) = newRowBytes
+                totalNeeded = totalNeeded + newRowLen
+            ElseIf (otherEntry And ROW_FLAG_DELETED) = 0 And ends(r) > starts(r) Then
+                pLen = ends(r) - starts(r)
+                If (flags(r) And ROW_FLAG_OVERFLOW) = 0 Then
+                    pLen = TrimZeroPaddedRowLen(dp, starts(r), pLen, tdef)
+                End If
+                ReDim rowBuf(0 To pLen - 1)
+                For bIdx = 0 To pLen - 1
+                    rowBuf(bIdx) = dp(starts(r) + bIdx)
+                Next bIdx
+                payloads(r) = rowBuf
+                totalNeeded = totalNeeded + pLen
+            End If
+        Next r
+
+        slotTableEnd = 14 + (numRows * 2)
+        If (slotTableEnd + totalNeeded) <= PAGE_SIZE_JET4 Then
+            For bIdx = slotTableEnd To PAGE_SIZE_JET4 - 1
+                dp(bIdx) = 0
+            Next bIdx
+
+            wTop = PAGE_SIZE_JET4
+            For r = 0 To numRows - 1
+                If r = slotIdx Or (flags(r) And ROW_FLAG_DELETED) = 0 Then
+                    If Not IsEmpty(payloads(r)) Then
+                        writeRow = payloads(r)
+                        wLen = UBound(writeRow) - LBound(writeRow) + 1
+                        wTop = wTop - wLen
+                        For bIdx = 0 To wLen - 1
+                            dp(wTop + bIdx) = writeRow(LBound(writeRow) + bIdx)
+                        Next bIdx
+                        newEntryVal = (wTop And ROW_OFFSET_MASK) Or (CLng(flags(r)) And &HFFFF&)
+                        PageWriter.WriteUInt16LE dp, 14 + (r * 2), newEntryVal
+                    End If
+                Else
+                    newEntryVal = (wTop And ROW_OFFSET_MASK) Or ROW_FLAG_DELETED Or ROW_FLAG_OVERFLOW
+                    PageWriter.WriteUInt16LE dp, 14 + (r * 2), newEntryVal
+                End If
+            Next r
+
+            newFree = wTop - slotTableEnd
+            If newFree < 0 Then newFree = 0
+            PageWriter.WriteUInt16LE dp, 2, newFree
+
+            PageWriter.WritePageBytes fileNum, totalPages, pageNum, dp
+            outNewPageNum = pageNum
+            outNewSlotIdx = slotIdx
+
+            If tdef.TdefPageNumber > 0 And tdef.TdefPageNumber < totalPages Then
+                tp = CatalogReader.ReadPageBytes(fileNum, totalPages, tdef.TdefPageNumber)
+                If tp(0) = &H2& Then
+                    SyncTableRealIndexes fileNum, totalPages, tdef, tp, 2, fieldValues, pageNum, slotIdx, pageNum, slotIdx
+                    PageWriter.WritePageBytes fileNum, totalPages, tdef.TdefPageNumber, tp
+                End If
+            End If
+
+            If autoTransStarted Then PageWriter.CommitTransaction
+            UpdateRecord = True
+            Exit Function
+        End If
+
+        ' Otherwise relocate row to a page with enough room and store a 4-byte 0x4000 overflow pointer at the original slot so existing B-tree indexes stay 100% valid
+        If UCase$(Trim$(tdef.TableName)) = "MSYSACCESSSTORAGE" And oldRowLen >= 4 Then
+            UpdateRecord = InsertRecord(fileNum, totalPages, tdef, fieldValues, outNewPageNum, outNewSlotIdx, True)
+            If UpdateRecord Then
+                dp = CatalogReader.ReadPageBytes(fileNum, totalPages, pageNum)
+                dp(oldRowStart) = CByte(outNewSlotIdx And &HFF&)
+                dp(oldRowStart + 1) = CByte(outNewPageNum And &HFF&)
+                dp(oldRowStart + 2) = CByte((outNewPageNum \ &H100&) And &HFF&)
+                dp(oldRowStart + 3) = CByte((outNewPageNum \ &H10000&) And &HFF&)
+                PageWriter.WriteUInt16LE dp, 14 + (CLng(slotIdx) * 2), (oldRowStart And ROW_OFFSET_MASK) Or ROW_FLAG_OVERFLOW
+                PageWriter.WritePageBytes fileNum, totalPages, pageNum, dp
+                outNewPageNum = pageNum
+                outNewSlotIdx = slotIdx
+            End If
+        Else
+            PageWriter.WriteUInt16LE dp, 14 + (CLng(slotIdx) * 2), oldRowStart Or ROW_FLAG_DELETED
+            PageWriter.WritePageBytes fileNum, totalPages, pageNum, dp
+            UpdateRecord = InsertRecord(fileNum, totalPages, tdef, fieldValues, outNewPageNum, outNewSlotIdx, True)
+        End If
+
+        If UpdateRecord And tdef.TdefPageNumber > 0 And tdef.TdefPageNumber < totalPages Then
+            tp = CatalogReader.ReadPageBytes(fileNum, totalPages, tdef.TdefPageNumber)
+            If tp(0) = &H2& Then
+                SyncTableRealIndexes fileNum, totalPages, tdef, tp, 2, fieldValues, outNewPageNum, outNewSlotIdx, pageNum, slotIdx
+                PageWriter.WritePageBytes fileNum, totalPages, tdef.TdefPageNumber, tp
+            End If
+        End If
+
+        If autoTransStarted Then PageWriter.CommitTransaction
+        Exit Function
+
+AutoTransErr:
+        savedErrNum = Err.Number
+        savedErrDesc = Err.Description
+        savedErrSrc = Err.Source
+        If autoTransStarted Then
+            On Error Resume Next
+            PageWriter.RollbackTransaction totalPages
+            On Error GoTo 0
+        End If
+        Err.Raise savedErrNum, savedErrSrc, savedErrDesc
+    End Function
+
+    Public Sub DeleteRecordOnPage(ByVal fileNum As Integer, ByRef totalPages As Long, ByRef tdef As TableDefDescriptor, ByVal pageNum As Long, ByVal slotIndex As Integer)
+        Dim targetPage As Long
+        Dim dp() As Byte
+        Dim numRows As Long
+        Dim slotOff As Long
+        Dim rawEntry As Long
+        Dim rowStart As Long
+        Dim rowEnd As Long
+        Dim r As Long
+        Dim i As Long
+        Dim lowestActiveStart As Long
+        Dim rEntry As Long
+        Dim rOff As Long
+        Dim slotTableEnd As Long
+        Dim newFreeSpace As Long
+        Dim tp() As Byte
+        Dim diskRowCount As Long
+        Dim initialRowCount As Long
+        Dim autoTransStarted As Boolean
+        Dim savedErrNum As Long
+        Dim savedErrDesc As String
+        Dim savedErrSrc As String
+
+        targetPage = pageNum
+        If targetPage <= 0 Then targetPage = tdef.PrimaryDataPage
+        If targetPage <= 0 Or targetPage >= totalPages Then Exit Sub
+
+        dp = CatalogReader.ReadPageBytes(fileNum, totalPages, targetPage)
+        If dp(0) <> &H1& Then Exit Sub
+
+        numRows = ReadUInt16LE_Local(dp, 12)
+        If slotIndex < 0 Or slotIndex >= numRows Then
+            Err.Raise vbObjectError + 3312, "RecordWriter.DeleteRecord", "Invalid slot index for deletion."
+        End If
+
+        initialRowCount = tdef.RowCount
+        autoTransStarted = PageWriter.BeginAutoTransaction(fileNum, totalPages)
+        On Error GoTo AutoTransErr
+
+        slotOff = 14 + (CLng(slotIndex) * 2)
+        rawEntry = ReadUInt16LE_Local(dp, slotOff)
+        If (rawEntry And ROW_FLAG_DELETED) <> 0 Then
+            If autoTransStarted Then PageWriter.CommitTransaction
+            Exit Sub ' Already deleted
+        End If
+
+        ' Compact all active rows on the page from PAGE_SIZE_JET4 downward and mark deleted slots (wTop | 0xC000)
+        Dim dStarts() As Long
+        Dim dEnds() As Long
+        Dim dFlags() As Long
+        Dim dPayloads() As Variant
+        Dim dRowBuf() As Byte
+        Dim dLen As Long
+        Dim wTopDel As Long
+        Dim wRowDel() As Byte
+        Dim wLenDel As Long
+        Dim delEntryVal As Long
+
+        ReDim dStarts(0 To numRows - 1)
+        ReDim dEnds(0 To numRows - 1)
+        ReDim dFlags(0 To numRows - 1)
+        ReDim dPayloads(0 To numRows - 1)
+
+        For r = 0 To numRows - 1
+            rEntry = ReadUInt16LE_Local(dp, 14 + (r * 2))
+            dFlags(r) = rEntry And (&H8000& Or &H4000&)
+            dStarts(r) = rEntry And ROW_OFFSET_MASK
+            dEnds(r) = FindRowEndOnPage(dp, numRows, r, dStarts(r))
+            If r <> slotIndex And (rEntry And ROW_FLAG_DELETED) = 0 And dEnds(r) > dStarts(r) Then
+                dLen = dEnds(r) - dStarts(r)
+                If (dFlags(r) And ROW_FLAG_OVERFLOW) = 0 Then
+                    dLen = TrimZeroPaddedRowLen(dp, dStarts(r), dLen, tdef)
+                End If
+                ReDim dRowBuf(0 To dLen - 1)
+                For i = 0 To dLen - 1
+                    dRowBuf(i) = dp(dStarts(r) + i)
+                Next i
+                dPayloads(r) = dRowBuf
+            End If
+        Next r
+
+        slotTableEnd = 14 + (numRows * 2)
+        For i = slotTableEnd To PAGE_SIZE_JET4 - 1
+            dp(i) = 0
+        Next i
+
+        wTopDel = PAGE_SIZE_JET4
+        For r = 0 To numRows - 1
+            If r <> slotIndex And (dFlags(r) And ROW_FLAG_DELETED) = 0 And Not IsEmpty(dPayloads(r)) Then
+                wRowDel = dPayloads(r)
+                wLenDel = UBound(wRowDel) - LBound(wRowDel) + 1
+                wTopDel = wTopDel - wLenDel
+                For i = 0 To wLenDel - 1
+                    dp(wTopDel + i) = wRowDel(LBound(wRowDel) + i)
+                Next i
+                delEntryVal = (wTopDel And ROW_OFFSET_MASK) Or (CLng(dFlags(r)) And &HFFFF&)
+                PageWriter.WriteUInt16LE dp, 14 + (r * 2), delEntryVal
+            Else
+                delEntryVal = (wTopDel And ROW_OFFSET_MASK) Or ROW_FLAG_DELETED Or ROW_FLAG_OVERFLOW
+                PageWriter.WriteUInt16LE dp, 14 + (r * 2), delEntryVal
+            End If
+        Next r
+
+        newFreeSpace = wTopDel - slotTableEnd
+        If newFreeSpace < 0 Then newFreeSpace = 0
+        PageWriter.WriteUInt16LE dp, 2, newFreeSpace
+
+        PageWriter.WritePageBytes fileNum, totalPages, targetPage, dp
+
+        ' Decrement TDEF RowCount at offset 16 and remove entry from all Real B-Tree Indexes
+        If tdef.TdefPageNumber > 0 And tdef.TdefPageNumber < totalPages Then
+            tp = CatalogReader.ReadPageBytes(fileNum, totalPages, tdef.TdefPageNumber)
+            If tp(0) = &H2& Then
+                diskRowCount = FormatProbe.ReadInt32LE(tp, 16)
+                If diskRowCount > tdef.RowCount Then
+                    tdef.RowCount = diskRowCount
+                End If
+                If tdef.RowCount > 0 Then
+                    tdef.RowCount = tdef.RowCount - 1
+                End If
+                PageWriter.WriteInt32LE tp, 16, tdef.RowCount
+
+                SyncTableRealIndexes fileNum, totalPages, tdef, tp, 3, Empty, 0, 0, targetPage, slotIndex
+                PageWriter.WritePageBytes fileNum, totalPages, tdef.TdefPageNumber, tp
+            End If
+        End If
+
+        If autoTransStarted Then PageWriter.CommitTransaction
+        Exit Sub
+
+AutoTransErr:
+        savedErrNum = Err.Number
+        savedErrDesc = Err.Description
+        savedErrSrc = Err.Source
+        tdef.RowCount = initialRowCount
+        If autoTransStarted Then
+            On Error Resume Next
+            PageWriter.RollbackTransaction totalPages
+            On Error GoTo 0
+        End If
+        Err.Raise savedErrNum, savedErrSrc, savedErrDesc
+    End Sub
+
+    Public Sub DeleteRecord(ByVal fileNum As Integer, ByRef totalPages As Long, ByRef tdef As TableDefDescriptor, ByVal slotIndex As Integer)
+        DeleteRecordOnPage fileNum, totalPages, tdef, tdef.PrimaryDataPage, slotIndex
+    End Sub
+
+    ' =========================================================================
+    ' Jet 4 / ACE B-Tree Real Index Synchronizer (0x04 Leaf Index Pages & Stats)
+    ' opMode: 1 = Insert, 2 = Update, 3 = Delete
+    ' =========================================================================
+    Private Sub SyncTableRealIndexes(ByVal fileNum As Integer, ByVal totalPages As Long, ByRef tdef As TableDefDescriptor, ByRef tp() As Byte, ByVal opMode As Long, ByVal fieldValues As Variant, ByVal targetPage As Long, ByVal targetSlot As Integer, ByVal oldPage As Long, ByVal oldSlot As Integer)
+        On Error Resume Next
+        Dim numRealIdx As Long
+        Dim numCols As Long
+        Dim off As Long
+        Dim i As Long
+        Dim nameLen As Long
+        Dim realIdxStart As Long
+        Dim r As Long
+        Dim blkOff As Long
+        Dim keyColNums(0 To 9) As Integer
+        Dim keyOrders(0 To 9) As Byte
+        Dim numKeys As Long
+        Dim k As Long
+        Dim colNumVal As Long
+        Dim idxFlags As Byte
+        Dim firstDp As Long
+
+        If UCase$(Trim$(tdef.TableName)) = "MSYSACCESSSTORAGE" Then
+            On Error GoTo 0
+            Exit Sub
+        End If
+        numCols = FormatProbe.ReadUInt16LE(tp, 45)
+        numRealIdx = FormatProbe.ReadInt32LE(tp, 51)
+        If numRealIdx <= 0 Or numCols <= 0 Then
+            On Error GoTo 0
+            Exit Sub
+        End If
+
+        off = 63 + (12 * numRealIdx) + (25 * numCols)
+        For i = 0 To numCols - 1
+            If off + 2 > PAGE_SIZE_JET4 Then
+                On Error GoTo 0
+                Exit Sub
+            End If
+            nameLen = FormatProbe.ReadUInt16LE(tp, off)
+            off = off + 2 + nameLen
+        Next i
+        realIdxStart = off
+
+        For r = 0 To numRealIdx - 1
+            ' 1. Update Real Index row count statistics at 63 + (r * 12) + 4 (uniqueEntryCount in Jet4/ACE)
+            If 63 + (r * 12) + 8 <= PAGE_SIZE_JET4 Then
+                PageWriter.WriteInt32LE tp, 63 + (r * 12) + 4, tdef.RowCount
+                If FormatProbe.ReadInt32LE(tp, 63 + (r * 12)) > 0 And FormatProbe.ReadInt32LE(tp, 63 + (r * 12)) < 1000 Then
+                    PageWriter.WriteInt32LE tp, 63 + (r * 12), tdef.RowCount
+                End If
+            End If
+
+            ' 2. Read 52-byte Real Index definition block
+            blkOff = realIdxStart + (r * 52)
+            If blkOff + 52 <= PAGE_SIZE_JET4 Then
+                numKeys = 0
+                For k = 0 To 9
+                    colNumVal = FormatProbe.ReadUInt16LE(tp, blkOff + 4 + (k * 3))
+                    If colNumVal <> &HFFFF& And colNumVal < 256 Then
+                        keyColNums(numKeys) = CInt(colNumVal)
+                        keyOrders(numKeys) = tp(blkOff + 6 + (k * 3))
+                        numKeys = numKeys + 1
+                    End If
+                Next k
+                idxFlags = tp(blkOff + 46)
+                firstDp = FormatProbe.ReadInt32LE(tp, blkOff + 38)
+
+                If numKeys > 0 And firstDp > 0 And firstDp < totalPages Then
+                    UpdateLeafIndexPage fileNum, totalPages, tdef, firstDp, keyColNums, keyOrders, numKeys, idxFlags, opMode, fieldValues, targetPage, targetSlot, oldPage, oldSlot
+                End If
+            End If
+        Next r
+        Err.Clear
+        On Error GoTo 0
+    End Sub
+
+    Private Sub UpdateLeafIndexPage(ByVal fileNum As Integer, ByVal totalPages As Long, ByRef tdef As TableDefDescriptor, ByVal rootPageNum As Long, ByRef keyColNums() As Integer, ByRef keyOrders() As Byte, ByVal numKeys As Long, ByVal idxFlags As Byte, ByVal opMode As Long, ByVal fieldValues As Variant, ByVal targetPage As Long, ByVal targetSlot As Integer, ByVal oldPage As Long, ByVal oldSlot As Integer)
+        Dim leafPage As Long
+        Dim ipg() As Byte
+        Dim nextLeaf As Long
+        Dim hopGuard As Long
+        Dim oldFreeSpace As Long
+        Dim oldPrefLen As Long
+        Dim oldTotalBytes As Long
+        Dim baseFreeSpace As Long
+        Dim entries As New Collection
+        Dim prevEndOff As Long
+        Dim curEndOff As Long
+        Dim bPos As Long
+        Dim rawSliceLen As Long
+        Dim fullEntry() As Byte
+        Dim sharedPrefix() As Byte
+        Dim bCopy As Long
+        Dim entryCount As Long
+        Dim keptEntries As New Collection
+        Dim eVar As Variant
+        Dim eBuf() As Byte
+        Dim eLen As Long
+        Dim ePage As Long
+        Dim eSlot As Integer
+        Dim skipEntry As Boolean
+        Dim matchedExisting As Boolean
+        Dim newEntry() As Byte
+        Dim hasNewEntry As Boolean
+        Dim nFinal As Long
+        Dim sortedArr() As Variant
+        Dim sIdx As Long
+        Dim sIdx2 As Long
+        Dim tmpVar As Variant
+        Dim aBytes() As Byte
+        Dim bBytes() As Byte
+        Dim newPrefLen As Long
+        Dim maxPref As Long
+        Dim firstB() As Byte
+        Dim lastB() As Byte
+        Dim pCheck As Long
+        Dim bClear As Long
+        Dim writePos As Long
+        Dim curE() As Byte
+        Dim curELen As Long
+        Dim startCopyIdx As Long
+        Dim cumLen As Long
+        Dim newTotalBytes As Long
+        Dim newFreeSpace As Long
+
+        leafPage = rootPageNum
+        ipg = CatalogReader.ReadPageBytes(fileNum, totalPages, leafPage)
+        If ipg(0) <> &H4& Then Exit Sub
+
+        ' If leaf chain exists, follow next_page (offset 16) to the active leaf for append/scan
+        hopGuard = 0
+        Do While FormatProbe.ReadInt32LE(ipg, 16) > 0 And FormatProbe.ReadInt32LE(ipg, 16) < totalPages And hopGuard < 32
+            nextLeaf = FormatProbe.ReadInt32LE(ipg, 16)
+            leafPage = nextLeaf
+            ipg = CatalogReader.ReadPageBytes(fileNum, totalPages, leafPage)
+            If ipg(0) <> &H4& Then Exit Sub
+            hopGuard = hopGuard + 1
+        Loop
+
+        oldFreeSpace = ReadUInt16LE_Local(ipg, 2)
+        oldPrefLen = ReadUInt16LE_Local(ipg, 24)
+
+        ' Find all existing entry boundaries from bitmap at 0x1B..0x1DF (entries start at 0x1E0 = 480)
+        prevEndOff = 0
+        entryCount = 0
+        For bPos = 1 To (PAGE_SIZE_JET4 - &H1E0&) - 1
+            If (ipg(&H1B& + (bPos \ 8)) And BitMaskByte(CInt(bPos Mod 8))) <> 0 Then
+                curEndOff = bPos
+                rawSliceLen = curEndOff - prevEndOff
+                If rawSliceLen > 0 And (&H1E0& + curEndOff) <= PAGE_SIZE_JET4 Then
+                    If entryCount = 0 Then
+                        ReDim fullEntry(0 To rawSliceLen - 1)
+                        For bCopy = 0 To rawSliceLen - 1
+                            fullEntry(bCopy) = ipg(&H1E0& + prevEndOff + bCopy)
+                        Next bCopy
+                        If oldPrefLen > 0 And oldPrefLen <= rawSliceLen Then
+                            ReDim sharedPrefix(0 To oldPrefLen - 1)
+                            For bCopy = 0 To oldPrefLen - 1
+                                sharedPrefix(bCopy) = fullEntry(bCopy)
+                            Next bCopy
+                        End If
+                    Else
+                        ReDim fullEntry(0 To oldPrefLen + rawSliceLen - 1)
+                        For bCopy = 0 To oldPrefLen - 1
+                            fullEntry(bCopy) = sharedPrefix(bCopy)
+                        Next bCopy
+                        For bCopy = 0 To rawSliceLen - 1
+                            fullEntry(oldPrefLen + bCopy) = ipg(&H1E0& + prevEndOff + bCopy)
+                        Next bCopy
+                    End If
+                    entries.Add fullEntry
+                    entryCount = entryCount + 1
+                    prevEndOff = curEndOff
+                End If
+            End If
+        Next bPos
+
+        oldTotalBytes = prevEndOff
+        baseFreeSpace = oldFreeSpace + oldTotalBytes
+        If baseFreeSpace <= 0 Or baseFreeSpace > (PAGE_SIZE_JET4 - &H1E0&) Then
+            baseFreeSpace = PAGE_SIZE_JET4 - &H1E0&
+        End If
+
+        ' Filter out deleted/updated rowId (and any duplicate of targetPage/targetSlot)
+        matchedExisting = False
+        For Each eVar In entries
+            eBuf = eVar
+            eLen = UBound(eBuf) - LBound(eBuf) + 1
+            skipEntry = False
+            If eLen >= 5 Then
+                ePage = (CLng(eBuf(eLen - 4)) * &H10000&) Or (CLng(eBuf(eLen - 3)) * &H100&) Or CLng(eBuf(eLen - 2))
+                eSlot = CInt(eBuf(eLen - 1))
+                If (opMode = 2 Or opMode = 3) And ePage = oldPage And eSlot = oldSlot Then
+                    skipEntry = True
+                    matchedExisting = True
+                ElseIf (opMode = 1 Or opMode = 2) And ePage = targetPage And eSlot = targetSlot Then
+                    skipEntry = True
+                End If
+            End If
+            If Not skipEntry Then
+                keptEntries.Add eBuf
+            End If
+        Next eVar
+
+        ' Calibrate text index sort weights from existing leaf entries on disk before building new entry
+        If entries.Count > 0 And (opMode = 1 Or opMode = 2) Then
+            CalibrateTextIndexFromLeaf fileNum, totalPages, tdef, entries, keyColNums, keyOrders, numKeys
+        End If
+
+        ' Build new entry for Insert (opMode=1) or Update (opMode=2)
+        hasNewEntry = False
+        If opMode = 1 Or opMode = 2 Then
+            hasNewEntry = BuildIndexLeafEntry(tdef, fieldValues, keyColNums, keyOrders, numKeys, idxFlags, targetPage, targetSlot, newEntry)
+            If hasNewEntry Then
+                keptEntries.Add newEntry
+            End If
+        End If
+
+        ' Sort keptEntries lexicographically by key + rowId
+        nFinal = keptEntries.Count
+        If nFinal > 0 Then
+            ReDim sortedArr(0 To nFinal - 1)
+            For sIdx = 0 To nFinal - 1
+                sortedArr(sIdx) = keptEntries(sIdx + 1)
+            Next sIdx
+
+            For sIdx = 0 To nFinal - 2
+                For sIdx2 = sIdx + 1 To nFinal - 1
+                    aBytes = sortedArr(sIdx)
+                    bBytes = sortedArr(sIdx2)
+                    If CompareIndexEntryBytes(aBytes, bBytes) > 0 Then
+                        tmpVar = sortedArr(sIdx)
+                        sortedArr(sIdx) = sortedArr(sIdx2)
+                        sortedArr(sIdx2) = tmpVar
+                    End If
+                Next sIdx2
+            Next sIdx
+        End If
+
+        ' Keep newPrefLen = 0 (uncompressed prefix, matching MS Access MSysObjects and Jackcess) unless entries exceed 3616 bytes
+        Dim uncompBytes As Long
+        Dim estBytes As Long
+        uncompBytes = 0
+        If nFinal > 0 Then
+            For sIdx = 0 To nFinal - 1
+                curE = sortedArr(sIdx)
+                uncompBytes = uncompBytes + (UBound(curE) + 1)
+            Next sIdx
+        End If
+
+        newPrefLen = 0
+        If uncompBytes > (PAGE_SIZE_JET4 - &H1E0&) And nFinal >= 2 Then
+            firstB = sortedArr(0)
+            lastB = sortedArr(nFinal - 1)
+            maxPref = UBound(firstB) + 1 - 4
+            If (UBound(lastB) + 1 - 4) < maxPref Then
+                maxPref = UBound(lastB) + 1 - 4
+            End If
+            If maxPref > 0 Then
+                For pCheck = 0 To maxPref - 1
+                    If firstB(pCheck) = lastB(pCheck) Then
+                        newPrefLen = newPrefLen + 1
+                    Else
+                        Exit For
+                    End If
+                Next pCheck
+            End If
+        End If
+
+        estBytes = 0
+        If nFinal > 0 Then
+            For sIdx = 0 To nFinal - 1
+                curE = sortedArr(sIdx)
+                curELen = UBound(curE) + 1
+                If sIdx = 0 Then
+                    estBytes = estBytes + curELen
+                Else
+                    estBytes = estBytes + (curELen - newPrefLen)
+                End If
+            Next sIdx
+        End If
+        If estBytes > (PAGE_SIZE_JET4 - &H1E0&) Then Exit Sub
+
+        PageWriter.WriteUInt16LE ipg, 24, newPrefLen
+        For bClear = &H1B& To PAGE_SIZE_JET4 - 1
+            ipg(bClear) = 0
+        Next bClear
+
+        writePos = &H1E0&
+        If nFinal > 0 Then
+            For sIdx = 0 To nFinal - 1
+                curE = sortedArr(sIdx)
+                curELen = UBound(curE) + 1
+                If sIdx = 0 Then
+                    startCopyIdx = 0
+                Else
+                    startCopyIdx = newPrefLen
+                End If
+                For bCopy = startCopyIdx To curELen - 1
+                    ipg(writePos) = curE(bCopy)
+                    writePos = writePos + 1
+                Next bCopy
+                cumLen = writePos - &H1E0&
+                If cumLen > 0 And (&H1B& + (cumLen \ 8)) < &H1E0& Then
+                    ipg(&H1B& + (cumLen \ 8)) = ipg(&H1B& + (cumLen \ 8)) Or BitMaskByte(CInt(cumLen Mod 8))
+                End If
+            Next sIdx
+        End If
+
+        newTotalBytes = writePos - &H1E0&
+        newFreeSpace = baseFreeSpace - newTotalBytes
+        If newFreeSpace < 0 Then newFreeSpace = 0
+        PageWriter.WriteUInt16LE ipg, 2, newFreeSpace
+        PageWriter.WritePageBytes fileNum, totalPages, leafPage, ipg
+    End Sub
+
+    Private Function BuildIndexLeafEntry(ByRef tdef As TableDefDescriptor, ByVal fieldValues As Variant, ByRef keyColNums() As Integer, ByRef keyOrders() As Byte, ByVal numKeys As Long, ByVal idxFlags As Byte, ByVal pageNum As Long, ByVal slotIdx As Integer, ByRef outEntry() As Byte) As Boolean
+        Dim buf() As Byte
+        Dim bufLen As Long
+        Dim k As Long
+        Dim targetColNum As Integer
+        Dim colIdx As Integer
+        Dim c As Integer
+        Dim isAsc As Boolean
+        Dim vVal As Variant
+        Dim allNull As Boolean
+        Dim kBytes() As Byte
+        Dim kLen As Long
+        Dim bIdx As Long
+        Dim oldLen As Long
+
+        BuildIndexLeafEntry = False
+        ReDim buf(0 To 0)
+        bufLen = 0
+        allNull = True
+
+        For k = 0 To numKeys - 1
+            targetColNum = keyColNums(k)
+            isAsc = (keyOrders(k) <> 0)
+            colIdx = -1
+            For c = 0 To tdef.ColumnCount - 1
+                If tdef.Columns(c).ColNumber = targetColNum Then
+                    colIdx = c
+                    Exit For
+                End If
+            Next c
+            If colIdx < 0 And targetColNum >= 0 And targetColNum < tdef.ColumnCount Then
+                colIdx = targetColNum
+            End If
+            If colIdx < 0 Then Exit Function
+
+            vVal = fieldValues(colIdx)
+            If IsNull(vVal) Or IsEmpty(vVal) Then
+                oldLen = bufLen
+                bufLen = bufLen + 1
+                ReDim Preserve buf(0 To bufLen - 1)
+                buf(oldLen) = IIf(isAsc, &H0&, &HFF&)
+            Else
+                allNull = False
+                kBytes = EncodeIndexColumnValue(tdef.Columns(colIdx).ColType, vVal)
+                kLen = UBound(kBytes) - LBound(kBytes) + 1
+                If Not isAsc Then
+                    For bIdx = 0 To kLen - 1
+                        kBytes(bIdx) = Not kBytes(bIdx)
+                    Next bIdx
+                End If
+                oldLen = bufLen
+                bufLen = bufLen + 1 + kLen
+                ReDim Preserve buf(0 To bufLen - 1)
+                buf(oldLen) = IIf(isAsc, &H7F&, &H80&)
+                For bIdx = 0 To kLen - 1
+                    buf(oldLen + 1 + bIdx) = kBytes(bIdx)
+                Next bIdx
+            End If
+        Next k
+
+        If allNull And ((idxFlags And &H2&) <> 0) Then
+            Exit Function
+        End If
+
+        oldLen = bufLen
+        bufLen = bufLen + 4
+        ReDim Preserve buf(0 To bufLen - 1)
+        buf(oldLen) = CByte((pageNum \ &H10000&) And &HFF&)
+        buf(oldLen + 1) = CByte((pageNum \ &H100&) And &HFF&)
+        buf(oldLen + 2) = CByte(pageNum And &HFF&)
+        buf(oldLen + 3) = CByte(slotIdx And &HFF&)
+
+        outEntry = buf
+        BuildIndexLeafEntry = True
+    End Function
+
+    Private Function EncodeIndexColumnValue(ByVal colType As JetColumnType, ByVal vVal As Variant) As Byte()
+        Dim res() As Byte
+        Dim b2(0 To 1) As Byte
+        Dim b4(0 To 3) As Byte
+        Dim b8(0 To 7) As Byte
+        Dim iVal As Integer
+        Dim lVal As Long
+        Dim sngVal As Single
+        Dim dblVal As Double
+        Dim curVal As Currency
+        Dim llVal As LongLong
+        Dim sText As String
+        Dim skBuf(0 To 1023) As Byte
+        Dim skLen As Long
+        Dim firstSep As Long
+        Dim secondSep As Long
+        Dim sPos As Long
+
+        Select Case colType
+            Case JetColumnType.ColByte, JetColumnType.ColBoolean
+                ReDim res(0 To 0)
+                res(0) = CByte(CLng(vVal) And &HFF&)
+            Case JetColumnType.ColInteger
+                iVal = CInt(vVal)
+                #If Win64 Then
+                    CopyMemory VarPtr(b2(0)), VarPtr(iVal), 2^
+                #Else
+                    CopyMemory VarPtr(b2(0)), VarPtr(iVal), 2&
+                #End If
+                ReDim res(0 To 1)
+                res(0) = b2(1) Xor &H80&
+                res(1) = b2(0)
+            Case JetColumnType.ColLong, JetColumnType.ColComplex
+                lVal = CLng(vVal)
+                #If Win64 Then
+                    CopyMemory VarPtr(b4(0)), VarPtr(lVal), 4^
+                #Else
+                    CopyMemory VarPtr(b4(0)), VarPtr(lVal), 4&
+                #End If
+                ReDim res(0 To 3)
+                res(0) = b4(3) Xor &H80&
+                res(1) = b4(2)
+                res(2) = b4(1)
+                res(3) = b4(0)
+            Case JetColumnType.ColSingle
+                sngVal = CSng(vVal)
+                #If Win64 Then
+                    CopyMemory VarPtr(b4(0)), VarPtr(sngVal), 4^
+                #Else
+                    CopyMemory VarPtr(b4(0)), VarPtr(sngVal), 4&
+                #End If
+                ReDim res(0 To 3)
+                If (b4(3) And &H80&) <> 0 Then
+                    res(0) = Not b4(3)
+                    res(1) = Not b4(2)
+                    res(2) = Not b4(1)
+                    res(3) = Not b4(0)
+                Else
+                    res(0) = b4(3) Xor &H80&
+                    res(1) = b4(2)
+                    res(2) = b4(1)
+                    res(3) = b4(0)
+                End If
+            Case JetColumnType.ColDouble, JetColumnType.ColDateTime
+                If IsDate(vVal) Then dblVal = CDbl(CDate(vVal)) Else dblVal = CDbl(vVal)
+                #If Win64 Then
+                    CopyMemory VarPtr(b8(0)), VarPtr(dblVal), 8^
+                #Else
+                    CopyMemory VarPtr(b8(0)), VarPtr(dblVal), 8&
+                #End If
+                ReDim res(0 To 7)
+                If (b8(7) And &H80&) <> 0 Then
+                    res(0) = Not b8(7): res(1) = Not b8(6): res(2) = Not b8(5): res(3) = Not b8(4)
+                    res(4) = Not b8(3): res(5) = Not b8(2): res(6) = Not b8(1): res(7) = Not b8(0)
+                Else
+                    res(0) = b8(7) Xor &H80&: res(1) = b8(6): res(2) = b8(5): res(3) = b8(4)
+                    res(4) = b8(3): res(5) = b8(2): res(6) = b8(1): res(7) = b8(0)
+                End If
+            Case JetColumnType.ColCurrency
+                curVal = CCur(vVal)
+                #If Win64 Then
+                    CopyMemory VarPtr(b8(0)), VarPtr(curVal), 8^
+                #Else
+                    CopyMemory VarPtr(b8(0)), VarPtr(curVal), 8&
+                #End If
+                ReDim res(0 To 7)
+                res(0) = b8(7) Xor &H80&: res(1) = b8(6): res(2) = b8(5): res(3) = b8(4)
+                res(4) = b8(3): res(5) = b8(2): res(6) = b8(1): res(7) = b8(0)
+            Case JetColumnType.ColBigInt
+                llVal = CLngLng(vVal)
+                #If Win64 Then
+                    CopyMemory VarPtr(b8(0)), VarPtr(llVal), 8^
+                #Else
+                    CopyMemory VarPtr(b8(0)), VarPtr(llVal), 8&
+                #End If
+                ReDim res(0 To 7)
+                res(0) = b8(7) Xor &H80&: res(1) = b8(6): res(2) = b8(5): res(3) = b8(4)
+                res(4) = b8(3): res(5) = b8(2): res(6) = b8(1): res(7) = b8(0)
+            Case JetColumnType.ColGUID
+                res = EncodeGuidBytes(CStr(vVal))
+            Case JetColumnType.ColBinary
+                Dim rawBin() As Byte
+                Dim rbLen As Long
+                Dim rbStart As Long
+                Dim chunkStart As Long
+                Dim remBytes As Long
+                Dim outPos As Long
+                Dim cByteIdx As Long
+                Dim numChunks As Long
+                If VarType(vVal) = (vbArray Or vbByte) Then
+                    rawBin = vVal
+                Else
+                    rawBin = EncodeTextBytes(CStr(vVal), False)
+                End If
+                rbLen = 0
+                rbStart = 0
+                On Error Resume Next
+                rbStart = LBound(rawBin)
+                rbLen = UBound(rawBin) - rbStart + 1
+                If Err.Number <> 0 Then rbLen = 0: Err.Clear
+                On Error GoTo 0
+                If rbLen <= 0 Then
+                    ReDim res(0 To 8)
+                Else
+                    numChunks = (rbLen + 7) \ 8
+                    ReDim res(0 To (numChunks * 9) - 1)
+                    outPos = 0
+                    For chunkStart = 0 To rbLen - 1 Step 8
+                        remBytes = rbLen - chunkStart
+                        If remBytes > 8 Then
+                            For cByteIdx = 0 To 7
+                                res(outPos + cByteIdx) = rawBin(rbStart + chunkStart + cByteIdx)
+                            Next cByteIdx
+                            res(outPos + 8) = 9
+                        Else
+                            For cByteIdx = 0 To remBytes - 1
+                                res(outPos + cByteIdx) = rawBin(rbStart + chunkStart + cByteIdx)
+                            Next cByteIdx
+                            res(outPos + 8) = CByte(remBytes)
+                        End If
+                        outPos = outPos + 9
+                    Next chunkStart
+                End If
+            Case Else
+                sText = RTrim$(CStr(vVal))
+                If Len(sText) > 255 Then sText = Left$(sText, 255)
+                res = EncodeAccessTextIndexKey(sText)
+        End Select
+        EncodeIndexColumnValue = res
+    End Function
+
+    Private Sub EnsureDefaultTextWeights()
+        If m_idxWeightsInit Then Exit Sub
+        Dim i As Long
+        ' Jet 4 / ACE General Legacy (Mode 1, sortOrderVersion = 0) exact primary weights from DAO.DBEngine.120
+        Dim w1Digits As Variant
+        w1Digits = Array(&H36&, &H38&, &H3A&, &H3C&, &H3E&, &H40&, &H42&, &H44&, &H46&, &H48&)
+        Dim w1Alpha As Variant
+        w1Alpha = Array(&H4A&, &H4C&, &H4D&, &H4F&, &H51&, &H53&, &H55&, &H57&, &H59&, &H5B&, &H5C&, &H5E&, &H60&, &H62&, &H64&, &H66&, &H68&, &H69&, &H6B&, &H6D&, &H6F&, &H71&, &H73&, &H75&, &H76&, &H78&)
+        ' Access 2010+ General Modern (Mode 2, sortOrderVersion >= 1) exact 2-byte primary weights from DAO.DBEngine.120
+        Dim w2Digits As Variant
+        w2Digits = Array(&H17&, &H19&, &H1A&, &H1B&, &H1C&, &H1D&, &H1E&, &H1F&, &H20&, &H21&)
+        Dim w2Alpha As Variant
+        w2Alpha = Array(&H2&, &H9&, &HA&, &H1A&, &H21&, &H23&, &H25&, &H2C&, &H32&, &H35&, &H36&, &H48&, &H51&, &H70&, &H7C&, &H7E&, &H89&, &H8A&, &H91&, &H99&, &H9F&, &HA2&, &HA4&, &HA6&, &HA7&, &HA9&)
+
+        For i = 0 To 127
+            m_defHi1(i) = 0: m_defW1(i) = 0
+            m_idxCharHi1(i) = 0: m_idxCharW1(i) = 0
+            m_defHi2(i) = 0: m_defW2(i) = 0
+            m_idxCharHi2(i) = 0: m_idxCharW2(i) = 0
+        Next i
+
+        For i = 0 To 9
+            m_defW1(48 + i) = CByte(w1Digits(i))
+            m_idxCharW1(48 + i) = CByte(w1Digits(i))
+            m_defHi2(48 + i) = &HD&
+            m_defW2(48 + i) = CByte(w2Digits(i))
+            m_idxCharHi2(48 + i) = &HD&
+            m_idxCharW2(48 + i) = CByte(w2Digits(i))
+        Next i
+        For i = 0 To 25
+            m_defW1(97 + i) = CByte(w1Alpha(i))
+            m_idxCharW1(97 + i) = CByte(w1Alpha(i))
+            m_defHi2(97 + i) = &HE&
+            m_defW2(97 + i) = CByte(w2Alpha(i))
+            m_idxCharHi2(97 + i) = &HE&
+            m_idxCharW2(97 + i) = CByte(w2Alpha(i))
+        Next i
+
+        ' Exact printable ASCII punctuation & symbol weights (32..126) for Mode 1 and Mode 2
+        Dim symCodes As Variant
+        Dim symHi1 As Variant
+        Dim symW1 As Variant
+        Dim symHi2 As Variant
+        Dim symW2 As Variant
+        symCodes = Array(32, 33, 34, 35, 36, 37, 38, 40, 41, 42, 43, 44, 46, 47, 58, 59, 60, 61, 62, 63, 64, 91, 92, 93, 94, 95, 96, 123, 124, 125, 126)
+        symHi1 = Array(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, &H2B&, &H2B&, &H2B&, &H2B&, &H2B&, &H2B&, &H2B&)
+        symW1 = Array(&H7&, &H9&, &HA&, &HC&, &HE&, &H10&, &H12&, &H14&, &H16&, &H18&, &H2C&, &H1A&, &H1C&, &H1E&, &H20&, &H22&, &H2E&, &H30&, &H32&, &H24&, &H26&, &H27&, &H29&, &H2A&, &H2&, &H3&, &H7&, &H9&, &HB&, &HD&, &HF&)
+        symHi2 = Array(&H7&, &H7&, &H7&, &H7&, &H7&, &H7&, &H7&, &H7&, &H7&, &H7&, &H8&, &H7&, &H7&, &H7&, &H7&, &H7&, &H8&, &H8&, &H8&, &H7&, &H7&, &H7&, &H7&, &H7&, &H7&, &H7&, &H7&, &H7&, &H7&, &H7&, &H7&)
+        symW2 = Array(&H2&, &H1C&, &H1D&, &H1F&, &H21&, &H23&, &H25&, &H27&, &H2A&, &H2D&, &H3&, &H2F&, &H33&, &H35&, &H37&, &H3A&, &HE&, &H12&, &H14&, &H3C&, &H3E&, &H3F&, &H41&, &H42&, &H43&, &H44&, &H48&, &H4A&, &H4C&, &H4E&, &H50&)
+
+        Dim sc As Long
+        For i = LBound(symCodes) To UBound(symCodes)
+            sc = CLng(symCodes(i))
+            m_defHi1(sc) = CByte(symHi1(i))
+            m_defW1(sc) = CByte(symW1(i))
+            m_idxCharHi1(sc) = CByte(symHi1(i))
+            m_idxCharW1(sc) = CByte(symW1(i))
+            m_defHi2(sc) = CByte(symHi2(i))
+            m_defW2(sc) = CByte(symW2(i))
+            m_idxCharHi2(sc) = CByte(symHi2(i))
+            m_idxCharW2(sc) = CByte(symW2(i))
+        Next i
+
+        m_idxUscoreLen1 = 2
+        m_idxUscoreHi1 = &H2B&
+        m_idxUscoreLen2 = 2
+
+        If m_idxSortMode = 0 Then m_idxSortMode = 1
+        m_idxWeightsInit = True
+    End Sub
+
+    Private Sub CalibrateTextIndexFromLeaf(ByVal fileNum As Integer, ByVal totalPages As Long, ByRef tdef As TableDefDescriptor, ByVal entries As Collection, ByRef keyColNums() As Integer, ByRef keyOrders() As Byte, ByVal numKeys As Long)
+        On Error Resume Next
+        EnsureDefaultTextWeights
+
+        ' Detect database sort order version from Page 2 (0 = Jet4 General Legacy 1-byte, >=1 = Access 2010+ General 2-byte)
+        If totalPages > 2 Then
+            Dim p2Hdr() As Byte
+            Dim p2RIdxH As Long
+            Dim p2ColsH As Long
+            Dim p2OffH As Long
+            Dim p2IH As Long
+            p2Hdr = CatalogReader.ReadPageBytes(fileNum, totalPages, 2)
+            If p2Hdr(0) = &H2& Then
+                p2RIdxH = FormatProbe.ReadInt32LE(p2Hdr, 51)
+                p2ColsH = FormatProbe.ReadUInt16LE(p2Hdr, 45)
+                p2OffH = 63 + (12 * p2RIdxH)
+                For p2IH = 0 To p2ColsH - 1
+                    If p2OffH + 25 <= PAGE_SIZE_JET4 Then
+                        If p2Hdr(p2OffH) = &HA& Then
+                            If p2Hdr(p2OffH + 14) = 0 Then
+                                m_idxSortMode = 1
+                            Else
+                                m_idxSortMode = 2
+                            End If
+                            Exit For
+                        End If
+                    End If
+                    p2OffH = p2OffH + 25
+                Next p2IH
+            End If
+        End If
+
+        Static lastCalibFile As Integer
+        If entries Is Nothing Then Exit Sub
+        If entries.Count > 128 Then
+            On Error GoTo 0
+            Exit Sub
+        End If
+        If tdef.TdefPageNumber <> 2 And lastCalibFile = fileNum And fileNum > 0 Then
+            On Error GoTo 0
+            Exit Sub
+        End If
+
+        Dim txtKeyPos As Long
+        Dim txtColIdx As Integer
+        Dim prefixBytesLen As Long
+        Dim k As Long
+        Dim c As Integer
+        Dim colNum As Integer
+        Dim cType As JetColumnType
+
+        txtKeyPos = -1
+        txtColIdx = -1
+        prefixBytesLen = 0
+
+        For k = 0 To numKeys - 1
+            colNum = keyColNums(k)
+            cType = JetColumnType.ColText
+            For c = 0 To tdef.ColumnCount - 1
+                If tdef.Columns(c).ColNumber = colNum Then
+                    cType = tdef.Columns(c).ColType
+                    If cType = JetColumnType.ColText And keyOrders(k) <> 0 Then
+                        txtKeyPos = k
+                        txtColIdx = c
+                    End If
+                    Exit For
+                End If
+            Next c
+            If txtKeyPos = k Then Exit For
+            Select Case cType
+                Case JetColumnType.ColByte, JetColumnType.ColBoolean
+                    prefixBytesLen = prefixBytesLen + 2
+                Case JetColumnType.ColInteger
+                    prefixBytesLen = prefixBytesLen + 3
+                Case JetColumnType.ColLong, JetColumnType.ColSingle, JetColumnType.ColComplex
+                    prefixBytesLen = prefixBytesLen + 5
+                Case JetColumnType.ColDouble, JetColumnType.ColDateTime, JetColumnType.ColCurrency, JetColumnType.ColBigInt
+                    prefixBytesLen = prefixBytesLen + 9
+                Case JetColumnType.ColGUID
+                    prefixBytesLen = prefixBytesLen + 17
+                Case Else
+                    Exit Sub
+            End Select
+        Next k
+
+        If txtKeyPos < 0 Or txtColIdx < 0 Then
+            On Error GoTo 0
+            Exit Sub
+        End If
+
+        Dim rowsCol As Collection
+        Dim locsCol As Collection
+        Set rowsCol = RowDecoder.ReadDataPageRows(fileNum, totalPages, tdef, locsCol)
+        If rowsCol Is Nothing Or locsCol Is Nothing Then
+            On Error GoTo 0
+            Exit Sub
+        End If
+
+        If tdef.TdefPageNumber = 2 Then
+            lastCalibFile = fileNum
+        End If
+
+        Dim rIdx As Long
+        Dim locStr As String
+        Dim locParts() As String
+        Dim rPage As Long
+        Dim rSlot As Integer
+        Dim rowArr() As Variant
+        Dim sVal As String
+        Dim sLen As Long
+        Dim eVar As Variant
+        Dim eBuf() As Byte
+        Dim eLen As Long
+        Dim ePage As Long
+        Dim eSlot As Integer
+        Dim wStart As Long
+        Dim sepPos As Long
+        Dim scanPos As Long
+        Dim wLen As Long
+        Dim chPos As Long
+        Dim chCode As Long
+        Dim uCnt As Long
+        Dim bCur As Long
+        Dim canCalibRow As Boolean
+
+        For rIdx = 1 To rowsCol.Count
+            locStr = CStr(locsCol(rIdx))
+            locParts = Split(locStr, "|")
+            If UBound(locParts) >= 1 Then
+                rPage = CLng(Val(locParts(0)))
+                rSlot = CInt(Val(locParts(1)))
+                rowArr = rowsCol(rIdx)
+                If txtColIdx <= UBound(rowArr) Then
+                    If Not IsNull(rowArr(txtColIdx)) And Not IsEmpty(rowArr(txtColIdx)) Then
+                        sVal = RTrim$(CStr(rowArr(txtColIdx)))
+                        sLen = Len(sVal)
+                        If sLen > 0 Then
+                            uCnt = 0
+                            canCalibRow = True
+                            For chPos = 1 To sLen
+                                chCode = AscW(LCase$(Mid$(sVal, chPos, 1))) And &HFFFF&
+                                If chCode = 95 Then
+                                    uCnt = uCnt + 1
+                                ElseIf chCode <> 32 And (chCode < 48 Or chCode > 57) And (chCode < 97 Or chCode > 122) Then
+                                    canCalibRow = False
+                                    Exit For
+                                End If
+                            Next chPos
+
+                            If canCalibRow Then
+                                For Each eVar In entries
+                                    eBuf = eVar
+                                    eLen = UBound(eBuf) - LBound(eBuf) + 1
+                                    If eLen > (prefixBytesLen + 6) Then
+                                        ePage = (CLng(eBuf(eLen - 4)) * &H10000&) Or (CLng(eBuf(eLen - 3)) * &H100&) Or CLng(eBuf(eLen - 2))
+                                        eSlot = CInt(eBuf(eLen - 1))
+                                        If ePage = rPage And eSlot = rSlot Then
+                                            If eBuf(prefixBytesLen) = &H7F& Then
+                                                wStart = prefixBytesLen + 1
+                                                If eBuf(eLen - 6) = &H1& And eBuf(eLen - 5) = &H0& Then
+                                                    sepPos = eLen - 6
+                                                Else
+                                                    sepPos = -1
+                                                    For scanPos = wStart To eLen - 6
+                                                        If eBuf(scanPos) = &H1& Then
+                                                            sepPos = scanPos
+                                                            Exit For
+                                                        End If
+                                                    Next scanPos
+                                                End If
+                                                If sepPos > wStart Then
+                                                    wLen = sepPos - wStart
+                                                    If wLen = sLen Then
+                                                        m_idxSortMode = 1
+                                                        If uCnt > 0 Then
+                                                            m_idxUscoreLen1 = 1
+                                                            m_idxCharHi1(95) = 0
+                                                        End If
+                                                        For chPos = 1 To sLen
+                                                            chCode = AscW(LCase$(Mid$(sVal, chPos, 1))) And &HFFFF&
+                                                            If chCode >= 32 And chCode <= 122 Then
+                                                                m_idxCharW1(chCode) = eBuf(wStart + chPos - 1)
+                                                                m_idxKnown1(chCode) = True
+                                                                m_idxCharKnown(chCode) = True
+                                                            End If
+                                                        Next chPos
+                                                    ElseIf uCnt > 0 And wLen = (sLen + uCnt) Then
+                                                        m_idxSortMode = 1
+                                                        m_idxUscoreLen1 = 2
+                                                        bCur = wStart
+                                                        For chPos = 1 To sLen
+                                                            chCode = AscW(LCase$(Mid$(sVal, chPos, 1))) And &HFFFF&
+                                                            If chCode = 95 Then
+                                                                If bCur + 1 < sepPos Then
+                                                                    m_idxUscoreHi1 = eBuf(bCur)
+                                                                    m_idxCharHi1(95) = eBuf(bCur)
+                                                                    m_idxCharW1(95) = eBuf(bCur + 1)
+                                                                    m_idxKnown1(95) = True
+                                                                    m_idxCharKnown(95) = True
+                                                                End If
+                                                                bCur = bCur + 2
+                                                            Else
+                                                                If chCode >= 32 And chCode <= 122 And bCur < sepPos Then
+                                                                    m_idxCharW1(chCode) = eBuf(bCur)
+                                                                    m_idxKnown1(chCode) = True
+                                                                    m_idxCharKnown(chCode) = True
+                                                                End If
+                                                                bCur = bCur + 1
+                                                            End If
+                                                        Next chPos
+                                                    ElseIf wLen = (sLen * 2) Then
+                                                        m_idxSortMode = 2
+                                                        If uCnt > 0 Then m_idxUscoreLen2 = 2
+                                                        For chPos = 1 To sLen
+                                                            chCode = AscW(LCase$(Mid$(sVal, chPos, 1))) And &HFFFF&
+                                                            If chCode >= 32 And chCode <= 122 Then
+                                                                m_idxCharHi2(chCode) = eBuf(wStart + ((chPos - 1) * 2))
+                                                                m_idxCharW2(chCode) = eBuf(wStart + ((chPos - 1) * 2) + 1)
+                                                                m_idxKnown2(chCode) = True
+                                                                m_idxCharKnown(chCode) = True
+                                                            End If
+                                                        Next chPos
+                                                    ElseIf uCnt > 0 And wLen = ((sLen * 2) - uCnt) Then
+                                                        m_idxSortMode = 2
+                                                        m_idxUscoreLen2 = 1
+                                                        bCur = wStart
+                                                        For chPos = 1 To sLen
+                                                            chCode = AscW(LCase$(Mid$(sVal, chPos, 1))) And &HFFFF&
+                                                            If chCode = 95 Then
+                                                                If bCur < sepPos Then
+                                                                    m_idxCharW2(95) = eBuf(bCur)
+                                                                    m_idxKnown2(95) = True
+                                                                    m_idxCharKnown(95) = True
+                                                                End If
+                                                                bCur = bCur + 1
+                                                            Else
+                                                                If chCode >= 32 And chCode <= 122 And bCur + 1 < sepPos Then
+                                                                    m_idxCharHi2(chCode) = eBuf(bCur)
+                                                                    m_idxCharW2(chCode) = eBuf(bCur + 1)
+                                                                    m_idxKnown2(chCode) = True
+                                                                    m_idxCharKnown(chCode) = True
+                                                                End If
+                                                                bCur = bCur + 2
+                                                            End If
+                                                        Next chPos
+                                                    End If
+                                                End If
+                                            End If
+                                            Exit For
+                                        End If
+                                    End If
+                                Next eVar
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        Next rIdx
+
+        Err.Clear
+        On Error GoTo 0
+    End Sub
+
+    Private Function EncodeAccessTextIndexKey(ByVal sText As String) As Byte()
+        EnsureDefaultTextWeights
+        Dim res() As Byte
+        Dim sLen As Long
+        Dim i As Long
+        Dim chCode As Long
+        Dim allAscii As Boolean
+        Dim skBuf(0 To 1023) As Byte
+        Dim skLen As Long
+        Dim firstSep As Long
+        Dim sPos As Long
+        Dim outPos As Long
+        Dim primBytes As Long
+        Dim symCount As Long
+        Dim primCharCount As Long
+        Dim symPos As Long
+        Dim symOff As Long
+        Dim totalLen As Long
+
+        sLen = Len(sText)
+        If sLen = 0 Then
+            ReDim res(0 To 1)
+            res(0) = &H1&
+            res(1) = &H0&
+            EncodeAccessTextIndexKey = res
+            Exit Function
+        End If
+
+        allAscii = True
+        primBytes = 0
+        symCount = 0
+        For i = 1 To sLen
+            chCode = AscW(LCase$(Mid$(sText, i, 1))) And &HFFFF&
+            If chCode < 32 Or chCode > 126 Then
+                allAscii = False
+                Exit For
+            ElseIf chCode = 45 Or chCode = 39 Then
+                symCount = symCount + 1
+            Else
+                If m_idxSortMode = 1 Then
+                    If chCode = 95 Then
+                        primBytes = primBytes + m_idxUscoreLen1
+                    ElseIf m_idxCharHi1(chCode) <> 0 Then
+                        primBytes = primBytes + 2
+                    Else
+                        primBytes = primBytes + 1
+                    End If
+                Else
+                    If chCode = 95 Then
+                        primBytes = primBytes + m_idxUscoreLen2
+                    Else
+                        primBytes = primBytes + 2
+                    End If
+                End If
+            End If
+        Next i
+
+        If allAscii Then
+            If symCount > 0 Then
+                totalLen = primBytes + 4 + (symCount * 4) + 1
+            Else
+                totalLen = primBytes + 2
+            End If
+            ReDim res(0 To totalLen - 1)
+            outPos = 0
+            primCharCount = 0
+            symPos = primBytes + 4
+
+            If symCount > 0 Then
+                res(primBytes) = &H1&
+                res(primBytes + 1) = &H1&
+                res(primBytes + 2) = &H1&
+                res(primBytes + 3) = &H1&
+                res(totalLen - 1) = &H0&
+            Else
+                res(primBytes) = &H1&
+                res(primBytes + 1) = &H0&
+            End If
+
+            For i = 1 To sLen
+                chCode = AscW(LCase$(Mid$(sText, i, 1))) And &HFFFF&
+                If chCode = 45 Or chCode = 39 Then
+                    symOff = &H8007& + (4& * primCharCount)
+                    res(symPos) = CByte((symOff \ &H100&) And &HFF&)
+                    res(symPos + 1) = CByte(symOff And &HFF&)
+                    res(symPos + 2) = &H6&
+                    res(symPos + 3) = IIf(chCode = 45, &H82&, &H80&)
+                    symPos = symPos + 4
+                Else
+                    primCharCount = primCharCount + 1
+                    If m_idxSortMode = 1 Then
+                        If chCode = 95 Then
+                            If m_idxUscoreLen1 = 2 Then
+                                res(outPos) = m_idxUscoreHi1
+                                res(outPos + 1) = m_idxCharW1(95)
+                                outPos = outPos + 2
+                            Else
+                                res(outPos) = m_idxCharW1(95)
+                                outPos = outPos + 1
+                            End If
+                        ElseIf m_idxCharHi1(chCode) <> 0 Then
+                            res(outPos) = m_idxCharHi1(chCode)
+                            res(outPos + 1) = m_idxCharW1(chCode)
+                            outPos = outPos + 2
+                        Else
+                            res(outPos) = m_idxCharW1(chCode)
+                            outPos = outPos + 1
+                        End If
+                    Else
+                        If chCode = 95 And m_idxUscoreLen2 = 1 Then
+                            res(outPos) = m_idxCharW2(95)
+                            outPos = outPos + 1
+                        Else
+                            res(outPos) = m_idxCharHi2(chCode)
+                            res(outPos + 1) = m_idxCharW2(chCode)
+                            outPos = outPos + 2
+                        End If
+                    End If
+                End If
+            Next i
+            EncodeAccessTextIndexKey = res
+            Exit Function
+        End If
+
+        skLen = LCMapStringW(&H409&, &H401&, StrPtr(LCase$(sText)), sLen, VarPtr(skBuf(0)), 1024)
+        If skLen > 0 Then
+            firstSep = -1
+            For sPos = 0 To skLen - 1
+                If skBuf(sPos) = &H1& Then
+                    firstSep = sPos
+                    Exit For
+                End If
+            Next sPos
+            If firstSep >= 0 Then
+                ReDim res(0 To firstSep + 1)
+                For sPos = 0 To firstSep - 1
+                    res(sPos) = skBuf(sPos)
+                Next sPos
+                res(firstSep) = &H1&
+                res(firstSep + 1) = &H0&
+                EncodeAccessTextIndexKey = res
+                Exit Function
+            End If
+        End If
+
+        ReDim res(0 To 1)
+        res(0) = &H1&
+        res(1) = &H0&
+        EncodeAccessTextIndexKey = res
+    End Function
+
+    Private Function CompareIndexEntryBytes(ByRef a() As Byte, ByRef b() As Byte) As Long
+        Dim lenA As Long
+        Dim lenB As Long
+        Dim minL As Long
+        Dim i As Long
+        Dim va As Long
+        Dim vb As Long
+
+        lenA = UBound(a) - LBound(a) + 1
+        lenB = UBound(b) - LBound(b) + 1
+        minL = IIf(lenA < lenB, lenA, lenB)
+        For i = 0 To minL - 1
+            va = CLng(a(LBound(a) + i))
+            vb = CLng(b(LBound(b) + i))
+            If va < vb Then
+                CompareIndexEntryBytes = -1
+                Exit Function
+            ElseIf va > vb Then
+                CompareIndexEntryBytes = 1
+                Exit Function
+            End If
+        Next i
+        If lenA < lenB Then
+            CompareIndexEntryBytes = -1
+        ElseIf lenA > lenB Then
+            CompareIndexEntryBytes = 1
+        Else
+            CompareIndexEntryBytes = 0
+        End If
+    End Function
+
+    Private Function FindRowEndOnPage(ByRef dp() As Byte, ByVal numRows As Long, ByVal slotIdx As Long, ByVal rowStart As Long) As Long
+        Dim bestEnd As Long
+        Dim s As Long
+        Dim rawE As Long
+        Dim off As Long
+
+        bestEnd = PAGE_SIZE_JET4
+        For s = 0 To numRows - 1
+            If s <> slotIdx Then
+                rawE = ReadUInt16LE_Local(dp, 14 + (s * 2))
+                off = rawE And ROW_OFFSET_MASK
+                If off > rowStart And off < bestEnd Then
+                    bestEnd = off
+                End If
+            End If
+        Next s
+        FindRowEndOnPage = bestEnd
+    End Function
+
+    Private Function TrimZeroPaddedRowLen(ByRef dp() As Byte, ByVal rowStart As Long, ByVal rowLen As Long, ByRef tdef As TableDefDescriptor) As Long
+        Dim numCols As Long
+        Dim nullMaskLen As Long
+        Dim nullMaskStart As Long
+        Dim varLenPos As Long
+        Dim varLen As Long
+        Dim eodPos As Long
+        Dim isValid As Boolean
+        Dim minRowLen As Long
+        Dim candLen As Long
+        Dim cNullStart As Long
+        Dim cVarLenPos As Long
+        Dim cVarLen As Long
+        Dim cEodPos As Long
+
+        TrimZeroPaddedRowLen = rowLen
+        If tdef.VariableColumnCount <= 0 Then Exit Function
+        If rowStart < 14 Or rowLen < 6 Or (rowStart + rowLen) > PAGE_SIZE_JET4 Then Exit Function
+
+        numCols = ReadUInt16LE_Local(dp, rowStart)
+        If numCols <= 0 Or numCols > 255 Then Exit Function
+        nullMaskLen = (numCols + 7) \ 8
+        minRowLen = 2 + nullMaskLen + 4
+        If rowLen < minRowLen Then Exit Function
+
+        nullMaskStart = rowLen - nullMaskLen
+        varLenPos = nullMaskStart - 2
+        varLen = ReadUInt16LE_Local(dp, rowStart + varLenPos)
+        eodPos = varLenPos - (varLen * 2) - 2
+
+        isValid = False
+        If varLen > 0 And varLen <= CLng(tdef.VariableColumnCount) And eodPos >= 2 Then
+            If ReadUInt16LE_Local(dp, rowStart + eodPos) = eodPos Then
+                isValid = True
+            End If
+        End If
+
+        If isValid Then Exit Function
+
+        For candLen = rowLen - 1 To minRowLen Step -1
+            If dp(rowStart + candLen) <> 0 Then Exit For
+            cNullStart = candLen - nullMaskLen
+            cVarLenPos = cNullStart - 2
+            cVarLen = ReadUInt16LE_Local(dp, rowStart + cVarLenPos)
+            If cVarLen > 0 And cVarLen <= CLng(tdef.VariableColumnCount) Then
+                cEodPos = cVarLenPos - (cVarLen * 2) - 2
+                If cEodPos >= 2 Then
+                    If ReadUInt16LE_Local(dp, rowStart + cEodPos) = cEodPos Then
+                        TrimZeroPaddedRowLen = candLen
+                        Exit Function
+                    End If
+                End If
+            End If
+        Next candLen
+    End Function
+
+    Private Function FindLowestRowOffset(ByRef dp() As Byte, ByVal numRows As Long) As Long
+        Dim minOff As Long
+        minOff = PAGE_SIZE_JET4
+        Dim r As Long
+        For r = 0 To numRows - 1
+            Dim entryVal As Long
+            entryVal = ReadUInt16LE_Local(dp, 14 + (r * 2))
+            Dim off As Long
+            off = entryVal And ROW_OFFSET_MASK
+            If off > 14 And off < minOff Then
+                minOff = off
+            End If
+        Next r
+        FindLowestRowOffset = minOff
+    End Function
+
+    Private Function BitMaskByte(ByVal bitIndex As Integer) As Byte
+        Select Case bitIndex
+            Case 0: BitMaskByte = 1
+            Case 1: BitMaskByte = 2
+            Case 2: BitMaskByte = 4
+            Case 3: BitMaskByte = 8
+            Case 4: BitMaskByte = 16
+            Case 5: BitMaskByte = 32
+            Case 6: BitMaskByte = 64
+            Case Else: BitMaskByte = 128
+        End Select
+    End Function
+
+    Private Function ReadUInt16LE_Local(ByRef buf() As Byte, ByVal idx As Long) As Long
+        ReadUInt16LE_Local = CLng(buf(idx)) Or (CLng(buf(idx + 1)) * 256&)
+    End Function
+
+End Module

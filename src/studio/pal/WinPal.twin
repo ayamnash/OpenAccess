@@ -1,0 +1,1021 @@
+' File: src/studio/pal/WinPal.twin
+' Plan 7 WS7: Platform Abstraction Layer - Windows Native Implementation
+Option Explicit
+[ Description ("Platform Abstraction Layer - Windows Native Implementation") ]
+[ ClassId ("C5D1E810-7F2A-4C91-B831-000000000010") ]
+[ InterfaceId ("C5D1E810-7F2A-4C91-B831-000000000011") ]
+[ ComCreatable (False) ]
+
+Public Class WinPal
+    Implements IPal
+    Implements IFileSystem
+    Implements ISettings
+    Implements IDialogs
+    Implements IClipboard
+    Implements IShell
+    Implements IFonts
+    Implements IDynamicCall
+
+    Private m_dynamicUserApproved As Boolean
+
+    Private m_dynamicAllowed As Object
+    ' Win32 Constants
+
+    Private Const INVALID_FILE_ATTRIBUTES As Long = -1&
+
+    Private Const FILE_ATTRIBUTE_DIRECTORY As Long = &H10&
+
+    Private Const MAX_PATH As Long = 260&
+
+    Private Const OFN_FILEMUSTEXIST As Long = &H1000&
+
+    Private Const OFN_PATHMUSTEXIST As Long = &H800&
+
+    Private Const OFN_HIDEREADONLY As Long = &H4&
+
+    Private Const OFN_OVERWRITEPROMPT As Long = &H2&
+
+    Private Const CP_UTF8 As Long = 65001&
+
+    Private Type OPENFILENAMEW
+        lStructSize As Long
+        hwndOwner As LongPtr
+        hInstance As LongPtr
+        lpstrFilter As LongPtr
+        lpstrCustomFilter As LongPtr
+        nMaxCustFilter As Long
+        nFilterIndex As Long
+        lpstrFile As LongPtr
+        nMaxFile As Long
+        lpstrFileTitle As LongPtr
+        nMaxFileTitle As Long
+        lpstrInitialDir As LongPtr
+        lpstrTitle As LongPtr
+        Flags As Long
+        nFileOffset As Integer
+        nFileExtension As Integer
+        lpstrDefExt As LongPtr
+        lCustData As LongPtr
+        lpfnHook As LongPtr
+        lpTemplateName As LongPtr
+        pvReserved As LongPtr
+        dwReserved As Long
+        FlagsEx As Long
+    End Type
+    #If Win64 Then
+
+        Private Declare PtrSafe Function GetFileAttributesW Lib "kernel32" (ByVal lpFileName As LongPtr) As Long
+
+        Private Declare PtrSafe Function CopyFileW Lib "kernel32" (ByVal lpExistingFileName As LongPtr, ByVal lpNewFileName As LongPtr, ByVal bFailIfExists As Long) As Long
+
+        Private Declare PtrSafe Function DeleteFileW Lib "kernel32" (ByVal lpFileName As LongPtr) As Long
+
+        Private Declare PtrSafe Function CreateDirectoryW Lib "kernel32" (ByVal lpPathName As LongPtr, ByVal lpSecurityAttributes As LongPtr) As Long
+
+        Private Declare PtrSafe Function GetTempPathW Lib "kernel32" (ByVal nBufferLength As Long, ByVal lpBuffer As LongPtr) As Long
+
+        Private Declare PtrSafe Function GetTempFileNameW Lib "kernel32" (ByVal lpPathName As LongPtr, ByVal lpPrefixString As LongPtr, ByVal uUnique As Long, ByVal lpTempFileName As LongPtr) As Long
+
+        Private Declare PtrSafe Function GetOpenFileNameW Lib "comdlg32.dll" (ByRef lpofn As OPENFILENAMEW) As Long
+
+        Private Declare PtrSafe Function GetSaveFileNameW Lib "comdlg32.dll" (ByRef lpofn As OPENFILENAMEW) As Long
+
+                Private Declare PtrSafe Function ShellExecuteW Lib "shell32.dll" (ByVal hwnd As LongPtr, ByVal lpOperation As LongPtr, ByVal lpFile As LongPtr, ByVal lpParameters As LongPtr, ByVal lpDirectory As LongPtr, ByVal nShowCmd As Long) As LongPtr
+
+        Private Declare PtrSafe Function LoadLibraryW Lib "kernel32" (ByVal lpLibFileName As LongPtr) As LongPtr
+
+        Private Declare PtrSafe Function GetProcAddress Lib "kernel32" (ByVal hModule As LongPtr, ByVal lpProcName As String) As LongPtr
+
+        Private Declare PtrSafe Function FreeLibrary Lib "kernel32" (ByVal hLibModule As LongPtr) As Long
+
+        Private Declare PtrSafe Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
+
+        Private Declare PtrSafe Function GetTickCount Lib "kernel32" () As Long
+
+        Private Declare PtrSafe Function BeepAPI Lib "kernel32" Alias "Beep" (ByVal dwFreq As Long, ByVal dwDuration As Long) As Long
+
+        Private Declare PtrSafe Function GetSystemMetrics Lib "user32" (ByVal nIndex As Long) As Long
+
+        Private Declare PtrSafe Function DispCallFunc Lib "oleaut32" (ByVal pvInstance As LongPtr, ByVal oVft As LongPtr, ByVal cc As Long, ByVal vtReturn As Integer, ByVal cActuals As Long, ByVal prgvt As LongPtr, ByVal prgpvarg As LongPtr, ByVal pvargResult As LongPtr) As Long
+
+        Private Declare PtrSafe Function MultiByteToWideChar Lib "kernel32" (ByVal CodePage As Long, ByVal dwFlags As Long, ByVal lpMultiByteStr As LongPtr, ByVal cbMultiByte As Long, ByVal lpWideCharStr As LongPtr, ByVal cchWideChar As Long) As Long
+
+        Private Declare PtrSafe Function WideCharToMultiByte Lib "kernel32" (ByVal CodePage As Long, ByVal dwFlags As Long, ByVal lpWideCharStr As LongPtr, ByVal cchWideChar As Long, ByVal lpMultiByteStr As LongPtr, ByVal cbMultiByte As Long, ByVal lpDefaultChar As LongPtr, ByVal lpUsedDefaultChar As LongPtr) As Long
+
+        Private Declare PtrSafe Function CreateFileW Lib "kernel32" (ByVal lpFileName As LongPtr, ByVal dwDesiredAccess As Long, ByVal dwShareMode As Long, ByVal lpSecurityAttributes As LongPtr, ByVal dwCreationDisposition As Long, ByVal dwFlagsAndAttributes As Long, ByVal hTemplateFile As LongPtr) As LongPtr
+
+        Private Declare PtrSafe Function CloseHandle Lib "kernel32" (ByVal hObject As LongPtr) As Long
+
+        Private Declare PtrSafe Function SetFilePointerEx Lib "kernel32" (ByVal hFile As LongPtr, ByVal liDistanceToMove As LongLong, ByRef lpNewFilePointer As LongLong, ByVal dwMoveMethod As Long) As Long
+
+        Private Declare PtrSafe Function SetEndOfFile Lib "kernel32" (ByVal hFile As LongPtr) As Long
+
+        Private Declare PtrSafe Function FlushFileBuffers Lib "kernel32" (ByVal hFile As LongPtr) As Long
+    #Else
+
+        Private Declare Function GetFileAttributesW Lib "kernel32" (ByVal lpFileName As LongPtr) As Long
+
+        Private Declare Function CopyFileW Lib "kernel32" (ByVal lpExistingFileName As LongPtr, ByVal lpNewFileName As LongPtr, ByVal bFailIfExists As Long) As Long
+
+        Private Declare Function DeleteFileW Lib "kernel32" (ByVal lpFileName As LongPtr) As Long
+
+        Private Declare Function CreateDirectoryW Lib "kernel32" (ByVal lpPathName As LongPtr, ByVal lpSecurityAttributes As LongPtr) As Long
+
+        Private Declare Function GetTempPathW Lib "kernel32" (ByVal nBufferLength As Long, ByVal lpBuffer As LongPtr) As Long
+
+        Private Declare Function GetTempFileNameW Lib "kernel32" (ByVal lpPathName As LongPtr, ByVal lpPrefixString As LongPtr, ByVal uUnique As Long, ByVal lpTempFileName As LongPtr) As Long
+
+        Private Declare Function GetOpenFileNameW Lib "comdlg32.dll" (ByRef lpofn As OPENFILENAMEW) As Long
+
+        Private Declare Function GetSaveFileNameW Lib "comdlg32.dll" (ByRef lpofn As OPENFILENAMEW) As Long
+
+                Private Declare Function ShellExecuteW Lib "shell32.dll" (ByVal hwnd As LongPtr, ByVal lpOperation As LongPtr, ByVal lpFile As LongPtr, ByVal lpParameters As LongPtr, ByVal lpDirectory As LongPtr, ByVal nShowCmd As Long) As LongPtr
+
+        Private Declare Function LoadLibraryW Lib "kernel32" (ByVal lpLibFileName As LongPtr) As LongPtr
+
+        Private Declare Function GetProcAddress Lib "kernel32" (ByVal hModule As LongPtr, ByVal lpProcName As String) As LongPtr
+
+        Private Declare Function FreeLibrary Lib "kernel32" (ByVal hLibModule As LongPtr) As Long
+
+        Private Declare Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
+
+        Private Declare Function GetTickCount Lib "kernel32" () As Long
+
+        Private Declare Function BeepAPI Lib "kernel32" Alias "Beep" (ByVal dwFreq As Long, ByVal dwDuration As Long) As Long
+
+        Private Declare Function GetSystemMetrics Lib "user32" (ByVal nIndex As Long) As Long
+
+        Private Declare Function DispCallFunc Lib "oleaut32" (ByVal pvInstance As Long, ByVal oVft As Long, ByVal cc As Long, ByVal vtReturn As Integer, ByVal cActuals As Long, ByVal prgvt As Long, ByVal prgpvarg As Long, ByVal pvargResult As Long) As Long
+
+        Private Declare Function MultiByteToWideChar Lib "kernel32" (ByVal CodePage As Long, ByVal dwFlags As Long, ByVal lpMultiByteStr As LongPtr, ByVal cbMultiByte As Long, ByVal lpWideCharStr As LongPtr, ByVal cchWideChar As Long) As Long
+
+        Private Declare Function WideCharToMultiByte Lib "kernel32" (ByVal CodePage As Long, ByVal dwFlags As Long, ByVal lpWideCharStr As LongPtr, ByVal cchWideChar As Long, ByVal lpMultiByteStr As LongPtr, ByVal cbMultiByte As Long, ByVal lpDefaultChar As LongPtr, ByVal lpUsedDefaultChar As LongPtr) As Long
+
+        Private Declare Function CreateFileW Lib "kernel32" (ByVal lpFileName As LongPtr, ByVal dwDesiredAccess As Long, ByVal dwShareMode As Long, ByVal lpSecurityAttributes As LongPtr, ByVal dwCreationDisposition As Long, ByVal dwFlagsAndAttributes As Long, ByVal hTemplateFile As LongPtr) As LongPtr
+
+        Private Declare Function CloseHandle Lib "kernel32" (ByVal hObject As LongPtr) As Long
+
+        Private Declare Function SetFilePointerEx Lib "kernel32" (ByVal hFile As LongPtr, ByVal liDistanceToMove As LongLong, ByRef lpNewFilePointer As LongLong, ByVal dwMoveMethod As Long) As Long
+
+        Private Declare Function SetEndOfFile Lib "kernel32" (ByVal hFile As LongPtr) As Long
+
+        Private Declare Function FlushFileBuffers Lib "kernel32" (ByVal hFile As LongPtr) As Long
+    #End If
+    ' =========================================================================
+    ' IPal Implementation
+    ' =========================================================================
+
+    Public Function GetFileSystem() As IFileSystem Implements IPal.GetFileSystem
+        Set GetFileSystem = Me
+
+    End Function
+
+    Public Function GetSettings() As ISettings Implements IPal.GetSettings
+        Set GetSettings = Me
+
+    End Function
+
+    Public Function GetDialogs() As IDialogs Implements IPal.GetDialogs
+        Set GetDialogs = Me
+
+    End Function
+
+    Public Function GetClipboard() As IClipboard Implements IPal.GetClipboard
+        Set GetClipboard = Me
+
+    End Function
+
+    Public Function GetShell() As IShell Implements IPal.GetShell
+        Set GetShell = Me
+
+    End Function
+
+    Public Function GetFonts() As IFonts Implements IPal.GetFonts
+        Set GetFonts = Me
+
+    End Function
+
+    Public Function GetDynamicCall() As IDynamicCall Implements IPal.GetDynamicCall
+        Set GetDynamicCall = Me
+
+    End Function
+
+    Public Function CreateTextEditor(ByVal targetControl As Object) As ITextEditor Implements IPal.CreateTextEditor
+        Set CreateTextEditor = New TextBoxTextEditor(targetControl)
+
+    End Function
+
+    Public Function CreateDictionary() As Object Implements IPal.CreateDictionary
+        On Error Resume Next
+        Set CreateDictionary = CreateObject("Scripting.Dictionary")
+        On Error GoTo 0
+
+    End Function
+
+    Public Function TruncateFile(ByVal filePath As String, ByVal newByteLength As LongLong) As Boolean Implements IPal.TruncateFile
+        Dim hFile As LongPtr
+        hFile = CreateFileW(StrPtr(filePath), &H80000000 Or &H40000000, 1 Or 2 Or 4, 0, 3, &H80, 0)
+        If hFile = 0 Or hFile = -1 Then Exit Function
+        Dim newPos As LongLong
+        If SetFilePointerEx(hFile, newByteLength, newPos, 0) <> 0 Then
+            If SetEndOfFile(hFile) <> 0 Then
+                FlushFileBuffers hFile
+                TruncateFile = True
+            End If
+        End If
+        CloseHandle hFile
+
+    End Function
+
+    Public Function NormalizeCrLf(ByVal text As String) As String Implements IPal.NormalizeCrLf
+        Dim s As String
+        s = Replace$(text, vbCrLf, vbLf)
+        s = Replace$(s, vbCr, vbLf)
+        NormalizeCrLf = Replace$(s, vbLf, vbCrLf)
+
+    End Function
+
+    Public Function GetPlatformName() As String Implements IPal.GetPlatformName
+        GetPlatformName = "WINDOWS"
+
+    End Function
+    ' =========================================================================
+    ' IFileSystem Implementation
+    ' =========================================================================
+
+    Public Function PathSeparator() As String Implements IFileSystem.PathSeparator
+        PathSeparator = "\"
+
+    End Function
+
+    Public Function Combine(ByVal path1 As String, ByVal path2 As String) As String Implements IFileSystem.Combine
+        Dim p1 As String
+        Dim p2 As String
+        p1 = Trim$(path1)
+        p2 = Trim$(path2)
+        If Len(p1) = 0 Then
+            Combine = p2
+            Exit Function
+        End If
+        If Len(p2) = 0 Then
+            Combine = p1
+            Exit Function
+        End If
+        ' If p2 is an absolute path (drive rooted or UNC), return p2
+        If Len(p2) >= 2 Then
+            If Mid$(p2, 2, 1) = ":" Then
+                Combine = p2
+                Exit Function
+            End If
+            If Left$(p2, 2) = "\\" Or Left$(p2, 2) = "//" Then
+                Combine = p2
+                Exit Function
+            End If
+        End If
+        ' Preserve root UNC "\\"
+        If p1 = "\\" Or p1 = "//" Then
+            Do While Left$(p2, 1) = "\" Or Left$(p2, 1) = "/"
+                p2 = Mid$(p2, 2)
+            Loop
+            Combine = "\\" & p2
+            Exit Function
+        End If
+        ' Preserve drive root "C:\"
+        If Len(p1) = 2 And Mid$(p1, 2, 1) = ":" Then
+            Do While Left$(p2, 1) = "\" Or Left$(p2, 1) = "/"
+                p2 = Mid$(p2, 2)
+            Loop
+            Combine = p1 & "\" & p2
+            Exit Function
+        End If
+        Do While Right$(p1, 1) = "\" Or Right$(p1, 1) = "/"
+            If Len(p1) <= 1 Then Exit Do
+            If Len(p1) = 3 And Mid$(p1, 2, 1) = ":" Then Exit Do
+            p1 = Left$(p1, Len(p1) - 1)
+        Loop
+        Do While Left$(p2, 1) = "\" Or Left$(p2, 1) = "/"
+            p2 = Mid$(p2, 2)
+        Loop
+        If Right$(p1, 1) = "\" Or Right$(p1, 1) = "/" Then
+            Combine = p1 & p2
+        Else
+            Combine = p1 & "\" & p2
+        End If
+
+    End Function
+
+    Public Function FileExists(ByVal filePath As String) As Boolean Implements IFileSystem.FileExists
+        If Len(filePath) = 0 Then Exit Function
+        Dim attr As Long
+        attr = GetFileAttributesW(StrPtr(filePath))
+        If attr = INVALID_FILE_ATTRIBUTES Then Exit Function
+        FileExists = ((attr And FILE_ATTRIBUTE_DIRECTORY) = 0)
+
+    End Function
+
+    Public Function FolderExists(ByVal folderPath As String) As Boolean Implements IFileSystem.FolderExists
+        If Len(folderPath) = 0 Then Exit Function
+        Dim attr As Long
+        attr = GetFileAttributesW(StrPtr(folderPath))
+        If attr = INVALID_FILE_ATTRIBUTES Then Exit Function
+        FolderExists = ((attr And FILE_ATTRIBUTE_DIRECTORY) <> 0)
+
+    End Function
+
+    Public Function CopyFile(ByVal sourcePath As String, ByVal destPath As String, Optional ByVal overwrite As Boolean = True) As Boolean Implements IFileSystem.CopyFile
+        If Len(sourcePath) = 0 Or Len(destPath) = 0 Then Exit Function
+        Dim failIfExists As Long
+        failIfExists = IIf(overwrite, 0&, 1&)
+        CopyFile = (CopyFileW(StrPtr(sourcePath), StrPtr(destPath), failIfExists) <> 0)
+
+    End Function
+
+    Public Function DeleteFile(ByVal filePath As String) As Boolean Implements IFileSystem.DeleteFile
+        If Len(filePath) = 0 Then Exit Function
+        DeleteFile = (DeleteFileW(StrPtr(filePath)) <> 0)
+
+    End Function
+
+    Public Function CreateFolder(ByVal folderPath As String) As Boolean Implements IFileSystem.CreateFolder
+        Dim p As String
+        p = Trim$(folderPath)
+        If Len(p) = 0 Then Exit Function
+        If FolderExists(p) Then
+            CreateFolder = True
+            Exit Function
+        End If
+        ' Recursive creation: ensure parent folder exists
+        Dim parent As String
+        parent = GetDirectoryName(p)
+        If Len(parent) > 0 And parent <> p And Not FolderExists(parent) Then
+            CreateFolder parent
+        End If
+        CreateFolder = (CreateDirectoryW(StrPtr(p), 0) <> 0)
+
+    End Function
+
+    Public Function GetTempPath() As String Implements IFileSystem.GetTempPath
+        Dim buf As String
+        buf = String$(MAX_PATH, vbNullChar)
+        Dim cch As Long
+        cch = GetTempPathW(MAX_PATH, StrPtr(buf))
+        If cch > MAX_PATH Then
+            buf = String$(cch + 1, vbNullChar)
+            cch = GetTempPathW(cch + 1, StrPtr(buf))
+        End If
+        If cch > 0 Then
+            GetTempPath = Left$(buf, cch)
+        Else
+            GetTempPath = Environ$("TEMP")
+            If Len(GetTempPath) = 0 Then GetTempPath = "C:\Windows\Temp"
+        End If
+
+    End Function
+
+    Public Function GetTempFileName(Optional ByVal prefix As String = "oas") As String Implements IFileSystem.GetTempFileName
+        Dim tmpDir As String
+        tmpDir = GetTempPath()
+        Dim buf As String
+        buf = String$(MAX_PATH, vbNullChar)
+        Dim res As Long
+        res = GetTempFileNameW(StrPtr(tmpDir), StrPtr(prefix), 0, StrPtr(buf))
+        If res <> 0 Then
+            Dim nullPos As Long
+            nullPos = InStr(buf, vbNullChar)
+            If nullPos > 0 Then
+                GetTempFileName = Left$(buf, nullPos - 1)
+            Else
+                GetTempFileName = buf
+            End If
+        Else
+            GetTempFileName = Combine(tmpDir, prefix & "_" & CStr(Timer) & ".tmp")
+        End If
+
+    End Function
+
+    Public Function GetAppDataPath() As String Implements IFileSystem.GetAppDataPath
+        Dim p As String
+        p = Environ$("LOCALAPPDATA")
+        If Len(p) = 0 Then p = Environ$("APPDATA")
+        If Len(p) = 0 Then p = GetTempPath()
+        GetAppDataPath = p
+
+    End Function
+
+    Public Function GetCachePath() As String Implements IFileSystem.GetCachePath
+        Dim root As String
+        root = GetAppDataPath()
+        Dim cacheDir As String
+        cacheDir = Combine(root, "OpenAccessStudio\Cache")
+        If Not FolderExists(cacheDir) Then
+            CreateFolder cacheDir
+        End If
+        GetCachePath = cacheDir
+
+    End Function
+
+    Public Function GetFileName(ByVal filePath As String) As String Implements IFileSystem.GetFileName
+        Dim p As String
+        p = Trim$(filePath)
+        ' Strip trailing slashes so directory name is returned
+        Do While Right$(p, 1) = "\" Or Right$(p, 1) = "/"
+            If Len(p) <= 1 Then Exit Do
+            If Len(p) = 3 And Mid$(p, 2, 1) = ":" Then Exit Do
+            p = Left$(p, Len(p) - 1)
+        Loop
+        Dim pos1 As Long
+        Dim pos2 As Long
+        Dim maxPos As Long
+        pos1 = InStrRev(p, "\")
+        pos2 = InStrRev(p, "/")
+        maxPos = IIf(pos1 > pos2, pos1, pos2)
+        If maxPos > 0 Then
+            GetFileName = Mid$(p, maxPos + 1)
+        Else
+            GetFileName = p
+        End If
+
+    End Function
+
+    Public Function GetDirectoryName(ByVal filePath As String) As String Implements IFileSystem.GetDirectoryName
+        Dim p As String
+        p = Trim$(filePath)
+        ' Strip trailing slash
+        Do While Right$(p, 1) = "\" Or Right$(p, 1) = "/"
+            If Len(p) <= 1 Then Exit Do
+            If Len(p) = 3 And Mid$(p, 2, 1) = ":" Then Exit Do
+            p = Left$(p, Len(p) - 1)
+        Loop
+        Dim pos1 As Long
+        Dim pos2 As Long
+        Dim maxPos As Long
+        pos1 = InStrRev(p, "\")
+        pos2 = InStrRev(p, "/")
+        maxPos = IIf(pos1 > pos2, pos1, pos2)
+        If maxPos > 1 Then
+            ' Check if root drive like C:\
+            If maxPos = 3 And Mid$(p, 2, 1) = ":" Then
+                GetDirectoryName = Left$(p, 3)
+            ' Check if UNC share root like \\server\share
+            ElseIf Left$(p, 2) = "\\" And InStr(3, p, "\") = maxPos Then
+                GetDirectoryName = p
+            Else
+                GetDirectoryName = Left$(p, maxPos - 1)
+            End If
+        ElseIf maxPos = 1 Then
+            GetDirectoryName = Left$(p, 1)
+        Else
+            GetDirectoryName = vbNullString
+        End If
+
+    End Function
+
+    Public Function GetExtension(ByVal filePath As String) As String Implements IFileSystem.GetExtension
+        Dim fn As String
+        fn = GetFileName(filePath)
+        Dim dotPos As Long
+        dotPos = InStrRev(fn, ".")
+        ' If dot is the very first character (e.g. .gitignore), it has no extension
+        If dotPos > 1 Then
+            GetExtension = Mid$(fn, dotPos)
+        Else
+            GetExtension = vbNullString
+        End If
+
+    End Function
+
+    Public Function IsLockFilePresent(ByVal dbPath As String) As Boolean Implements IFileSystem.IsLockFilePresent
+        If Len(dbPath) = 0 Then Exit Function
+        Dim dirPart As String
+        Dim filePart As String
+        Dim extPart As String
+        dirPart = GetDirectoryName(dbPath)
+        filePart = GetFileName(dbPath)
+        extPart = LCase$(GetExtension(dbPath))
+        Dim lockName As String
+        Select Case extPart
+            Case ".accdb", ".accde", ".accdr", ".accdt"
+                lockName = Left$(filePart, Len(filePart) - Len(extPart)) & ".laccdb"
+            Case ".mdb", ".mde"
+                lockName = Left$(filePart, Len(filePart) - Len(extPart)) & ".ldb"
+            Case Else
+                lockName = filePart & ".lock"
+        End Select
+        Dim lockPath As String
+        lockPath = Combine(dirPart, lockName)
+        IsLockFilePresent = FileExists(lockPath)
+
+    End Function
+
+    Public Function LockFileRange(ByVal filePath As String, ByVal offsetBytes As LongLong, ByVal lengthBytes As LongLong, Optional ByVal exclusive As Boolean = True) As LongPtr Implements IFileSystem.LockFileRange
+        Dim startPage As Long, pageCount As Long
+        startPage = CLng(offsetBytes \ 4096^)
+        pageCount = CLng((lengthBytes + 4095^) \ 4096^)
+        If pageCount <= 0 Then pageCount = 1
+        LockFileRange = PageWriter.LockPageRange(filePath, startPage, pageCount, exclusive)
+
+    End Function
+
+    Public Function UnlockFileRange(ByVal hFile As LongPtr, ByVal offsetBytes As LongLong, ByVal lengthBytes As LongLong) As Boolean Implements IFileSystem.UnlockFileRange
+        Dim startPage As Long, pageCount As Long
+        startPage = CLng(offsetBytes \ 4096^)
+        pageCount = CLng((lengthBytes + 4095^) \ 4096^)
+        If pageCount <= 0 Then pageCount = 1
+        UnlockFileRange = PageWriter.UnlockPageRange(hFile, startPage, pageCount)
+
+    End Function
+
+    Public Function ReadAllText(ByVal filePath As String) As String Implements IFileSystem.ReadAllText
+        If Not FileExists(filePath) Then Exit Function
+        On Error Resume Next
+        Dim fn As Integer
+        fn = FreeFile
+        Open filePath For Binary Access Read As #fn
+        Dim flen As Long
+        flen = LOF(fn)
+        If flen > 0 Then
+            Dim raw() As Byte
+            ReDim raw(0 To flen - 1)
+            Get #fn, , raw
+            Close #fn
+            ' Check for UTF-8 BOM (&HEF, &HBB, &HBF)
+            Dim startIdx As Long
+            startIdx = 0
+            If flen >= 3 Then
+                If raw(0) = &HEF& And raw(1) = &HBB& And raw(2) = &HBF& Then
+                    startIdx = 3
+                End If
+            End If
+            ' Check for UTF-16 LE BOM (&HFF, &HFE)
+            If flen >= 2 And startIdx = 0 Then
+                If raw(0) = &HFF& And raw(1) = &HFE& Then
+                    Dim u16Len As Long
+                    u16Len = (flen - 2) \ 2
+                    Dim u16Str As String
+                    u16Str = String$(u16Len, vbNullChar)
+                    #If Win64 Then
+                        Dim pSrc As LongPtr
+                        Dim pDst As LongPtr
+                        pSrc = VarPtr(raw(2))
+                        pDst = StrPtr(u16Str)
+                    #Else
+                        Dim pSrc As Long
+                        Dim pDst As Long
+                        pSrc = VarPtr(raw(2))
+                        pDst = StrPtr(u16Str)
+                    #End If
+                    ' Direct memory copy or assignment
+                    ReadAllText = Mid$(CStr(raw), 2)
+                    Exit Function
+                End If
+            End If
+            ' Decode UTF-8 to UTF-16
+            Dim dataLen As Long
+            dataLen = flen - startIdx
+            If dataLen > 0 Then
+                Dim cchWide As Long
+                cchWide = MultiByteToWideChar(CP_UTF8, 0, VarPtr(raw(startIdx)), dataLen, 0, 0)
+                If cchWide > 0 Then
+                    Dim outStr As String
+                    outStr = String$(cchWide, vbNullChar)
+                    MultiByteToWideChar CP_UTF8, 0, VarPtr(raw(startIdx)), dataLen, StrPtr(outStr), cchWide
+                    ReadAllText = outStr
+                Else
+                    ' Fallback
+                    ReadAllText = StrConv(raw, vbUnicode)
+                End If
+            Else
+                ReadAllText = vbNullString
+            End If
+        Else
+            Close #fn
+            ReadAllText = vbNullString
+        End If
+        On Error GoTo 0
+
+    End Function
+
+    Public Function WriteAllText(ByVal filePath As String, ByVal content As String) As Boolean Implements IFileSystem.WriteAllText
+        On Error Resume Next
+        If FileExists(filePath) Then DeleteFile filePath
+        Dim fn As Integer
+        fn = FreeFile
+        Open filePath For Binary Access Write As #fn
+        If Len(content) > 0 Then
+            Dim cchWide As Long
+            cchWide = Len(content)
+            Dim cbUtf8 As Long
+            cbUtf8 = WideCharToMultiByte(CP_UTF8, 0, StrPtr(content), cchWide, 0, 0, 0, 0)
+            If cbUtf8 > 0 Then
+                Dim raw() As Byte
+                ReDim raw(0 To cbUtf8 - 1)
+                WideCharToMultiByte CP_UTF8, 0, StrPtr(content), cchWide, VarPtr(raw(0)), cbUtf8, 0, 0
+                Put #fn, , raw
+            End If
+        End If
+        Close #fn
+        WriteAllText = (Err.Number = 0)
+        On Error GoTo 0
+
+    End Function
+    ' =========================================================================
+    ' ISettings Implementation
+    ' =========================================================================
+
+    Public Function GetValue(ByVal appName As String, ByVal section As String, ByVal key As String, Optional ByVal defaultValue As String = "") As String Implements ISettings.GetValue
+        On Error Resume Next
+        GetValue = GetSetting(appName, section, key, defaultValue)
+        If Err.Number <> 0 Then GetValue = defaultValue
+        On Error GoTo 0
+
+    End Function
+
+    Public Function SetValue(ByVal appName As String, ByVal section As String, ByVal key As String, ByVal value As String) As Boolean Implements ISettings.SetValue
+        On Error Resume Next
+        SaveSetting appName, section, key, value
+        SetValue = (Err.Number = 0)
+        On Error GoTo 0
+
+    End Function
+
+    Public Function DeleteValue(ByVal appName As String, ByVal section As String, Optional ByVal key As String = "") As Boolean Implements ISettings.DeleteValue
+        On Error Resume Next
+        If Len(key) > 0 Then
+            DeleteSetting appName, section, key
+        Else
+            DeleteSetting appName, section
+        End If
+        DeleteValue = (Err.Number = 0)
+        On Error GoTo 0
+
+    End Function
+    ' =========================================================================
+    ' IDialogs Implementation
+    ' =========================================================================
+
+    Public Function ShowOpenFile(ByVal ownerHwnd As LongPtr, ByVal title As String, ByVal filter As String, Optional ByVal defaultExt As String = "") As String Implements IDialogs.ShowOpenFile
+        Dim ofn As OPENFILENAMEW
+        Dim filePath As String
+        filePath = String$(1024, vbNullChar)
+        Dim filterStr As String
+        Dim titleStr As String
+        Dim filterBytes() As Byte
+        Dim titleBytes() As Byte
+        Dim res As Long
+        filterStr = filter
+        If Len(filterStr) = 0 Then
+            filterStr = "Access Databases (*.accdb;*.mdb)" & vbNullChar & "*.accdb;*.mdb" & vbNullChar & "All Files (*.*)" & vbNullChar & "*.*" & vbNullChar & vbNullChar
+        ElseIf Right$(filterStr, 2) <> vbNullChar & vbNullChar Then
+            filterStr = filterStr & vbNullChar & vbNullChar
+        End If
+        titleStr = title
+        If Len(titleStr) = 0 Then titleStr = "Open Database"
+        filterBytes = filterStr
+        titleBytes = titleStr
+        ofn.lStructSize = LenB(ofn)
+        ofn.hwndOwner = ownerHwnd
+        ofn.lpstrFilter = VarPtr(filterBytes(0))
+        ofn.nFilterIndex = 1
+        ofn.lpstrFile = StrPtr(filePath)
+        ofn.nMaxFile = 1024
+        ofn.lpstrTitle = VarPtr(titleBytes(0))
+        ofn.Flags = OFN_FILEMUSTEXIST Or OFN_PATHMUSTEXIST Or OFN_HIDEREADONLY
+        res = GetOpenFileNameW(ofn)
+        If res <> 0 Then
+            Dim nullPos As Long
+            nullPos = InStr(filePath, vbNullChar)
+            If nullPos > 0 Then
+                ShowOpenFile = Trim$(Left$(filePath, nullPos - 1))
+            Else
+                ShowOpenFile = Trim$(filePath)
+            End If
+        Else
+            ShowOpenFile = vbNullString
+        End If
+
+    End Function
+
+    Public Function ShowSaveFile(ByVal ownerHwnd As LongPtr, ByVal title As String, ByVal filter As String, Optional ByVal defaultExt As String = "") As String Implements IDialogs.ShowSaveFile
+        Dim ofn As OPENFILENAMEW
+        Dim filePath As String
+        filePath = String$(1024, vbNullChar)
+        Dim filterStr As String
+        Dim titleStr As String
+        Dim defExtStr As String
+        Dim filterBytes() As Byte
+        Dim titleBytes() As Byte
+        Dim defExtBytes() As Byte
+        Dim res As Long
+        filterStr = filter
+        If Len(filterStr) = 0 Then
+            filterStr = "Access Database (*.accdb)" & vbNullChar & "*.accdb" & vbNullChar & "Jet Database (*.mdb)" & vbNullChar & "*.mdb" & vbNullChar & vbNullChar
+        ElseIf Right$(filterStr, 2) <> vbNullChar & vbNullChar Then
+            filterStr = filterStr & vbNullChar & vbNullChar
+        End If
+        titleStr = title
+        If Len(titleStr) = 0 Then titleStr = "Save Database"
+        defExtStr = defaultExt
+        If Len(defExtStr) = 0 Then defExtStr = "accdb"
+        filterBytes = filterStr
+        titleBytes = titleStr
+        defExtBytes = defExtStr & vbNullChar
+        ofn.lStructSize = LenB(ofn)
+        ofn.hwndOwner = ownerHwnd
+        ofn.lpstrFilter = VarPtr(filterBytes(0))
+        ofn.nFilterIndex = 1
+        ofn.lpstrFile = StrPtr(filePath)
+        ofn.nMaxFile = 1024
+        ofn.lpstrTitle = VarPtr(titleBytes(0))
+        ofn.lpstrDefExt = VarPtr(defExtBytes(0))
+        ofn.Flags = OFN_PATHMUSTEXIST Or OFN_OVERWRITEPROMPT Or OFN_HIDEREADONLY
+        res = GetSaveFileNameW(ofn)
+        If res <> 0 Then
+            Dim nullPos As Long
+            nullPos = InStr(filePath, vbNullChar)
+            If nullPos > 0 Then
+                ShowSaveFile = Trim$(Left$(filePath, nullPos - 1))
+            Else
+                ShowSaveFile = Trim$(filePath)
+            End If
+        Else
+            ShowSaveFile = vbNullString
+        End If
+
+    End Function
+
+    Public Function ShowMessage(ByVal prompt As String, Optional ByVal buttons As Long = 0, Optional ByVal title As String = "") As Long Implements IDialogs.ShowMessage
+        ShowMessage = MsgBox(prompt, buttons, title)
+
+    End Function
+
+    Public Function ShowInput(ByVal prompt As String, Optional ByVal title As String = "", Optional ByVal defaultVal As String = "") As String Implements IDialogs.ShowInput
+        ShowInput = InputBox(prompt, title, defaultVal)
+
+    End Function
+    ' =========================================================================
+    ' IClipboard Implementation
+    ' =========================================================================
+
+    Public Function GetText() As String Implements IClipboard.GetText
+        On Error Resume Next
+        GetText = Clipboard.GetText()
+        On Error GoTo 0
+
+    End Function
+
+    Public Function SetText(ByVal text As String) As Boolean Implements IClipboard.SetText
+        On Error Resume Next
+        Clipboard.Clear
+        Clipboard.SetText text
+        SetText = (Err.Number = 0)
+        On Error GoTo 0
+
+    End Function
+
+    Public Function Clear() As Boolean Implements IClipboard.Clear
+        On Error Resume Next
+        Clipboard.Clear
+        Clear = (Err.Number = 0)
+        On Error GoTo 0
+
+    End Function
+    ' =========================================================================
+    ' IShell Implementation
+    ' =========================================================================
+
+    Public Function OpenUrl(ByVal url As String) As Boolean Implements IShell.OpenUrl
+        If Len(url) = 0 Then Exit Function
+        Dim res As LongPtr
+        Dim opBytes() As Byte
+        Dim urlBytes() As Byte
+        opBytes = "open" & vbNullChar
+        urlBytes = url & vbNullChar
+        res = ShellExecuteW(0, VarPtr(opBytes(0)), VarPtr(urlBytes(0)), 0, 0, 1)
+        OpenUrl = (res > 32)
+
+    End Function
+
+    Public Function Execute(ByVal command As String, Optional ByVal parameters As String = "", Optional ByVal workingDir As String = "") As LongPtr Implements IShell.Execute
+        If Len(command) = 0 Then Exit Function
+        Dim opBytes() As Byte
+        Dim cmdBytes() As Byte
+        Dim paramBytes() As Byte
+        Dim dirBytes() As Byte
+        opBytes = "open" & vbNullChar
+        cmdBytes = command & vbNullChar
+        paramBytes = parameters & vbNullChar
+        dirBytes = workingDir & vbNullChar
+        Dim res As LongPtr
+        res = ShellExecuteW(0, VarPtr(opBytes(0)), VarPtr(cmdBytes(0)), IIf(Len(parameters) > 0, VarPtr(paramBytes(0)), 0), IIf(Len(workingDir) > 0, VarPtr(dirBytes(0)), 0), 1)
+        Execute = res
+
+    End Function
+    ' =========================================================================
+    ' IFonts Implementation
+    ' =========================================================================
+
+    Public Function GetCodeFont() As String Implements IFonts.GetCodeFont
+        GetCodeFont = "Consolas"
+
+    End Function
+
+    Public Function GetUiFont() As String Implements IFonts.GetUiFont
+        GetUiFont = "Segoe UI"
+
+    End Function
+
+    Public Function GetArabicFont() As String Implements IFonts.GetArabicFont
+        GetArabicFont = "Segoe UI"
+
+    End Function
+
+    Public Function GetDefaultFontSize() As Single Implements IFonts.GetDefaultFontSize
+        GetDefaultFontSize = 9.0!
+
+    End Function
+     ' =========================================================================
+    ' IDynamicCall Implementation
+    ' =========================================================================
+
+    Public Sub SetUserApproved(ByVal approved As Boolean) Implements IDynamicCall.SetUserApproved
+        m_dynamicUserApproved = approved
+
+    End Sub
+
+    Public Sub AddAllowed(ByVal dllName As String, ByVal procName As String) Implements IDynamicCall.AddAllowed
+        If m_dynamicAllowed Is Nothing Then
+            Set m_dynamicAllowed = CreateDictionary()
+        End If
+        Dim key As String
+        key = LCase$(GetFileName(dllName)) & "!" & LCase$(procName)
+        If Not m_dynamicAllowed.Exists(key) Then
+            m_dynamicAllowed.Add key, True
+        End If
+
+    End Sub
+
+    Public Function IsCallAllowed(ByVal dllName As String, ByVal procName As String) As Boolean Implements IDynamicCall.IsCallAllowed
+        If m_dynamicUserApproved Then
+            IsCallAllowed = True
+            Exit Function
+        End If
+        Dim dllLower As String
+        Dim procLower As String
+        dllLower = LCase$(GetFileName(dllName))
+        procLower = LCase$(procName)
+        If Not m_dynamicAllowed Is Nothing Then
+            Dim key As String
+            key = dllLower & "!" & procLower
+            If m_dynamicAllowed.Exists(key) Then
+                IsCallAllowed = True
+                Exit Function
+            End If
+        End If
+        Select Case dllLower
+            Case "kernel32.dll", "kernel32"
+                Select Case procLower
+                    Case "sleep", "gettickcount", "gettickcount64", "getsystemtime", "getlocaltime", "beep"
+                        IsCallAllowed = True
+                        Exit Function
+                End Select
+            Case "user32.dll", "user32"
+                Select Case procLower
+                    Case "messagebox", "messageboxw", "messageboxa", "getsystemmetrics", "getcursorpos", _
+                         "findwindowex", "findwindowexa", "findwindowexw", "getfocus", "getwindow", _
+                         "getwindowlong", "getwindowlonga", "getwindowlongw", "setwindowlong", _
+                         "setwindowlonga", "setwindowlongw", "showwindow", "setactivewindow", _
+                         "setforegroundwindow", "invalidaterect", "vkkeyscan", "vkkeyscana", _
+                         "vkkeyscanw", "apisetfocus", "keybd_event"
+                        IsCallAllowed = True
+                        Exit Function
+                End Select
+            Case "ole32.dll", "ole32"
+                Select Case procLower
+                    Case "cocreateguid"
+                        IsCallAllowed = True
+                        Exit Function
+                End Select
+            Case "advapi32.dll", "advapi32"
+                Select Case procLower
+                    Case "regopenkeyex", "regopenkeyexa", "regopenkeyexw", _
+                         "regqueryvalueex", "regqueryvalueexa", "regqueryvalueexw", _
+                         "regclosekey", "regqueryvalueexlong", "regqueryvalueexnull"
+                        IsCallAllowed = True
+                        Exit Function
+                End Select
+        End Select
+        IsCallAllowed = False
+
+    End Function
+
+    Public Function CallProcedure(ByVal dllName As String, ByVal procName As String, ByRef args() As Variant, ByVal returnType As Integer) As Variant Implements IDynamicCall.CallProcedure
+        If InStr(dllName, "\") > 0 Or InStr(dllName, "/") > 0 Then
+            Err.Raise 453, "WinPal.CallProcedure", "Calling procedure failed: DLL path separators are prohibited."
+            Exit Function
+        End If
+        If Not IsCallAllowed(dllName, procName) Then
+            Err.Raise 453, "WinPal.CallProcedure", "Calling procedure '" & procName & "' in '" & dllName & "' is restricted by security policy."
+            Exit Function
+        End If
+        Dim procLower As String
+        procLower = LCase$(Trim$(procName))
+        Select Case procLower
+            Case "sleep"
+                If UBound(args) >= LBound(args) Then
+                    Sleep CLng(args(LBound(args)))
+                End If
+                CallProcedure = Empty
+                Exit Function
+            Case "gettickcount", "gettickcount64"
+                CallProcedure = CLng(GetTickCount())
+                Exit Function
+            Case "beep"
+                If (UBound(args) - LBound(args) + 1) >= 2 Then
+                    CallProcedure = CLng(BeepAPI(CLng(args(LBound(args))), CLng(args(LBound(args) + 1))))
+                Else
+                    CallProcedure = CLng(BeepAPI(800, 200))
+                End If
+                Exit Function
+            Case "getsystemmetrics"
+                If UBound(args) >= LBound(args) Then
+                    CallProcedure = CLng(GetSystemMetrics(CLng(args(LBound(args)))))
+                Else
+                    CallProcedure = 0&
+                End If
+                Exit Function
+            Case "messagebox", "messageboxa", "messageboxw"
+                Dim msgText As String
+                Dim msgTitle As String
+                Dim msgFlags As Long
+                msgTitle = "OpenAccess Studio"
+                msgFlags = 0
+                If UBound(args) >= LBound(args) Then msgText = CStr(args(LBound(args)))
+                If UBound(args) >= LBound(args) + 1 Then msgTitle = CStr(args(LBound(args) + 1))
+                If UBound(args) >= LBound(args) + 2 Then msgFlags = CLng(args(LBound(args) + 2))
+                CallProcedure = PalManager.Dialogs.ShowMessage(msgText, msgTitle, msgFlags)
+                Exit Function
+        End Select
+        Dim fullDll As String
+        fullDll = GetFileName(dllName)
+        If InStr(fullDll, ".") = 0 Then fullDll = fullDll & ".dll"
+        Dim hMod As LongPtr
+        hMod = LoadLibraryW(StrPtr(fullDll))
+        If hMod = 0 Then
+            Err.Raise 453, "WinPal.CallProcedure", "Specified DLL could not be loaded: " & dllName
+            Exit Function
+        End If
+        Dim pProc As LongPtr
+        pProc = GetProcAddress(hMod, procName)
+        If pProc = 0 Then
+            pProc = GetProcAddress(hMod, procName & "W")
+            If pProc = 0 Then
+                pProc = GetProcAddress(hMod, procName & "A")
+            End If
+        End If
+        If pProc = 0 Then
+            FreeLibrary hMod
+            Err.Raise 453, "WinPal.CallProcedure", "Specified procedure not found in DLL: " & procName
+            Exit Function
+        End If
+        Dim numArgs As Long
+        numArgs = UBound(args) - LBound(args) + 1
+        Dim vResult As Variant
+        Dim hr As Long
+        If numArgs <= 0 Then
+            hr = DispCallFunc(0, pProc, 4, returnType, 0, 0, 0, VarPtr(vResult))
+        Else
+            Dim vTypes() As Integer
+            ReDim vTypes(0 To numArgs - 1)
+            #If Win64 Then
+                Dim pArgs() As LongPtr
+                ReDim pArgs(0 To numArgs - 1)
+            #Else
+                Dim pArgs() As Long
+                ReDim pArgs(0 To numArgs - 1)
+            #End If
+            Dim i As Long
+            For i = 0 To numArgs - 1
+                vTypes(i) = VarType(args(LBound(args) + i))
+                pArgs(i) = VarPtr(args(LBound(args) + i))
+            Next i
+            hr = DispCallFunc(0, pProc, 4, returnType, numArgs, VarPtr(vTypes(0)), VarPtr(pArgs(0)), VarPtr(vResult))
+        End If
+        FreeLibrary hMod
+        If hr = 0 Then
+            CallProcedure = vResult
+        Else
+            Select Case returnType
+                Case vbLong
+                    CallProcedure = 0&
+                Case vbBoolean
+                    CallProcedure = True
+                Case vbString
+                    CallProcedure = ""
+                Case Else
+                    CallProcedure = Empty
+            End Select
+        End If
+
+    End Function
+
+End Class

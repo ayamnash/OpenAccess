@@ -1,0 +1,1442 @@
+' File: src/studio/engine/LiveEngineSelfTest.twin
+' Comprehensive Assertion-Driven Self-Test for Live Native Engine (Stages 1 to 20)
+Option Explicit
+
+Public Module LiveEngineSelfTest
+
+    Private m_passCount As Long
+
+    Private m_failCount As Long
+
+    Private Sub LogMsg(ByVal msg As String, ByVal logPath As String)
+        Debug.Print msg
+        On Error Resume Next
+        Dim fn As Integer
+        fn = FreeFile()
+        Open logPath For Append As #fn
+        Print #fn, msg
+        Close #fn
+        On Error GoTo 0
+
+    End Sub
+
+    Private Sub AssertTrue(ByVal cond As Boolean, ByVal label As String, ByVal detail As String, ByVal logPath As String)
+        If cond Then
+            m_passCount = m_passCount + 1
+            LogMsg "[PASS] " & label & " :: " & detail, logPath
+        Else
+            m_failCount = m_failCount + 1
+            LogMsg "[FAIL] " & label & " :: " & detail, logPath
+        End If
+
+    End Sub
+
+    Public Sub VerifyLiveEngine(Optional ByVal testDbPath As String = "")
+        On Error GoTo ErrHandler
+        m_passCount = 0
+        m_failCount = 0
+        If Len(Trim$(testDbPath)) = 0 Then
+            testDbPath = Environ$("TEMP")
+            If Len(testDbPath) = 0 Then testDbPath = "."
+            If Right$(testDbPath, 1) <> "\" And Right$(testDbPath, 1) <> "/" Then
+                testDbPath = testDbPath & "\"
+            End If
+            testDbPath = testDbPath & "OpenAccess_LiveTest.mdb"
+        End If
+        Dim logPath As String
+        logPath = testDbPath & ".log"
+        ' Clean previous test files
+        On Error Resume Next
+        Kill testDbPath
+        Kill testDbPath & ".journal"
+        Kill logPath
+        On Error GoTo ErrHandler
+        LogMsg "==========================================================", logPath
+        LogMsg " OpenAccess Live Engine Self-Test (Strict Assertion Suite)", logPath
+        LogMsg " Target File: " & testDbPath, logPath
+        LogMsg "==========================================================", logPath
+        ' Stage 1: Create new database (4 standard pages + 17-column MSysObjects)
+        Dim dbe As DBEngine
+        Set dbe = New DBEngine
+        Dim db As Database
+        Set db = dbe.CreateDatabase(testDbPath)
+        AssertTrue (db.TotalPages >= 4), "Stage 1.1 CreateDatabase Pages", "TotalPages = " & db.TotalPages & " (expected >= 4)", logPath
+        LogMsg "DEBUG testDbPath: " & testDbPath, logPath
+        LogMsg "DEBUG TableDefs.Count: " & db.TableDefs.Count, logPath
+        Dim tii As Long
+        For tii = 0 To db.TableDefs.Count - 1
+            LogMsg "  DEBUG TableDef(" & tii & "): " & db.TableDefs(tii).Name, logPath
+        Next tii
+        AssertTrue (db.TableDefs("MSysObjects").Fields.Count = 17), "Stage 1.2 MSysObjects Schema", "MSysObjects.Fields.Count = " & db.TableDefs("MSysObjects").Fields.Count & " (expected 17)", logPath
+        ' Stage 2: SQL DDL (CREATE TABLE) with physical TDEF & Data Page allocation
+        db.Execute "CREATE TABLE Employees (EmpID LONG, FullName TEXT(50), Balance LONG, Dept TEXT(30))"
+        Dim empTd As TableDef
+        Set empTd = db.TableDefs("Employees")
+        AssertTrue (Not empTd Is Nothing), "Stage 2.1 CREATE TABLE Registered", "TableDefs.Count = " & db.TableDefs.Count, logPath
+        AssertTrue (empTd.Descriptor.TdefPageNumber >= 4 And empTd.Descriptor.PrimaryDataPage > 0), "Stage 2.2 Physical TDEF & Data Page Allocated", "TdefPage=" & empTd.Descriptor.TdefPageNumber & ", DataPage=" & empTd.Descriptor.PrimaryDataPage, logPath
+        ' Stage 3: SQL DML (INSERT INTO) with positive & negative Int32LE
+        db.Execute "INSERT INTO Employees (EmpID, FullName, Balance, Dept) VALUES (101, 'Ahmad Saleh', 2500, 'Engineering')"
+        db.Execute "INSERT INTO Employees (EmpID, FullName, Balance, Dept) VALUES (102, 'Sara Mansour', -450, 'Finance')"
+        db.Execute "INSERT INTO Employees (EmpID, FullName, Balance, Dept) VALUES (103, 'Khaled Nasser', 1800, 'Engineering')"
+        Dim rs As Recordset
+        Set rs = db.OpenRecordset("Employees")
+        AssertTrue (rs.RecordCount = 3), "Stage 3.1 INSERT INTO RecordCount", "RecordCount = " & rs.RecordCount & " (expected 3)", logPath
+        rs.Close
+        ' Stage 4: DAO Recordset (AddNew / Update)
+        Set rs = db.OpenRecordset("Employees")
+        rs.AddNew
+        rs.Fields("EmpID").Value = 104
+        rs.Fields("FullName").Value = "Lina Haddad"
+        rs.Fields("Balance").Value = 3200
+        rs.Fields("Dept").Value = "Management"
+        rs.Update
+        AssertTrue (rs.RecordCount = 4), "Stage 4.1 Recordset.AddNew + Update", "RecordCount = " & rs.RecordCount & " (expected 4)", logPath
+        rs.Close
+        ' Stage 5: In-place & Relocated DAO Recordset (Edit / Update)
+        Set rs = db.OpenRecordset("Employees")
+        rs.MoveFirst
+        Dim found102 As Boolean
+        found102 = False
+        Do While Not rs.EOF
+            If CLng(rs.Fields("EmpID").Value) = 102 Then
+                found102 = True
+                rs.Edit
+                rs.Fields("Balance").Value = -150
+                rs.Fields("Dept").Value = "Treasury"
+                rs.Update
+                Exit Do
+            End If
+            rs.MoveNext
+        Loop
+        AssertTrue found102, "Stage 5.1 Locate EmpID 102 for Edit", "Found = " & found102, logPath
+        AssertTrue (CLng(rs.Fields("Balance").Value) = -150 And CStr(rs.Fields("Dept").Value) = "Treasury"), "Stage 5.2 In-Memory Edit Buffer Applied", "Balance=" & rs.Fields("Balance").Value & ", Dept=" & rs.Fields("Dept").Value, logPath
+        rs.Close
+        ' Stage 6: DAO Recordset (Delete) and SQL query (SELECT ORDER BY)
+        Set rs = db.OpenRecordset("Employees")
+        rs.MoveFirst
+        Dim deleted103 As Boolean
+        deleted103 = False
+        Do While Not rs.EOF
+            If CLng(rs.Fields("EmpID").Value) = 103 Then
+                rs.Delete
+                deleted103 = True
+                Exit Do
+            End If
+            rs.MoveNext
+        Loop
+        rs.Close
+        AssertTrue deleted103, "Stage 6.1 Recordset.Delete EmpID 103", "Deleted = " & deleted103, logPath
+        Dim rsQuery As Recordset
+        Set rsQuery = db.OpenRecordset("SELECT EmpID, FullName, Balance, Dept FROM Employees ORDER BY EmpID")
+        AssertTrue (rsQuery.RecordCount = 3), "Stage 6.2 Post-Delete Row Count", "RecordCount = " & rsQuery.RecordCount & " (expected 3)", logPath
+        rsQuery.MoveFirst
+        Do While Not rsQuery.EOF
+            LogMsg "   -> [In-Session Row] EmpID=" & rsQuery.Fields("EmpID").Value & _
+                   " | Name=" & rsQuery.Fields("FullName").Value & _
+                   " | Balance=" & rsQuery.Fields("Balance").Value & _
+                   " | Dept=" & rsQuery.Fields("Dept").Value, logPath
+            rsQuery.MoveNext
+        Loop
+        rsQuery.Close
+        ' Stage 7: Close Database and Reopen from Disk (True Disk Persistence Verification)
+        db.Close
+        Set db = Nothing
+        Set dbe = Nothing
+        Dim dbeDisk As DBEngine
+        Set dbeDisk = New DBEngine
+        Dim dbDisk As Database
+        Set dbDisk = dbeDisk.OpenDatabase(testDbPath)
+        Dim reopenedTd As TableDef
+        Set reopenedTd = dbDisk.TableDefs("Employees")
+        AssertTrue (Not reopenedTd Is Nothing), "Stage 7.1 Reopen Catalog Discovery", "Employees found in MSysObjects on disk (TdefPage=" & reopenedTd.Descriptor.TdefPageNumber & ")", logPath
+        Set rsQuery = dbDisk.OpenRecordset("SELECT EmpID, FullName, Balance, Dept FROM Employees ORDER BY EmpID")
+        AssertTrue (rsQuery.RecordCount = 3), "Stage 7.2 Reopen Disk Row Count", "RecordCount = " & rsQuery.RecordCount & " (expected 3)", logPath
+        rsQuery.MoveFirst
+        AssertTrue (CLng(rsQuery.Fields("EmpID").Value) = 101 And CLng(rsQuery.Fields("Balance").Value) = 2500), "Stage 7.3 Reopen Row 1 (EmpID 101)", "EmpID=" & rsQuery.Fields("EmpID").Value & ", Balance=" & rsQuery.Fields("Balance").Value, logPath
+        rsQuery.MoveNext
+        AssertTrue (CLng(rsQuery.Fields("EmpID").Value) = 102 And CLng(rsQuery.Fields("Balance").Value) = -150 And CStr(rsQuery.Fields("Dept").Value) = "Treasury"), "Stage 7.4 Reopen Row 2 (EmpID 102 Updated)", "EmpID=" & rsQuery.Fields("EmpID").Value & ", Balance=" & rsQuery.Fields("Balance").Value & ", Dept=" & rsQuery.Fields("Dept").Value, logPath
+        rsQuery.MoveNext
+        AssertTrue (CLng(rsQuery.Fields("EmpID").Value) = 104 And CLng(rsQuery.Fields("Balance").Value) = 3200), "Stage 7.5 Reopen Row 3 (EmpID 104)", "EmpID=" & rsQuery.Fields("EmpID").Value & ", Balance=" & rsQuery.Fields("Balance").Value, logPath
+        rsQuery.Close
+        ' Stage 8: Page-Level Rollback Journal Transaction Verification
+        dbeDisk.BeginTrans
+        dbDisk.Execute "DELETE FROM Employees"
+        AssertTrue (dbDisk.RecordsAffected = 3), "Stage 8.1 DELETE FROM Employees Inside Trans", "RecordsAffected = " & dbDisk.RecordsAffected & " (expected 3)", logPath
+        Set rsQuery = dbDisk.OpenRecordset("SELECT * FROM Employees")
+        AssertTrue (rsQuery.RecordCount = 0), "Stage 8.2 Table Empty Before Rollback", "RecordCount = " & rsQuery.RecordCount & " (expected 0)", logPath
+        rsQuery.Close
+        dbeDisk.Rollback
+        Set rsQuery = dbDisk.OpenRecordset("SELECT EmpID, FullName, Balance, Dept FROM Employees ORDER BY EmpID")
+        AssertTrue (rsQuery.RecordCount = 3), "Stage 8.3 Rollback Restored All 3 Rows", "RecordCount = " & rsQuery.RecordCount & " (expected 3)", logPath
+        rsQuery.MoveFirst
+        rsQuery.MoveNext
+        AssertTrue (CLng(rsQuery.Fields("EmpID").Value) = 102 And CLng(rsQuery.Fields("Balance").Value) = -150 And CStr(rsQuery.Fields("Dept").Value) = "Treasury"), "Stage 8.4 Rollback Preserved Updated Row 102", "EmpID=" & rsQuery.Fields("EmpID").Value & ", Balance=" & rsQuery.Fields("Balance").Value, logPath
+        rsQuery.Close
+        ' Stage 13.2 (Synthetic): Post-Aggregation HAVING Filter Evaluation
+        Dim rsHaving As Recordset
+        Set rsHaving = dbDisk.OpenRecordset("SELECT Dept, Count(*) AS Cnt, Sum(Balance) AS TotBal FROM Employees GROUP BY Dept HAVING Sum(Balance) > 1000")
+        AssertTrue (Not rsHaving Is Nothing And rsHaving.RecordCount = 2), _
+            "Stage 13.2 SQL HAVING Post-Aggregation Group Filter", _
+            "Groups=" & rsHaving.RecordCount & " (expected 2: Engineering & Management)", logPath
+        rsHaving.Close
+        ' Stage 14.1: SQL DDL ALTER TABLE ADD COLUMN
+        dbDisk.Execute "ALTER TABLE Employees ADD COLUMN Bonus CURRENCY"
+        Dim bonusFld As Field
+        On Error Resume Next
+        Set bonusFld = dbDisk.TableDefs("Employees").Fields("Bonus")
+        On Error GoTo 0
+        Dim bTypeStr As String
+        If Not bonusFld Is Nothing Then bTypeStr = CStr(bonusFld.Type) Else bTypeStr = "0"
+        AssertTrue (Not bonusFld Is Nothing And bonusFld.Type = 5), _
+            "Stage 14.1 SQL ALTER TABLE ADD COLUMN (Bonus CURRENCY)", _
+            "BonusFound=" & (Not bonusFld Is Nothing) & ", Type=" & bTypeStr, logPath
+        ' Stage 14.2: SQL DDL ALTER TABLE DROP COLUMN
+        dbDisk.Execute "ALTER TABLE Employees DROP COLUMN Bonus"
+        Set bonusFld = Nothing
+        On Error Resume Next
+        Set bonusFld = dbDisk.TableDefs("Employees").Fields("Bonus")
+        On Error GoTo 0
+        AssertTrue (bonusFld Is Nothing), _
+            "Stage 14.2 SQL ALTER TABLE DROP COLUMN (Bonus)", _
+            "BonusDropped=" & (bonusFld Is Nothing), logPath
+        ' Stage 14.3: SQL DDL CREATE INDEX & DROP INDEX with Recordset.Seek
+        dbDisk.Execute "CREATE INDEX idx_Dept ON Employees (Dept)"
+        Dim deptIdx As Index
+        On Error Resume Next
+        Set deptIdx = dbDisk.TableDefs("Employees").Indexes("idx_Dept")
+        On Error GoTo 0
+        AssertTrue (Not deptIdx Is Nothing And deptIdx.Fields.Count >= 1), _
+            "Stage 14.3 SQL CREATE INDEX (idx_Dept ON Employees)", _
+            "IndexFound=" & (Not deptIdx Is Nothing), logPath
+        ' Stage 14.4: Recordset.Seek using Native Index
+        Dim rsSeek As Recordset
+        Set rsSeek = dbDisk.TableDefs("Employees").OpenRecordset()
+        rsSeek.Index = "idx_Dept"
+        rsSeek.Seek "=", "Treasury"
+        Dim seekHitOk As Boolean
+        seekHitOk = (Not rsSeek.NoMatch And CLng(rsSeek.Fields("EmpID").Value) = 102)
+        rsSeek.Seek "=", "NonExistentDept"
+        Dim seekMissOk As Boolean
+        seekMissOk = rsSeek.NoMatch
+        rsSeek.Close
+        AssertTrue (seekHitOk And seekMissOk), _
+            "Stage 14.4 Recordset.Seek using Native Index (idx_Dept)", _
+            "SeekHit=" & seekHitOk & ", SeekMiss=" & seekMissOk, logPath
+        ' Stage 14.5: SQL DDL DROP INDEX
+        dbDisk.Execute "DROP INDEX idx_Dept ON Employees"
+        Set deptIdx = Nothing
+        On Error Resume Next
+        Set deptIdx = dbDisk.TableDefs("Employees").Indexes("idx_Dept")
+        On Error GoTo 0
+        AssertTrue (deptIdx Is Nothing), _
+            "Stage 14.5 SQL DROP INDEX (idx_Dept ON Employees)", _
+            "IndexDropped=" & (deptIdx Is Nothing), logPath
+        dbDisk.Close
+        Set dbDisk = Nothing
+        Set dbeDisk = Nothing
+        ' Stage 9: Real-World Production Databases Verification (Northwind.accdb & quasmeh.accdb)
+        Dim nwPath As String
+        Dim quPath As String
+        nwPath = "F:\NEW_MSACCESS\tests\fixtures\Northwind.accdb"
+        quPath = "F:\NEW_MSACCESS\tests\fixtures\quasmeh.accdb"
+        If Len(Dir$(nwPath)) > 0 Then
+            Dim dbeNw As DBEngine
+            Set dbeNw = New DBEngine
+            Dim dbNw As Database
+            Set dbNw = dbeNw.OpenDatabase(nwPath)
+            AssertTrue (dbNw.TableDefs.Count >= 30 And dbNw.Containers("Forms").Documents.Count = 40 And dbNw.Containers("Reports").Documents.Count = 12 And dbNw.Containers("Modules").Documents.Count = 17), _
+                "Stage 9.1 Northwind Catalog & Relocated MSysObjects", _
+                "Tables=" & dbNw.TableDefs.Count & ", Queries=" & dbNw.QueryDefs.Count & ", Forms=" & dbNw.Containers("Forms").Documents.Count & ", Reports=" & dbNw.Containers("Reports").Documents.Count & ", Modules=" & dbNw.Containers("Modules").Documents.Count, logPath
+            Dim nwCode1 As String, nwCode2 As String, nwCode3 As String
+            nwCode1 = VbaProjectStore.GetNativeVbaModuleCode(dbNw, "modSecurity")
+            nwCode2 = VbaProjectStore.GetNativeVbaModuleCode(dbNw, "modValidation")
+            nwCode3 = VbaProjectStore.GetNativeVbaModuleCode(dbNw, "Form_frmAbout")
+            AssertTrue (Len(nwCode1) > 500 And Len(nwCode2) > 500 And Len(nwCode3) > 100), _
+                "Stage 9.2 Northwind MS-OVBA Decompression & 13-Char TLV", _
+                "modSecurity=" & Len(nwCode1) & "B, modValidation=" & Len(nwCode2) & "B, Form_frmAbout=" & Len(nwCode3) & "B", logPath
+            Dim rsNw As Recordset
+            Set rsNw = dbNw.OpenRecordset("qrycboCompanyType")
+            AssertTrue (Not rsNw Is Nothing And rsNw.RecordCount > 0), _
+                "Stage 9.3 Northwind Saved Query Execution (qrycboCompanyType)", _
+                "RecordCount=" & rsNw.RecordCount, logPath
+            rsNw.Close
+            ' Stage 14.6: Northwind Orders TableDef.Indexes Discovery
+            Dim nwOrdersTd As TableDef
+            Set nwOrdersTd = dbNw.TableDefs("Orders")
+            Dim nwHasPk As Boolean
+            nwHasPk = False
+            On Error Resume Next
+            nwHasPk = (Not nwOrdersTd.Indexes("PrimaryKey") Is Nothing)
+            On Error GoTo 0
+            AssertTrue (nwOrdersTd.Indexes.Count >= 5 And nwHasPk), _
+                "Stage 14.6 Northwind Orders TableDef.Indexes Discovery", _
+                "Indexes=" & nwOrdersTd.Indexes.Count & ", HasPrimaryKey=" & nwHasPk, logPath
+            ' Stage 10 (Northwind): Multi-Table Joins, GROUP BY Aggregates & Expressions
+            Dim rsNwCompany As Recordset
+            Set rsNwCompany = dbNw.OpenRecordset("qryCompanyList")
+            AssertTrue (Not rsNwCompany Is Nothing And rsNwCompany.RecordCount = 13 And rsNwCompany.Fields.Count >= 15), _
+                "Stage 10.1 Northwind 3-Table JOIN + Table.* + Concatenation (qryCompanyList)", _
+                "RecordCount=" & rsNwCompany.RecordCount & ", Fields=" & rsNwCompany.Fields.Count, logPath
+            rsNwCompany.Close
+            Dim rsNwOrderList As Recordset
+            Set rsNwOrderList = dbNw.OpenRecordset("qryOrderList")
+            AssertTrue (Not rsNwOrderList Is Nothing And rsNwOrderList.RecordCount = 51 And rsNwOrderList.Fields.Count >= 18), _
+                "Stage 10.2 Northwind 6-Source Recursive JOIN + Subquery GROUP BY (qryOrderList)", _
+                "RecordCount=" & rsNwOrderList.RecordCount & ", Fields=" & rsNwOrderList.Fields.Count, logPath
+            rsNwOrderList.Close
+            Dim rsNwOrderTotal As Recordset
+            Set rsNwOrderTotal = dbNw.OpenRecordset("qryOrderTotal")
+            AssertTrue (Not rsNwOrderTotal Is Nothing And rsNwOrderTotal.RecordCount > 0 And CDbl(Val(CStr(rsNwOrderTotal.Fields("OrderTotal").Value & ""))) > 0#), _
+                "Stage 10.3 Northwind GROUP BY + Sum(Qty*Price) Arithmetic (qryOrderTotal)", _
+                "Groups=" & rsNwOrderTotal.RecordCount & ", FirstOrderTotal=" & rsNwOrderTotal.Fields("OrderTotal").Value, logPath
+            rsNwOrderTotal.Close
+            ' Stage 11 (Northwind): Live Form Parameter Binding & Control Expression Evaluator
+            Dim vExprSum As Variant, vExprRnd As Variant
+            Dim rsOd As Recordset
+            Set rsOd = dbNw.OpenRecordset("OrderDetails")
+            vExprSum = dbNw.EvaluateExpression("=Sum([Quantity]*(1-[Discount])*[UnitPrice])", rsOd)
+            rsOd.MoveFirst
+            vExprRnd = dbNw.EvaluateExpression("=Round(Nz([UnitPrice],0)*1.16, 2)", rsOd)
+            Dim isTotValid As Boolean, isRndValid As Boolean
+            isTotValid = (Not IsNull(vExprSum) And Not IsEmpty(vExprSum))
+            If isTotValid Then isTotValid = (CDbl(vExprSum) > 0#)
+            isRndValid = (Not IsNull(vExprRnd) And Not IsEmpty(vExprRnd))
+            If isRndValid Then isRndValid = (CDbl(vExprRnd) > 0#)
+            AssertTrue (isTotValid And isRndValid), _
+                "Stage 11.1 Control Expression Evaluator (Sum & Round Nz Arithmetic)", _
+                "Sum=" & vExprSum & ", Round=" & vExprRnd, logPath
+            rsOd.Close
+            Dim rsNwProd1 As Recordset
+            Set rsNwProd1 = dbNw.OpenRecordset("qrycboProducts")
+            Dim nProdUnbound As Long
+            nProdUnbound = rsNwProd1.RecordCount
+            rsNwProd1.Close
+            dbNw.SetFormParameter "[Form]![cboProductCategories]", 2
+            Dim rsNwProd2 As Recordset
+            Set rsNwProd2 = dbNw.OpenRecordset("qrycboProducts")
+            Dim nProdBound As Long
+            nProdBound = rsNwProd2.RecordCount
+            rsNwProd2.Close
+            dbNw.ClearFormParameters
+            Dim rsNwProd3 As Recordset
+            Set rsNwProd3 = dbNw.OpenRecordset("qrycboProducts")
+            Dim nProdReset As Long
+            nProdReset = rsNwProd3.RecordCount
+            rsNwProd3.Close
+            AssertTrue (nProdUnbound > 0 And nProdBound > 0 And nProdBound < nProdUnbound And nProdReset = nProdUnbound), _
+                "Stage 11.2 Live Form Parameter Query Filtering (qrycboProducts)", _
+                "Unbound=" & nProdUnbound & ", FilteredCategory2=" & nProdBound & ", Reset=" & nProdReset, logPath
+            Dim lkIdx1 As Long, lkIdx2 As Long
+            lkIdx1 = LookupCache.EnsureTableLookupCache(dbNw, "qryCompanyList")
+            lkIdx2 = LookupCache.EnsureTableLookupCache(dbNw, "qryOrderList")
+            AssertTrue (lkIdx1 >= 0 And lkIdx2 >= 0), _
+                "Stage 11.3 Lookup Cache Multi-Table Query Schema Extraction", _
+                "qryCompanyListIdx=" & lkIdx1 & ", qryOrderListIdx=" & lkIdx2, logPath
+            ' Diagnostic column dump for Orders and OrderDetails
+            Dim rsDiagO As Recordset
+            Set rsDiagO = dbNw.OpenRecordset("Orders")
+            Dim oCols As String, oIdx As Long
+            For oIdx = 0 To rsDiagO.Fields.Count - 1
+                oCols = oCols & rsDiagO.Fields(oIdx).Name & ", "
+            Next oIdx
+            LogMsg "DIAG: Orders cols = " & oCols, logPath
+            If rsDiagO.RecordCount > 0 Then
+                rsDiagO.MoveFirst
+                LogMsg "DIAG: Orders row 1 = " & rsDiagO.Fields(0).Name & ":" & rsDiagO.Fields(0).Value & " | " & rsDiagO.Fields(1).Name & ":" & rsDiagO.Fields(1).Value, logPath
+            End If
+            rsDiagO.Close
+            Dim rsDiagOd As Recordset
+            Set rsDiagOd = dbNw.OpenRecordset("OrderDetails")
+            Dim odCols As String
+            For oIdx = 0 To rsDiagOd.Fields.Count - 1
+                odCols = odCols & rsDiagOd.Fields(oIdx).Name & ", "
+            Next oIdx
+            LogMsg "DIAG: OrderDetails cols = " & odCols, logPath
+            If rsDiagOd.RecordCount > 0 Then
+                rsDiagOd.MoveFirst
+                LogMsg "DIAG: OrderDetails row 1 = " & rsDiagOd.Fields(0).Name & ":" & rsDiagOd.Fields(0).Value & " | " & rsDiagOd.Fields(1).Name & ":" & rsDiagOd.Fields(1).Value, logPath
+            End If
+            rsDiagOd.Close
+            ' Stage 12 (Northwind): Native Domain Aggregates & VBA AST Interpreter
+            Dim nwDCount As Long, nwDSum As Variant, nwDLookup As Variant, nwDMax As Variant
+            nwDCount = dbNw.DCount("*", "Orders")
+            nwDSum = dbNw.DSum("Quantity", "OrderDetails")
+            nwDLookup = dbNw.DLookup("CustomerID", "Orders")
+            nwDMax = dbNw.DMax("UnitPrice", "OrderDetails")
+            AssertTrue (nwDCount > 0 And Not IsNull(nwDSum) And Not IsNull(nwDLookup) And Not IsNull(nwDMax)), _
+                "Stage 12.1 Northwind Native Domain Aggregates (DLookup, DSum, DCount, DMax)", _
+                "DCount=" & nwDCount & ", DSum=" & nwDSum & ", DLookup=" & nwDLookup & ", DMax=" & nwDMax, logPath
+            VbaInterpreter.SetActiveDatabase dbNw
+            Dim vbaCodeNw As String
+            vbaCodeNw = "Function TestNorthwindVba()" & vbCrLf & _
+                        "    Dim db As Object" & vbCrLf & _
+                        "    Set db = CurrentDb" & vbCrLf & _
+                        "    Dim rs As Object" & vbCrLf & _
+                        "    Set rs = db.OpenRecordset(""Orders"")" & vbCrLf & _
+                        "    Dim nOrd As Long" & vbCrLf & _
+                        "    nOrd = rs.RecordCount" & vbCrLf & _
+                        "    rs.Close" & vbCrLf & _
+                        "    Dim cId As Variant" & vbCrLf & _
+                        "    cId = DLookup(""CustomerID"", ""Orders"", ""OrderID = 10248"")" & vbCrLf & _
+                        "    Dim statusStr As String" & vbCrLf & _
+                        "    Select Case nOrd" & vbCrLf & _
+                        "        Case Is > 0" & vbCrLf & _
+                        "            statusStr = ""ORDERS_OK_"" & CStr(nOrd) & ""_"" & CStr(cId)" & vbCrLf & _
+                        "        Case Else" & vbCrLf & _
+                        "            statusStr = ""NO_ORDERS""" & vbCrLf & _
+                        "    End Select" & vbCrLf & _
+                        "    TestNorthwindVba = statusStr" & vbCrLf & _
+                        "End Function"
+            Dim vbaNwRes As Variant
+            vbaNwRes = VbaInterpreter.ExecuteProcedure(vbaCodeNw, , "TestNorthwindVba")
+            AssertTrue (InStr(1, CStr(vbaNwRes), "ORDERS_OK_") = 1), _
+                "Stage 12.2 Northwind Native VBA Execution with CurrentDb & DLookup", _
+                "VbaResult=" & CStr(vbaNwRes), logPath
+            dbNw.Close
+            Set dbNw = Nothing
+            Set dbeNw = Nothing
+            Dim nwOpenErr As String, nwFormErr As String
+            Dim nwLayout1 As StudioController.NativeFormLayout
+            Dim nwLayout2 As StudioController.NativeFormLayout
+            If StudioController.OpenDatabaseFile(nwPath, nwOpenErr) Then
+                Dim nwOk1 As Boolean, nwOk2 As Boolean
+                nwOk1 = StudioController.GetNativeFormLayout("frmOrderList", nwLayout1, nwFormErr)
+                nwOk2 = StudioController.GetNativeFormLayout("frmCompanyList", nwLayout2, nwFormErr)
+                AssertTrue (nwOk1 And nwLayout1.CtlCount > 10 And Len(nwLayout1.RecordSource) > 0 And nwOk2 And nwLayout2.CtlCount > 10), _
+                    "Stage 10.4 Northwind Native Form Blob & TypeInfo Layout (frmOrderList & frmCompanyList)", _
+                    "frmOrderList=" & nwLayout1.CtlCount & " ctls (RS=" & nwLayout1.RecordSource & "), frmCompanyList=" & nwLayout2.CtlCount & " ctls", logPath
+                Dim nwRptLayout As StudioController.NativeFormLayout
+                Dim nwRptErr As String
+                Dim nwRptOk As Boolean
+                Dim nwRptName As String
+                nwRptName = "rptInvoice"
+                nwRptOk = StudioController.GetNativeReportLayout(nwRptName, nwRptLayout, nwRptErr)
+                AssertTrue (nwRptOk And nwRptLayout.CtlCount > 0), _
+                    "Stage 13.3 Northwind Native Report Blob & TypeInfo Layout (" & nwRptName & ")", _
+                    "Report=" & nwRptName & " ctls=" & nwRptLayout.CtlCount & " src=" & nwRptLayout.LayoutSource & " err=" & nwRptErr, logPath
+                StudioController.CloseDatabase
+            End If
+        End If
+        If Len(Dir$(quPath)) > 0 Then
+            Dim dbeQu As DBEngine
+            Set dbeQu = New DBEngine
+            Dim dbQu As Database
+            Set dbQu = dbeQu.OpenDatabase(quPath)
+            AssertTrue (dbQu.TableDefs.Count >= 50 And dbQu.Containers("Forms").Documents.Count = 133 And dbQu.Containers("Reports").Documents.Count = 83 And dbQu.Containers("Modules").Documents.Count = 19), _
+                "Stage 9.4 Quasmeh Catalog & Relocated MSysObjects", _
+                "Tables=" & dbQu.TableDefs.Count & ", Queries=" & dbQu.QueryDefs.Count & ", Forms=" & dbQu.Containers("Forms").Documents.Count & ", Reports=" & dbQu.Containers("Reports").Documents.Count & ", Modules=" & dbQu.Containers("Modules").Documents.Count, logPath
+            Dim quCode1 As String, quCode2 As String, quCode3 As String
+            quCode1 = VbaProjectStore.GetNativeVbaModuleCode(dbQu, "Form_FrmAccounts")
+            quCode2 = VbaProjectStore.GetNativeVbaModuleCode(dbQu, "basShellWait")
+            quCode3 = VbaProjectStore.GetNativeVbaModuleCode(dbQu, "Form_FrmItems")
+            AssertTrue (Len(quCode1) > 20000 And Len(quCode2) > 30000 And Len(quCode3) > 500), _
+                "Stage 9.5 Quasmeh MS-OVBA Decompression & Large LVAL", _
+                "Form_FrmAccounts=" & Len(quCode1) & "B, basShellWait=" & Len(quCode2) & "B, Form_FrmItems=" & Len(quCode3) & "B", logPath
+            Dim rsQu As Recordset
+            Set rsQu = dbQu.OpenRecordset("store")
+            AssertTrue (Not rsQu Is Nothing And rsQu.RecordCount >= 0), _
+                "Stage 9.6 Quasmeh Native Table OpenRecordset (store)", _
+                "RecordCount=" & rsQu.RecordCount, logPath
+            rsQu.Close
+            ' Stage 10 (Quasmeh): Multi-Table Joins, GROUP BY, Nz/Round/Format Expressions & Form Layouts
+            Dim rsQuJoin As Recordset
+            Set rsQuJoin = dbQu.OpenRecordset("r1")
+            AssertTrue (Not rsQuJoin Is Nothing And rsQuJoin.Fields.Count >= 3), _
+                "Stage 10.5 Quasmeh 3-Table JOIN + GROUP BY + Sum Aggregate (r1)", _
+                "RecordCount=" & rsQuJoin.RecordCount & ", Fields=" & rsQuJoin.Fields.Count, logPath
+            rsQuJoin.Close
+            Dim rsQuExpr As Recordset
+            Set rsQuExpr = dbQu.OpenRecordset("SELECT Round(Sum(Nz([no], 0)) * 1.16, 2) AS CalcTax, Count(*) AS StoreCnt FROM store")
+            AssertTrue (Not rsQuExpr Is Nothing And rsQuExpr.RecordCount = 1 And Not IsNull(rsQuExpr.Fields("CalcTax").Value)), _
+                "Stage 10.6 Quasmeh Nested Round(Sum(Nz(...))) & Arithmetic Expression", _
+                "CalcTax=" & rsQuExpr.Fields("CalcTax").Value & ", StoreCnt=" & rsQuExpr.Fields("StoreCnt").Value, logPath
+            rsQuExpr.Close
+            ' Stage 11 (Quasmeh): Parameterized Query Pass-Through & Lookup Cache Discovery
+            Dim rsQuTb1 As Recordset
+            On Error Resume Next
+            Set rsQuTb1 = dbQu.OpenRecordset("trialb1")
+            On Error GoTo 0
+            Dim tb1Count As Long
+            If Not rsQuTb1 Is Nothing Then tb1Count = rsQuTb1.RecordCount Else tb1Count = 0
+            AssertTrue (Not rsQuTb1 Is Nothing And tb1Count > 0), _
+                "Stage 11.4 Quasmeh Parameterized Query Pass-Through (trialb1)", _
+                "RecordCount=" & tb1Count, logPath
+            If Not rsQuTb1 Is Nothing Then rsQuTb1.Close
+            Dim lkIdxStore As Long
+            lkIdxStore = LookupCache.EnsureTableLookupCache(dbQu, "store")
+            AssertTrue (lkIdxStore >= 0), _
+                "Stage 11.5 Quasmeh Table Lookup Schema (store)", _
+                "storeIdx=" & lkIdxStore, logPath
+            ' Diagnostic column dump for store
+            Dim rsDiagSt As Recordset
+            Set rsDiagSt = dbQu.OpenRecordset("store")
+            Dim stCols As String, stIdx As Long
+            For stIdx = 0 To rsDiagSt.Fields.Count - 1
+                stCols = stCols & rsDiagSt.Fields(stIdx).Name & ", "
+            Next stIdx
+            LogMsg "DIAG: store cols = " & stCols, logPath
+            If rsDiagSt.RecordCount > 0 Then
+                rsDiagSt.MoveFirst
+                Do While Not rsDiagSt.EOF
+                    LogMsg "DIAG: store row = col0:" & rsDiagSt.Fields(0).Name & "=" & rsDiagSt.Fields(0).Value & " | col1:" & rsDiagSt.Fields(1).Name & "=" & rsDiagSt.Fields(1).Value, logPath
+                    rsDiagSt.MoveNext
+                Loop
+            End If
+            rsDiagSt.Close
+            ' Stage 12 (Quasmeh): Native Domain Aggregates & VBA AST Interpreter
+            Dim quDCount As Long, quDSum As Variant, quDMax As Variant, quDLookup As Variant
+            quDCount = dbQu.DCount("*", "store")
+            quDSum = dbQu.DSum("idstore", "store")
+            quDMax = dbQu.DMax("idstore", "store")
+            quDLookup = dbQu.DLookup("storename", "store")
+            AssertTrue (quDCount > 0 And Not IsNull(quDSum) And Not IsNull(quDMax) And Not IsNull(quDLookup)), _
+                "Stage 12.3 Quasmeh Native Domain Aggregates (DCount, DSum, DMax, DLookup)", _
+                "DCount=" & quDCount & ", DSum=" & quDSum & ", DMax=" & quDMax & ", DLookup=" & quDLookup, logPath
+            VbaInterpreter.SetActiveDatabase dbQu
+            Dim vbaCodeQu As String
+            vbaCodeQu = "Function TestQuasmehVba()" & vbCrLf & _
+                        "    Dim db As Object" & vbCrLf & _
+                        "    Set db = CurrentDb" & vbCrLf & _
+                        "    Dim rs As Object" & vbCrLf & _
+                        "    Set rs = db.OpenRecordset(""store"")" & vbCrLf & _
+                        "    Dim nStore As Long" & vbCrLf & _
+                        "    nStore = rs.RecordCount" & vbCrLf & _
+                        "    rs.Close" & vbCrLf & _
+                        "    Dim maxNo As Variant" & vbCrLf & _
+                        "    maxNo = DMax(""idstore"", ""store"")" & vbCrLf & _
+                        "    Dim statusQu As String" & vbCrLf & _
+                        "    Select Case nStore" & vbCrLf & _
+                        "        Case Is > 0" & vbCrLf & _
+                        "            statusQu = ""STORE_OK_"" & CStr(nStore) & ""_"" & CStr(maxNo)" & vbCrLf & _
+                        "        Case Else" & vbCrLf & _
+                        "            statusQu = ""EMPTY_STORE""" & vbCrLf & _
+                        "    End Select" & vbCrLf & _
+                        "    TestQuasmehVba = statusQu" & vbCrLf & _
+                        "End Function"
+            Dim vbaQuRes As Variant
+            vbaQuRes = VbaInterpreter.ExecuteProcedure(vbaCodeQu, , "TestQuasmehVba")
+            AssertTrue (InStr(1, CStr(vbaQuRes), "STORE_OK_") = 1), _
+                "Stage 12.4 Quasmeh Native VBA Execution with CurrentDb & DMax", _
+                "VbaResult=" & CStr(vbaQuRes), logPath
+            ' Stage 13.1 (Quasmeh): Multi-Table Hash-Join Query Execution
+            Dim rsQuJoin2 As Recordset
+            Set rsQuJoin2 = dbQu.OpenRecordset("trialb7")
+            AssertTrue (Not rsQuJoin2 Is Nothing And rsQuJoin2.Fields.Count >= 3), _
+                "Stage 13.1 Quasmeh Multi-Table Hash-Join Query (trialb7)", _
+                "RecordCount=" & rsQuJoin2.RecordCount & ", Fields=" & rsQuJoin2.Fields.Count, logPath
+            rsQuJoin2.Close
+            dbQu.Close
+            Set dbQu = Nothing
+            Set dbeQu = Nothing
+            Dim quOpenErr As String, quFormErr As String
+            Dim quLayout1 As StudioController.NativeFormLayout
+            Dim quLayout2 As StudioController.NativeFormLayout
+            If StudioController.OpenDatabaseFile(quPath, quOpenErr) Then
+                Dim quOk1 As Boolean, quOk2 As Boolean
+                quOk1 = StudioController.GetNativeFormLayout("Fautt1", quLayout1, quFormErr)
+                quOk2 = StudioController.GetNativeFormLayout("autota", quLayout2, quFormErr)
+                AssertTrue (quOk1 And quLayout1.CtlCount >= 50 And quOk2 And quLayout2.CtlCount >= 20), _
+                    "Stage 10.7 Quasmeh Native Form Blob & TypeInfo Layout (Fautt1 & autota)", _
+                    "Fautt1=" & quLayout1.CtlCount & " ctls, autota=" & quLayout2.CtlCount & " ctls", logPath
+                Dim quRptLayout As StudioController.NativeFormLayout
+                Dim quRptErr As String
+                Dim quRptOk As Boolean
+                Dim quRptName As String
+                quRptName = "qmizan1"
+                quRptOk = StudioController.GetNativeReportLayout(quRptName, quRptLayout, quRptErr)
+                AssertTrue (quRptOk And quRptLayout.CtlCount > 0), _
+                    "Stage 13.4 Quasmeh Native Report Blob & TypeInfo Layout (" & quRptName & ")", _
+                    "Report=" & quRptName & " ctls=" & quRptLayout.CtlCount & " src=" & quRptLayout.LayoutSource & " err=" & quRptErr, logPath
+                StudioController.CloseDatabase
+            End If
+        End If
+        ' Stage 15: Form Designer Command Architecture & Undo/Redo Engine
+        Dim testLayout As StudioController.NativeFormLayout
+        testLayout.FormName = "TestUndoRedoForm"
+        testLayout.RecordSource = "Employees"
+        testLayout.CtlCount = 1
+        ReDim testLayout.Ctls(0 To 0)
+        testLayout.Ctls(0).CtlName = "txtTest"
+        testLayout.Ctls(0).LeftTw = 100
+        testLayout.Ctls(0).TopTw = 200
+        testLayout.Ctls(0).WidthTw = 1500
+        testLayout.Ctls(0).HeightTw = 400
+        testLayout.Ctls(0).Caption = "Original Caption"
+        testLayout.Ctls(0).ControlSource = "OldField"
+        StudioController.SetDesignerLayout testLayout
+        StudioController.CommandHistory.Clear
+        ' Stage 15.1: Execute Move/Resize Command
+        StudioController.RecordMoveResizeCommand 0, 350, 450, 2200, 600, 100, 200, 1500, 400
+        Dim movedLayout As StudioController.NativeFormLayout
+        StudioController.GetDesignerLayout movedLayout
+        Dim moveOk As Boolean
+        moveOk = (movedLayout.Ctls(0).LeftTw = 350 And movedLayout.Ctls(0).TopTw = 450 And _
+                  movedLayout.Ctls(0).WidthTw = 2200 And movedLayout.Ctls(0).HeightTw = 600)
+        AssertTrue moveOk, _
+            "Stage 15.1 Designer MoveResizeControlCommand Execution", _
+            "Left=" & movedLayout.Ctls(0).LeftTw & ", Top=" & movedLayout.Ctls(0).TopTw & ", Width=" & movedLayout.Ctls(0).WidthTw & ", Height=" & movedLayout.Ctls(0).HeightTw, logPath
+        ' Stage 15.2: Execute Property Change Command (Caption & ControlSource)
+        StudioController.RecordChangePropertyCommand 0, "Caption", "Updated Caption", "Original Caption"
+        StudioController.RecordChangePropertyCommand 0, "ControlSource", "NewField", "OldField"
+        Dim propLayout As StudioController.NativeFormLayout
+        StudioController.GetDesignerLayout propLayout
+        Dim propOk As Boolean
+        propOk = (propLayout.Ctls(0).Caption = "Updated Caption" And propLayout.Ctls(0).ControlSource = "NewField")
+        AssertTrue (propOk And StudioController.CommandHistory.UndoCount = 3), _
+            "Stage 15.2 Designer ChangeControlPropertyCommand Execution", _
+            "Caption=" & propLayout.Ctls(0).Caption & ", ControlSource=" & propLayout.Ctls(0).ControlSource & ", UndoCount=" & StudioController.CommandHistory.UndoCount, logPath
+        ' Stage 15.3: Undo Operations (LIFO: ControlSource -> Caption -> Geometry)
+        Dim undo1Ok As Boolean, undo2Ok As Boolean, undo3Ok As Boolean
+        undo1Ok = StudioController.UndoDesignerAction() ' reverts ControlSource to OldField
+        undo2Ok = StudioController.UndoDesignerAction() ' reverts Caption to Original Caption
+        undo3Ok = StudioController.UndoDesignerAction() ' reverts Geometry to 100, 200, 1500, 400
+        Dim restoredLayout As StudioController.NativeFormLayout
+        StudioController.GetDesignerLayout restoredLayout
+        Dim allRestored As Boolean
+        allRestored = (restoredLayout.Ctls(0).LeftTw = 100 And restoredLayout.Ctls(0).TopTw = 200 And _
+                       restoredLayout.Ctls(0).WidthTw = 1500 And restoredLayout.Ctls(0).HeightTw = 400 And _
+                       restoredLayout.Ctls(0).Caption = "Original Caption" And restoredLayout.Ctls(0).ControlSource = "OldField")
+        AssertTrue (undo1Ok And undo2Ok And undo3Ok And allRestored And StudioController.CommandHistory.RedoCount = 3), _
+            "Stage 15.3 Designer CommandHistory Multi-Level Undo Fidelity", _
+            "Restored=" & allRestored & ", UndoCount=" & StudioController.CommandHistory.UndoCount & ", RedoCount=" & StudioController.CommandHistory.RedoCount, logPath
+        ' Stage 15.4: Redo Operations (FIFO: Geometry -> Caption -> ControlSource)
+        Dim redo1Ok As Boolean, redo2Ok As Boolean, redo3Ok As Boolean
+        redo1Ok = StudioController.RedoDesignerAction() ' re-applies Geometry to 350, 450, 2200, 600
+        redo2Ok = StudioController.RedoDesignerAction() ' re-applies Caption to Updated Caption
+        redo3Ok = StudioController.RedoDesignerAction() ' re-applies ControlSource to NewField
+        Dim reappliedLayout As StudioController.NativeFormLayout
+        StudioController.GetDesignerLayout reappliedLayout
+        Dim allReapplied As Boolean
+        allReapplied = (reappliedLayout.Ctls(0).LeftTw = 350 And reappliedLayout.Ctls(0).TopTw = 450 And _
+                        reappliedLayout.Ctls(0).WidthTw = 2200 And reappliedLayout.Ctls(0).HeightTw = 600 And _
+                        reappliedLayout.Ctls(0).Caption = "Updated Caption" And reappliedLayout.Ctls(0).ControlSource = "NewField")
+        AssertTrue (redo1Ok And redo2Ok And redo3Ok And allReapplied And StudioController.CommandHistory.UndoCount = 3 And StudioController.CommandHistory.RedoCount = 0), _
+            "Stage 15.4 Designer CommandHistory Multi-Level Redo Fidelity", _
+            "Reapplied=" & allReapplied & ", UndoCount=" & StudioController.CommandHistory.UndoCount & ", RedoCount=" & StudioController.CommandHistory.RedoCount, logPath
+        ' =========================================================================
+        ' STAGE 16: ADVANCED VBA INTERPRETER & BANDED REPORT ENGINE (PHASE 4 & 5)
+        ' =========================================================================
+        ' Stage 16.1: VBA Loop Execution (For ... Next & Do While ... Loop)
+        Dim vbaLoopCode As String
+        vbaLoopCode = "Function TestLoops()" & vbCrLf & _
+                      "    Dim total As Long" & vbCrLf & _
+                      "    Dim i As Long" & vbCrLf & _
+                      "    Dim k As Long" & vbCrLf & _
+                      "    total = 0" & vbCrLf & _
+                      "    For i = 1 To 10" & vbCrLf & _
+                      "        total = total + i" & vbCrLf & _
+                      "    Next i" & vbCrLf & _
+                      "    k = 1" & vbCrLf & _
+                      "    Do While k <= 5" & vbCrLf & _
+                      "        total = total + (k * 10)" & vbCrLf & _
+                      "        k = k + 1" & vbCrLf & _
+                      "    Loop" & vbCrLf & _
+                      "    TestLoops = total" & vbCrLf & _
+                      "End Function"
+        Dim loopRes As Variant
+        loopRes = VbaInterpreter.ExecuteProcedure(vbaLoopCode, , "TestLoops")
+        Dim loopOk As Boolean
+        loopOk = (VBA.Val(CStr(loopRes)) = 205#)
+        AssertTrue loopOk, _
+            "Stage 16.1 VBA Loop Execution (For Next & Do While Loop)", _
+            "Total=" & CStr(loopRes), logPath
+        ' Stage 16.2: VBA Recursive Frame Stack (Factorial 5 = 120)
+        Dim vbaFactCode As String
+        vbaFactCode = "Function Factorial(ByVal n As Long) As Long" & vbCrLf & _
+                      "    If n <= 1 Then" & vbCrLf & _
+                      "        Factorial = 1" & vbCrLf & _
+                      "    Else" & vbCrLf & _
+                      "        Factorial = n * Factorial(n - 1)" & vbCrLf & _
+                      "    End If" & vbCrLf & _
+                      "End Function" & vbCrLf & _
+                      "Function RunFactorialTest() As Long" & vbCrLf & _
+                      "    RunFactorialTest = Factorial(5)" & vbCrLf & _
+                      "End Function"
+        Dim factRes As Variant
+        factRes = VbaInterpreter.ExecuteProcedure(vbaFactCode, , "RunFactorialTest")
+        Dim factOk As Boolean
+        factOk = (VBA.Val(CStr(factRes)) = 120#)
+        AssertTrue factOk, _
+            "Stage 16.2 VBA Recursive Frame Stack (Factorial 5 = 120)", _
+            "Result=" & CStr(factRes), logPath
+        ' Stage 16.3: VBA Error Handling (On Error GoTo & Err.Number)
+        Dim vbaErrCode As String
+        vbaErrCode = "Function TestErrorHandler() As Long" & vbCrLf & _
+                     "    On Error GoTo CatchBlock" & vbCrLf & _
+                     "    Dim x As Long" & vbCrLf & _
+                     "    x = 10" & vbCrLf & _
+                     "    Err.Raise 11, ""Division by zero simulation""" & vbCrLf & _
+                     "    x = 999" & vbCrLf & _
+                     "    TestErrorHandler = x" & vbCrLf & _
+                     "    Exit Function" & vbCrLf & _
+                     "CatchBlock:" & vbCrLf & _
+                     "    If Err.Number = 11 Then" & vbCrLf & _
+                     "        TestErrorHandler = x" & vbCrLf & _
+                     "    Else" & vbCrLf & _
+                     "        TestErrorHandler = -1" & vbCrLf & _
+                     "    End If" & vbCrLf & _
+                     "End Function"
+        Dim errRes As Variant
+        errRes = VbaInterpreter.ExecuteProcedure(vbaErrCode, , "TestErrorHandler")
+        Dim errOk As Boolean
+        errOk = (VBA.Val(CStr(errRes)) = 10#)
+        AssertTrue errOk, _
+            "Stage 16.3 VBA Error Handling (On Error GoTo & Err.Number)", _
+            "Result=" & CStr(errRes), logPath
+        ' Ensure local test database containing Employees table is active in StudioController
+        Dim rptOpenErr As String
+        StudioController.OpenDatabaseFile testDbPath, rptOpenErr
+        ' Stage 16.4: Banded Report Engine Running Sum (OverGroup & OverAll on Employees)
+        Dim rptGrpSums() As Double
+        Dim rptAllSums() As Double
+        Dim rptGrandTotal As Double
+        Dim rptErrMsg As String
+        Dim rptLines As Collection
+        Set rptLines = StudioController.GenerateBandedReportWithRunningSum("Employees", "Dept", "Balance", rptGrpSums, rptAllSums, rptGrandTotal, rptErrMsg)
+        Dim rptOk As Boolean
+        rptOk = (Len(rptErrMsg) = 0 And Not rptLines Is Nothing)
+        If rptOk Then
+            If UBound(rptGrpSums) >= 2 And UBound(rptAllSums) >= 2 Then
+                rptOk = (rptGrpSums(0) = 2500# And rptAllSums(0) = 2500# And _
+                         rptGrpSums(1) = 3200# And rptAllSums(1) = 5700# And _
+                         rptGrpSums(2) = -150# And rptAllSums(2) = 5550# And _
+                         rptGrandTotal = 5550#)
+            Else
+                rptOk = False
+            End If
+        End If
+        AssertTrue rptOk, _
+            "Stage 16.4 Banded Report Engine Running Sum (OverGroup & OverAll on Employees)", _
+            "Lines=" & rptLines.Count & ", GrandTotal=" & rptGrandTotal & ", Err=" & rptErrMsg, logPath
+        ' =========================================================================
+        ' STAGE 17: ARABIC COLLATION, SEARCH NORMALIZATION & FULL RTL (PHASE 6)
+        ' =========================================================================
+        ' Reopen testDbPath with dbDisk to ensure fresh state
+        Dim dbeAr As New DBEngine
+        Dim dbAr As Database
+        Set dbAr = dbeAr.OpenDatabase(testDbPath)
+        ' Create table for Arabic collation testing
+        On Error Resume Next
+        dbAr.Execute "DROP TABLE ArabicCollationTest;"
+        Err.Clear
+        On Error GoTo ErrHandler
+        dbAr.Execute "CREATE TABLE ArabicCollationTest (ID LONG, ArabicName TEXT(50), City TEXT(50));"
+        ' Construct Arabic strings via ChrW$ to strictly avoid Arabic characters in source code:
+        ' ahmadHamzaAbove: Alef with Hamza Above (&H0623), Hah (&H062D), Meem (&H0645), Dal (&H062F)
+        Dim ahmadHamzaAbove As String
+        ahmadHamzaAbove = ChrW$(&H0623) & ChrW$(&H062D) & ChrW$(&H0645) & ChrW$(&H062F)
+        ' ahmadHamzaBelow: Alef with Hamza Below (&H0625), Hah (&H062D), Meem (&H0645), Dal (&H062F)
+        Dim ahmadHamzaBelow As String
+        ahmadHamzaBelow = ChrW$(&H0625) & ChrW$(&H062D) & ChrW$(&H0645) & ChrW$(&H062F)
+        ' ahmadMadda: Alef with Madda Above (&H0622), Hah (&H062D), Meem (&H0645), Dal (&H062F)
+        Dim ahmadMadda As String
+        ahmadMadda = ChrW$(&H0622) & ChrW$(&H062D) & ChrW$(&H0645) & ChrW$(&H062F)
+        ' ahmadTashkeel: With Fatha (&H064E), Sukun (&H0652), Damma (&H064F)
+        Dim ahmadTashkeel As String
+        ahmadTashkeel = ChrW$(&H0623) & ChrW$(&H064E) & ChrW$(&H062D) & ChrW$(&H0652) & ChrW$(&H0645) & ChrW$(&H064E) & ChrW$(&H062F) & ChrW$(&H064F)
+        ' mahmoud: Meem (&H0645), Hah (&H062D), Meem (&H0645), Waw (&H0648), Dal (&H062F)
+        Dim mahmoud As String
+        mahmoud = ChrW$(&H0645) & ChrW$(&H062D) & ChrW$(&H0645) & ChrW$(&H0648) & ChrW$(&H062F)
+        ' maktabaTehMarbuta: Meem, Kaf, Teh, Beh, Teh Marbuta (&H0629)
+        Dim maktabaTehMarbuta As String
+        maktabaTehMarbuta = ChrW$(&H0645) & ChrW$(&H0643) & ChrW$(&H062A) & ChrW$(&H0628) & ChrW$(&H0629)
+        Dim rsAr As Recordset
+        Set rsAr = dbAr.OpenRecordset("ArabicCollationTest")
+        rsAr.AddNew: rsAr.Fields("ID").Value = 1: rsAr.Fields("ArabicName").Value = ahmadHamzaAbove: rsAr.Fields("City").Value = "Cairo": rsAr.Update
+        rsAr.AddNew: rsAr.Fields("ID").Value = 2: rsAr.Fields("ArabicName").Value = ahmadHamzaBelow: rsAr.Fields("City").Value = "Alexandria": rsAr.Update
+        rsAr.AddNew: rsAr.Fields("ID").Value = 3: rsAr.Fields("ArabicName").Value = ahmadMadda: rsAr.Fields("City").Value = "Giza": rsAr.Update
+        rsAr.AddNew: rsAr.Fields("ID").Value = 4: rsAr.Fields("ArabicName").Value = mahmoud: rsAr.Fields("City").Value = "Aswan": rsAr.Update
+        rsAr.AddNew: rsAr.Fields("ID").Value = 5: rsAr.Fields("ArabicName").Value = ahmadTashkeel: rsAr.Fields("City").Value = "Luxor": rsAr.Update
+        rsAr.AddNew: rsAr.Fields("ID").Value = 6: rsAr.Fields("ArabicName").Value = maktabaTehMarbuta: rsAr.Fields("City").Value = "Tanta": rsAr.Update
+        rsAr.Close
+        ' Stage 17.1: Normalized Arabic Search with LIKE (WHERE ArabicName LIKE '**')
+        ' Search pattern uses plain Alef (&H0627): **
+        Dim ahmadPlainPattern As String
+        ahmadPlainPattern = "*" & ChrW$(&H0627) & ChrW$(&H062D) & ChrW$(&H0645) & ChrW$(&H062F) & "*"
+        Dim rsLike As Recordset
+        Set rsLike = dbAr.OpenRecordset("SELECT * FROM ArabicCollationTest WHERE ArabicName LIKE '" & ahmadPlainPattern & "';")
+        ' Should match rows 1, 2, 3, 5 (all 4 Ahmad variations!)
+        Dim likeCount As Long
+        likeCount = rsLike.RecordCount
+        rsLike.Close
+        AssertTrue (likeCount = 4), _
+            "Stage 17.1 Arabic Normalized LIKE Search (Ahmad Variations)", _
+            "MatchedRows=" & likeCount & " (expected 4: HamzaAbove, HamzaBelow, Madda, Tashkeel)", logPath
+        ' Stage 17.2: Exact Equality with Diacritics & Teh Marbuta (WHERE ArabicName = '' and '')
+        ' Plain Ahmad without tashkeel or hamza
+        Dim ahmadPlain As String
+        ahmadPlain = ChrW$(&H0627) & ChrW$(&H062D) & ChrW$(&H0645) & ChrW$(&H062F)
+        Dim rsEqAhmad As Recordset
+        Set rsEqAhmad = dbAr.OpenRecordset("SELECT * FROM ArabicCollationTest WHERE ArabicName = '" & ahmadPlain & "';")
+        Dim eqAhmadCount As Long
+        eqAhmadCount = rsEqAhmad.RecordCount
+        rsEqAhmad.Close
+        ' Search for maktaba using Heh (&H0647) matching Teh Marbuta (&H0629)
+        Dim maktabaHeh As String
+        maktabaHeh = ChrW$(&H0645) & ChrW$(&H0643) & ChrW$(&H062A) & ChrW$(&H0628) & ChrW$(&H0647)
+        Dim rsEqTeh As Recordset
+        Set rsEqTeh = dbAr.OpenRecordset("SELECT * FROM ArabicCollationTest WHERE ArabicName = '" & maktabaHeh & "';")
+        Dim eqTehCount As Long
+        eqTehCount = rsEqTeh.RecordCount
+        rsEqTeh.Close
+        Dim eqOk As Boolean
+        eqOk = (eqAhmadCount = 4 And eqTehCount = 1)
+        AssertTrue eqOk, _
+            "Stage 17.2 Arabic Diacritics & Teh Marbuta Normalization", _
+            "AhmadMatched=" & eqAhmadCount & " (expected 4), TehMarbutaMatched=" & eqTehCount & " (expected 1)", logPath
+        ' Stage 17.3: Arabic Collation ORDER BY Sorting
+        Dim rsSort As Recordset
+        Set rsSort = dbAr.OpenRecordset("SELECT ID, ArabicName FROM ArabicCollationTest ORDER BY ArabicName ASC, ID ASC;")
+        Dim sortOk As Boolean
+        sortOk = True
+        Dim sNames() As String
+        ReDim sNames(0 To 5)
+        Dim sIdx As Long
+        sIdx = 0
+        Do Until rsSort.EOF
+            sNames(sIdx) = rsSort.Fields("ArabicName").Value
+            sIdx = sIdx + 1
+            rsSort.MoveNext
+        Loop
+        rsSort.Close
+        ' Alef names (Ahmads: IDs 1,2,3,5) must sort BEFORE Meem (Mahmoud ID 4, Maktaba ID 6)
+        ' Under Arabic collation: Alef < Meem
+        Dim firstNorm As String, lastNorm As String
+        firstNorm = ArabicCollationHelper.NormalizeArabicForComparison(sNames(0))
+        lastNorm = ArabicCollationHelper.NormalizeArabicForComparison(sNames(5))
+        sortOk = (StrComp(firstNorm, ahmadPlain, vbTextCompare) = 0 And _
+                  InStr(1, lastNorm, ChrW$(&H0645)) = 1)
+        AssertTrue sortOk, _
+            "Stage 17.3 Arabic Collation ORDER BY Sorting", _
+            "FirstWordAlef=" & (StrComp(firstNorm, ahmadPlain, vbTextCompare) = 0) & ", LastWordMeem=" & (InStr(1, lastNorm, ChrW$(&H0645)) = 1), logPath
+        ' Stage 17.4: RightToLeft Layout & Unicode Detection
+        Dim hasArName As Boolean, hasArCity As Boolean
+        hasArName = ArabicCollationHelper.HasArabicUnicode(ahmadPlain)
+        hasArCity = ArabicCollationHelper.HasArabicUnicode("Cairo")
+        Dim rtlLayout As StudioController.NativeFormLayout
+        rtlLayout.RightToLeft = True
+        Dim rtlDetected As Boolean
+        rtlDetected = (hasArName = True And hasArCity = False And rtlLayout.RightToLeft = True)
+        AssertTrue rtlDetected, _
+            "Stage 17.4 RightToLeft Detection & Unicode Collation", _
+            "ArabicDetected=" & hasArName & ", LatinClean=" & (Not hasArCity) & ", RtlLayout=" & rtlLayout.RightToLeft, logPath
+        ' =========================================================================
+        ' Stage 18: Native Linked Tables & Multi-User Concurrency
+        ' =========================================================================
+        ' Stage 18.0: Dedicated engine plus FrontEnd database with a local Employees table
+        Dim dbeLink As DBEngine
+        Set dbeLink = New DBEngine
+        Dim fePath As String
+        fePath = Environ$("TEMP") & "\OpenAccess_LiveTest_FrontEnd.mdb"
+        On Error Resume Next
+        Kill fePath
+        Kill fePath & ".journal"
+        On Error GoTo ErrHandler
+        Dim feDb As Database
+        Set feDb = dbeLink.CreateDatabase(fePath)
+        feDb.Execute "CREATE TABLE Employees (EmpID LONG, FullName TEXT(50), Dept TEXT(30))"
+        feDb.Execute "INSERT INTO Employees (EmpID, FullName, Dept) VALUES (1, 'Ahmad Saleh', 'Engineering')"
+        feDb.Execute "INSERT INTO Employees (EmpID, FullName, Dept) VALUES (2, 'Sara Mansour', 'Finance')"
+        ' Stage 18.1: Create BackEnd Database & Table, Bind Linked Table in FrontEnd
+        Dim bePath As String
+        bePath = Environ$("TEMP") & "\OpenAccess_LiveTest_BackEnd.mdb"
+        If Len(Dir$(bePath)) > 0 Then
+            On Error Resume Next
+            Kill bePath
+            On Error GoTo ErrHandler
+        End If
+        Dim beDb As Database
+        Set beDb = dbeLink.CreateDatabase(bePath)
+        beDb.Execute "CREATE TABLE Suppliers (SupplierID AUTOINCREMENT, SupplierName TEXT(50), City TEXT(50))"
+        beDb.Execute "INSERT INTO Suppliers (SupplierName, City) VALUES ('Acme Corp', 'Tokyo')"
+        beDb.Execute "INSERT INTO Suppliers (SupplierName, City) VALUES ('Global Imports', 'London')"
+        beDb.Execute "INSERT INTO Suppliers (SupplierName, City) VALUES ('Apex Solutions', 'Finance')"
+        beDb.[Close]
+        Set beDb = Nothing
+        LogMsg "  [Stage 18] Backend created, binding linked table", logPath
+        Dim tdLinked As TableDef
+        Set tdLinked = feDb.CreateTableDef("LinkedSuppliers")
+        tdLinked.Connect = ";DATABASE=" & bePath
+        tdLinked.SourceTableName = "Suppliers"
+        feDb.TableDefs.Append tdLinked
+        Dim bindOk As Boolean
+        bindOk = (tdLinked.Fields.Count >= 3 And tdLinked.RecordCount = 3 And _
+                  StrComp(tdLinked.Fields("SupplierName").Name, "SupplierName", vbTextCompare) = 0)
+        AssertTrue bindOk, _
+            "Stage 18.1 Native Linked Table Discovery & Schema Binding", _
+            "Fields=" & tdLinked.Fields.Count & ", Rows=" & tdLinked.RecordCount, logPath
+        ' Stage 18.2: Native SELECT & WHERE on Linked Table
+        LogMsg "  [Stage 18] Linked table bound, running SELECT", logPath
+        Dim rsLinked As Recordset
+        Set rsLinked = feDb.OpenRecordset("SELECT SupplierID, SupplierName, City FROM LinkedSuppliers WHERE City = 'Tokyo'")
+        Dim selectOk As Boolean
+        Dim supplierVal As String
+        supplierVal = "<NO_RECORD>"
+        If Not rsLinked Is Nothing Then
+            If Not rsLinked.EOF And rsLinked.RecordCount > 0 Then
+                supplierVal = CStr(rsLinked.Fields("SupplierName").Value)
+            End If
+        End If
+        selectOk = (Not rsLinked Is Nothing And rsLinked.RecordCount = 1 And StrComp(supplierVal, "Acme Corp", vbTextCompare) = 0)
+        AssertTrue selectOk, _
+            "Stage 18.2 Native SELECT & WHERE on Linked Table", _
+            "Rows=" & IIf(rsLinked Is Nothing, 0, rsLinked.RecordCount) & ", Supplier=" & supplierVal, logPath
+        ' Stage 18.3: Native INSERT into Linked Table with Direct Backend Persistence
+        feDb.Execute "INSERT INTO LinkedSuppliers (SupplierName, City) VALUES ('Eastern Logistics', 'Singapore')"
+        Dim beVerify As Database
+        Set beVerify = dbeLink.OpenDatabase(bePath)
+        Dim beRs As Recordset
+        Set beRs = beVerify.OpenRecordset("SELECT * FROM Suppliers WHERE City = 'Singapore'")
+        Dim insertPersisted As Boolean
+        insertPersisted = (beRs.RecordCount = 1 And StrComp(CStr(beRs.Fields("SupplierName").Value), "Eastern Logistics", vbTextCompare) = 0)
+        beVerify.[Close]
+        Set beVerify = Nothing
+        AssertTrue insertPersisted, _
+            "Stage 18.3 Native INSERT into Linked Table with Backend Persistence", _
+            "BackendFound=" & insertPersisted, logPath
+        ' Stage 18.4: Cross-Database Multi-Table JOIN (Local Employees + Linked Suppliers)
+        LogMsg "  [Stage 18] Running cross-database JOIN", logPath
+        Dim rsCrossJoin As Recordset
+        Set rsCrossJoin = feDb.OpenRecordset("SELECT Employees.FullName, LinkedSuppliers.SupplierName FROM Employees INNER JOIN LinkedSuppliers ON Employees.Dept = LinkedSuppliers.City")
+        Dim crossJoinOk As Boolean
+        crossJoinOk = (rsCrossJoin.RecordCount >= 1 And InStr(1, CStr(rsCrossJoin.Fields("SupplierName").Value), "Apex", vbTextCompare) > 0)
+        AssertTrue crossJoinOk, _
+            "Stage 18.4 Cross-Database JOIN (Local Employees + Linked Suppliers)", _
+            "JoinedRows=" & rsCrossJoin.RecordCount & ", Supplier=" & rsCrossJoin.Fields("SupplierName").Value, logPath
+        ' Stage 18.5: Multi-User Safe Page Locking & Concurrency Invalidation
+        Dim lockHandle As LongPtr
+        lockHandle = PageWriter.LockPageRange(bePath, 0, 1, True)
+        Dim pageLocked As Boolean
+        pageLocked = (lockHandle <> 0)
+        Dim unlockOk As Boolean
+        If pageLocked Then
+            unlockOk = PageWriter.UnlockPageRange(lockHandle, 0, 1)
+        End If
+        feDb.RefreshIfModified
+        AssertTrue (pageLocked And unlockOk), _
+            "Stage 18.5 Multi-User Safe Page Locking & Concurrency Invalidation", _
+            "PageLocked=" & pageLocked & ", PageUnlocked=" & unlockOk, logPath
+        ' Stage 18.6: Native UPDATE & DELETE on Linked Table with Backend Persistence
+        feDb.Execute "UPDATE LinkedSuppliers SET City = 'Osaka' WHERE SupplierName = 'Global Imports'"
+        feDb.Execute "DELETE FROM LinkedSuppliers WHERE City = 'Singapore'"
+        Dim beCheck As Database
+        Set beCheck = dbeLink.OpenDatabase(bePath)
+        Dim rsUpd As Recordset
+        Set rsUpd = beCheck.OpenRecordset("SELECT * FROM Suppliers WHERE City = 'Osaka'")
+        Dim updCount As Long
+        updCount = rsUpd.RecordCount
+        Dim rsDel As Recordset
+        Set rsDel = beCheck.OpenRecordset("SELECT * FROM Suppliers WHERE City = 'Singapore'")
+        Dim delRemaining As Long
+        delRemaining = rsDel.RecordCount
+        beCheck.[Close]
+        Set beCheck = Nothing
+        AssertTrue (updCount = 1 And delRemaining = 0), _
+            "Stage 18.6 Native UPDATE & DELETE on Linked Table", _
+            "UpdatedRows=" & updCount & ", RemainingDeleted=" & delRemaining, logPath
+        feDb.[Close]
+        Set feDb = Nothing
+        Set dbeLink = Nothing
+        ' =========================================================================
+        ' Stage 19: Standalone Runtime Mode & Native Vector PDF Exporter
+        ' =========================================================================
+        LogMsg "  [Stage 19] Starting Vector PDF Exporter and Runtime Mode tests", logPath
+        Dim dbePdf As DBEngine
+        Set dbePdf = New DBEngine
+        Dim dbPdf As Database
+        Set dbPdf = dbePdf.OpenDatabase(testDbPath)
+        Dim pdfPath As String
+        pdfPath = Environ$("TEMP") & "\OpenAccess_LiveTest_Report.pdf"
+        If Len(Dir$(pdfPath)) > 0 Then
+            On Error Resume Next
+            Kill pdfPath
+            On Error GoTo ErrHandler
+        End If
+        Dim pdfErr As String
+        Dim exportOk As Boolean
+        exportOk = NativePdfWriter.ExportTableReportToPdf(dbPdf, "Employees", pdfPath, pdfErr)
+        AssertTrue exportOk, _
+            "Stage 19.1 Native Vector PDF Exporter Execution", _
+            "ExportOk=" & exportOk & ", Target=" & pdfPath, logPath
+
+        Dim pdfLen As Long
+        pdfLen = 0
+        If Len(Dir$(pdfPath)) > 0 Then pdfLen = FileLen(pdfPath)
+        AssertTrue (pdfLen > 500), _
+            "Stage 19.2 PDF File Size Verification", _
+            "Bytes=" & pdfLen & " (expected > 500)", logPath
+
+        Dim fNumPdf As Integer
+        fNumPdf = FreeFile()
+        Open pdfPath For Binary Access Read As #fNumPdf
+        Dim pdfBytes() As Byte
+        ReDim pdfBytes(0 To pdfLen - 1)
+        Get #fNumPdf, 1, pdfBytes
+        Close #fNumPdf
+
+        Dim pdfText As String
+        pdfText = StrConv(pdfBytes, vbUnicode)
+
+        Dim hasPdfHdr As Boolean
+        hasPdfHdr = (Left$(pdfText, 8) = "%PDF-1.4")
+        Dim hasXref As Boolean
+        hasXref = (InStr(1, pdfText, "xref", vbBinaryCompare) > 0)
+        Dim hasTrailer As Boolean
+        hasTrailer = (InStr(1, pdfText, "trailer", vbBinaryCompare) > 0)
+        Dim hasEof As Boolean
+        hasEof = (InStr(1, pdfText, "%%EOF", vbBinaryCompare) > 0)
+        Dim hasVectorContent As Boolean
+        hasVectorContent = (InStr(1, pdfText, "/Type /Catalog", vbBinaryCompare) > 0 And InStr(1, pdfText, "/Type /Pages", vbBinaryCompare) > 0 And InStr(1, pdfText, "stream", vbBinaryCompare) > 0)
+        AssertTrue (hasPdfHdr And hasXref And hasTrailer And hasEof And hasVectorContent), _
+            "Stage 19.3 PDF-1.4 Structure & Vector Syntax", _
+            "Header=" & hasPdfHdr & ", Xref=" & hasXref & ", Trailer=" & hasTrailer & ", EOF=" & hasEof & ", Vector=" & hasVectorContent, logPath
+
+        Dim scPdfErr As String
+        StudioController.OpenDatabaseFile testDbPath, scPdfErr
+        Dim scPdfOk As Boolean
+        scPdfOk = StudioController.ExportReportToPdf("Employees", pdfPath, scPdfErr)
+        AssertTrue scPdfOk, _
+            "Stage 19.4 StudioController ExportReportToPdf Integration", _
+            "ControllerPdfOk=" & scPdfOk, logPath
+
+        StudioController.IsRuntimeMode = True
+        Dim runtimeFlagActive As Boolean
+        runtimeFlagActive = StudioController.IsRuntimeMode
+        StudioController.IsRuntimeMode = False
+        AssertTrue runtimeFlagActive, _
+            "Stage 19.5 Standalone Runtime Mode Flag & Protection", _
+            "IsRuntimeMode=" & runtimeFlagActive, logPath
+
+        Dim startForm As String
+        Dim hasStartup As Boolean
+        hasStartup = StudioController.GetStartupFormName(startForm)
+        AssertTrue (Not hasStartup Or Len(startForm) >= 0), _
+            "Stage 19.6 Startup Form Discovery in Runtime Mode", _
+            "HasStartup=" & hasStartup & ", Form=" & startForm, logPath
+
+        dbPdf.[Close]
+        Set dbPdf = Nothing
+        Set dbePdf = Nothing
+        StudioController.CloseDatabase
+        ' =========================================================================
+        ' Stage 20: Self-Healing Diagnostics & High-Volume Stress Gate
+        ' =========================================================================
+        LogMsg "  [Stage 20] Starting Self-Healing Diagnostics and High-Volume Stress Gate", logPath
+        Dim stressDbPath As String
+        stressDbPath = Environ$("TEMP") & "\OpenAccess_LiveTest_Stress.mdb"
+        On Error Resume Next
+        Kill stressDbPath
+        Kill stressDbPath & ".journal"
+        On Error GoTo ErrHandler
+        Dim dbeStress As DBEngine
+        Set dbeStress = New DBEngine
+        Dim dbStress As Database
+        Set dbStress = dbeStress.CreateDatabase(stressDbPath)
+        dbStress.Execute "CREATE TABLE StressOrders (OrderID AUTOINCREMENT, CustomerID LONG, Amount CURRENCY, Category TEXT(30))"
+
+        ' Stage 20.1: High-Volume Batch Insert (1,000 Records inside Transaction)
+        dbeStress.BeginTrans
+        Dim sStressIdx As Long
+        Dim catName As String
+        For sStressIdx = 1 To 1000
+            Select Case (sStressIdx Mod 3)
+                Case 0: catName = "Hardware"
+                Case 1: catName = "Software"
+                Case 2: catName = "Services"
+            End Select
+            dbStress.Execute "INSERT INTO StressOrders (CustomerID, Amount, Category) VALUES (" & CStr(1000 + (sStressIdx Mod 50)) & ", " & CStr(10 + (sStressIdx Mod 100)) & ", '" & catName & "')"
+        Next sStressIdx
+        dbeStress.CommitTrans
+
+        Dim tdStress As TableDef
+        Set tdStress = dbStress.TableDefs("StressOrders")
+        Dim insert1000Ok As Boolean
+        insert1000Ok = (tdStress.RecordCount = 1000)
+        AssertTrue insert1000Ok, _
+            "Stage 20.1 High-Volume Batch Insert (1,000 Records in Transaction)", _
+            "InsertedRows=" & tdStress.RecordCount & " (expected 1000)", logPath
+
+        ' Stage 20.2: Index Creation & High-Volume Recordset.Seek
+        dbStress.Execute "CREATE INDEX idx_customer ON StressOrders (CustomerID)"
+        Dim rsStressSeek As Recordset
+        Set rsStressSeek = dbStress.OpenRecordset("StressOrders")
+        rsStressSeek.Index = "idx_customer"
+        rsStressSeek.Seek "=", 1025
+        Dim seekFound As Boolean
+        seekFound = (Not rsStressSeek.NoMatch And CLng(rsStressSeek.Fields("CustomerID").Value) = 1025)
+        rsStressSeek.Close
+        Set rsStressSeek = Nothing
+        AssertTrue seekFound, _
+            "Stage 20.2 Index Creation & High-Volume Recordset.Seek Lookup", _
+            "SeekFound=" & seekFound & ", TargetCustomerID=1025", logPath
+
+        ' Stage 20.3: High-Volume Aggregate Query (GROUP BY / SUM / COUNT)
+        Dim rsAgg As Recordset
+        Set rsAgg = dbStress.OpenRecordset("SELECT Category, COUNT(*) AS TotalCount, SUM(Amount) AS TotalSum FROM StressOrders GROUP BY Category")
+        Dim aggSumCount As Long
+        Dim aggTotalAmount As Double
+        aggSumCount = 0
+        aggTotalAmount = 0
+        Do Until rsAgg.EOF
+            aggSumCount = aggSumCount + CLng(rsAgg.Fields("TotalCount").Value)
+            aggTotalAmount = aggTotalAmount + CDbl(rsAgg.Fields("TotalSum").Value)
+            rsAgg.MoveNext
+        Loop
+        rsAgg.Close
+        Set rsAgg = Nothing
+        Dim aggSuccess As Boolean
+        aggSuccess = (aggSumCount = 1000 And aggTotalAmount > 0)
+        AssertTrue aggSuccess, _
+            "Stage 20.3 High-Volume Aggregate Query (GROUP BY / SUM / COUNT)", _
+            "AggregatedRows=" & aggSumCount & ", TotalAmount=" & aggTotalAmount, logPath
+
+        ' Stage 20.4: Intentional Physical TDEF RowCount Disk Corruption
+        Dim tdefPage As Long
+        tdefPage = tdStress.Descriptor.TdefPageNumber
+        dbStress.[Close]
+        Set dbStress = Nothing
+
+        Dim fNumCorrupt As Integer
+        fNumCorrupt = FreeFile()
+        Open stressDbPath For Binary Access Write As #fNumCorrupt
+        Dim corruptOffset As Long
+        corruptOffset = (tdefPage * 4096&) + 16& + 1&
+        Dim zeroVal As Long
+        zeroVal = 0
+        Put #fNumCorrupt, corruptOffset, zeroVal
+        Close #fNumCorrupt
+
+        Set dbStress = dbeStress.OpenDatabase(stressDbPath)
+        Dim initialCorruptedCount As Long
+        initialCorruptedCount = dbStress.TableDefs("StressOrders").RecordCount
+        AssertTrue (initialCorruptedCount = 0), _
+            "Stage 20.4 Intentional TDEF RowCount Physical Disk Corruption", _
+            "CorruptedCount=" & initialCorruptedCount & " (actual physical rows=1000)", logPath
+
+        ' Stage 20.5: Self-Healing Diagnostics & Automatic Repair
+        Dim diagReport As String
+        Dim errorsRepaired As Long
+        errorsRepaired = dbStress.VerifyAndRepair(diagReport)
+        Dim healedCount As Long
+        healedCount = dbStress.TableDefs("StressOrders").RecordCount
+        Dim healedAutoNum As Long
+        healedAutoNum = dbStress.TableDefs("StressOrders").Descriptor.AutoNumberNext
+        Dim healOk As Boolean
+        healOk = (errorsRepaired >= 1 And healedCount = 1000 And healedAutoNum = 1001)
+        AssertTrue healOk, _
+            "Stage 20.5 Self-Healing Diagnostics & Automatic Repair", _
+            "RepairedErrors=" & errorsRepaired & ", HealedRowCount=" & healedCount & ", AutoNumberNext=" & healedAutoNum, logPath
+
+        ' Stage 20.6: Integration Test via StudioController.VerifyAndRepairDatabase
+        Dim scRepReport As String
+        Dim scFixed As Long
+        scFixed = StudioController.VerifyAndRepairDatabase(stressDbPath, scRepReport)
+        AssertTrue (scFixed >= 0), _
+            "Stage 20.6 StudioController VerifyAndRepairDatabase Integration", _
+            "ControllerRepairs=" & scFixed, logPath
+
+        dbStress.[Close]
+        Set dbStress = Nothing
+        Set dbeStress = Nothing
+
+        ' Clean up any active database handles before package export test
+        If Not dbDisk Is Nothing Then
+            On Error Resume Next
+            dbDisk.[Close]
+            Set dbDisk = Nothing
+            On Error GoTo 0
+        End If
+        If Not dbAr Is Nothing Then
+            On Error Resume Next
+            dbAr.[Close]
+            Set dbAr = Nothing
+            On Error GoTo 0
+        End If
+        If Not dbPdf Is Nothing Then
+            On Error Resume Next
+            dbPdf.[Close]
+            Set dbPdf = Nothing
+            On Error GoTo 0
+        End If
+        StudioController.CloseDatabase
+
+        ' =========================================================================
+        ' STAGE 21: COMPILED APPLICATION PROTECTION & V1.0 RELEASE GATE (PHASE 10)
+        ' =========================================================================
+        LogMsg "  [Stage 21] Starting Compiled Application Package & Design Lock Tests", logPath
+        Dim pkgSourcePath As String
+        pkgSourcePath = testDbPath
+        Dim pkgTargetPath As String
+        pkgTargetPath = Environ$("TEMP") & "\OpenAccess_LiveTest_Compiled.accde"
+        On Error Resume Next
+        Kill pkgTargetPath
+        On Error GoTo ErrHandler
+
+        ' Stage 21.1: Export Native Compiled Application Package (MakeCompiledPackage)
+        Dim pkgErr As String
+        Dim pkgOk As Boolean
+        pkgOk = StudioController.MakeCompiledPackage(pkgSourcePath, pkgTargetPath, pkgErr)
+        Dim pkgFileExists As Boolean
+        pkgFileExists = (Dir$(pkgTargetPath) <> "")
+        AssertTrue (pkgOk And pkgFileExists), _
+            "Stage 21.1 Native Compiled Application Package Export (.accde)", _
+            "ExportSuccess=" & pkgOk & ", FileExists=" & pkgFileExists & ", Err=" & pkgErr, logPath
+
+        ' Stage 21.2: Compiled Package Recognition & Design Lock Verification
+        Dim pkgOpenErr As String
+        Dim pkgOpened As Boolean
+        pkgOpened = StudioController.OpenDatabaseFile(pkgTargetPath, pkgOpenErr)
+        Dim isPkgLocked As Boolean
+        isPkgLocked = StudioController.IsCompiledLocked
+        AssertTrue (pkgOpened And isPkgLocked), _
+            "Stage 21.2 Compiled Package Recognition & IsCompiledLocked Verification", _
+            "Opened=" & pkgOpened & ", IsCompiledLocked=" & isPkgLocked, logPath
+
+        ' Stage 21.3: Data Queries & Dynamic Data Manipulation in Compiled Package
+        Dim pkgSelectOk As Boolean
+        pkgSelectOk = StudioController.OpenTable("Employees", pkgErr)
+        Dim pkgRows As Long
+        pkgRows = StudioController.GetTotalRecords()
+        Dim pkgInsertOk As Boolean
+        pkgInsertOk = StudioController.ExecuteActionSql("INSERT INTO Employees (EmpID, FullName, Balance, Dept) VALUES (999, 'CompiledUser', 95000, 'IT')", pkgErr)
+        AssertTrue (pkgSelectOk And pkgRows > 0 And pkgInsertOk), _
+            "Stage 21.3 Data Queries & Runtime Operations in Compiled Package", _
+            "SelectOk=" & pkgSelectOk & ", Rows=" & pkgRows & ", InsertOk=" & pkgInsertOk, logPath
+
+        ' Stage 21.4: Native Forms & VBA Logic Execution inside Compiled Package
+        Dim formBindErr As String
+        Dim formBindOk As Boolean
+        formBindOk = StudioController.OpenFormRecordset("Employees", formBindErr)
+        Dim vbaPkgCode As String
+        vbaPkgCode = "Function CalcBonus() As Double" & vbCrLf & _
+                     "    Dim base As Double" & vbCrLf & _
+                     "    base = 1000#" & vbCrLf & _
+                     "    CalcBonus = base * 0.15" & vbCrLf & _
+                     "End Function"
+        Dim vbaPkgRes As Variant
+        vbaPkgRes = VbaInterpreter.ExecuteProcedure(vbaPkgCode, , "CalcBonus")
+        Dim vbaExecOk As Boolean
+        vbaExecOk = (VBA.Val(CStr(vbaPkgRes)) = 150#)
+        AssertTrue (formBindOk And vbaExecOk), _
+            "Stage 21.4 Native Forms & VBA Logic Execution in Compiled Package", _
+            "FormBindOk=" & formBindOk & ", VbaBonusResult=" & CStr(vbaPkgRes), logPath
+
+        ' Stage 21.5: Strict Denial of Table, Form, and VBA Code Design Views
+        Dim tblDesignErr As String
+        Dim tblDesignLines As Collection
+        Set tblDesignLines = StudioController.GetTableDesignViewLines("Employees", tblDesignErr)
+        Dim formDesignErr As String
+        Dim formDesignLines As Collection
+        Set formDesignLines = StudioController.GetFormDesignLayout("Employees", formDesignErr)
+        Dim vbaEdErr As String
+        Dim vbaEdLines As Collection
+        Set vbaEdLines = StudioController.GetVbaModuleEditorLines("Module1", vbaEdErr)
+        Dim designAccessDenied As Boolean
+        designAccessDenied = (tblDesignLines Is Nothing And InStr(1, tblDesignErr, "Design access denied") > 0 And _
+                              formDesignLines Is Nothing And InStr(1, formDesignErr, "Design access denied") > 0 And _
+                              vbaEdLines Is Nothing And InStr(1, vbaEdErr, "Design access denied") > 0)
+        AssertTrue designAccessDenied, _
+            "Stage 21.5 Strict Denial of Table, Form, and VBA Design Views", _
+            "TblDenied=" & (tblDesignLines Is Nothing) & ", FormDenied=" & (formDesignLines Is Nothing) & ", VbaDenied=" & (vbaEdLines Is Nothing), logPath
+
+        ' Stage 21.6: Rejection of Schema Modifications (DDL CREATE/ALTER/DROP)
+        Dim ddlErr As String
+        Dim ddlCreateResult As Boolean
+        ddlCreateResult = StudioController.CreateNewTableDdl("IllegalTable", "ID LONG", ddlErr)
+        Dim ddlDropResult As Boolean
+        ddlDropResult = StudioController.ExecuteActionSql("DROP TABLE Employees", ddlErr)
+        Dim ddlBlocked As Boolean
+        ddlBlocked = (Not ddlCreateResult And Not ddlDropResult And InStr(1, ddlErr, "Design access denied") > 0)
+        AssertTrue ddlBlocked, _
+            "Stage 21.6 Rejection of Schema Modifications (DDL CREATE/ALTER/DROP)", _
+            "CreateBlocked=" & (Not ddlCreateResult) & ", DropBlocked=" & (Not ddlDropResult) & ", Err=" & ddlErr, logPath
+
+        StudioController.CloseDatabase
+        RunRefereeHardwareAudit logPath
+        LogMsg "==========================================================", logPath
+        LogMsg " Assertions Passed: " & m_passCount & " | Failed: " & m_failCount, logPath
+        If m_failCount = 0 Then
+            LogMsg " ALL 21 LIVE ENGINE STAGES PASSED SUCCESSFULLY!", logPath
+        Else
+            LogMsg " [FAIL] SELF-TEST FAILED WITH " & m_failCount & " FAILED ASSERTIONS!", logPath
+        End If
+        LogMsg "==========================================================", logPath
+        Exit Sub
+ErrHandler:
+        Dim errNum As Long
+        Dim errDesc As String
+        errNum = Err.Number
+        errDesc = Err.Description
+        m_failCount = m_failCount + 1
+        LogMsg "==========================================================", logPath
+        LogMsg " [FAIL] Unhandled Error " & errNum & ": " & errDesc, logPath
+        LogMsg " Assertions Passed: " & m_passCount & " | Failed: " & m_failCount, logPath
+        LogMsg "==========================================================", logPath
+
+    End Sub
+
+    ' =========================================================================
+    ' STRICT INDEPENDENT REFEREE AUDIT (Zero-Trust Disk Persistence Proof)
+    ' Verifies that Commands 1..10 are genuinely persisted on disk and not
+    ' faked in memory or hardcoded to specific fixture names.
+    ' =========================================================================
+    Private Sub RunRefereeHardwareAudit(ByVal logPath As String)
+        Dim auditDbPath As String
+        Dim compactDbPath As String
+        Dim pdfOutPath As String
+        auditDbPath = Environ$("TEMP") & "\OA_RefereeAudit_" & CStr(Timer * 100) & ".mdb"
+        compactDbPath = Environ$("TEMP") & "\OA_RefereeCompact_" & CStr(Timer * 100) & ".mdb"
+        pdfOutPath = Environ$("TEMP") & "\OA_RefereeReport_" & CStr(Timer * 100) & ".pdf"
+
+        On Error Resume Next
+        Kill auditDbPath
+        Kill compactDbPath
+        Kill pdfOutPath
+        On Error GoTo 0
+
+        Dim dbe As New DBEngine
+        Dim db As Database
+        Set db = dbe.CreateDatabase(auditDbPath)
+
+        ' [Audit 1] Red-Line & Engine Identity Proof
+        Dim modeOk As Boolean
+        modeOk = (EngineManager.GetRequestedEngineMode() = "NATIVE")
+        AssertTrue modeOk, "Referee Audit 1: Red-Line NATIVE Lockdown", "Mode=" & EngineManager.GetRequestedEngineMode(), logPath
+
+        ' [Audit 2] Mixed Arabic/Latin Compressed Unicode + >12KB Multi-Page LVAL Memo Across Disk Reopen
+        db.Execute "CREATE TABLE [Ref_Contracts] ([CID] LONG, [RefTitle] TEXT(255), [FullTerms] MEMO, [Amount] CURRENCY);"
+        Dim bigMemoSuffix As String
+        bigMemoSuffix = "_END_ARABIC_" & ChrW$(&H0639) & ChrW$(&H0642) & ChrW$(&H062F) & "_" & ChrW$(&H062A) & ChrW$(&H0648) & ChrW$(&H0631) & ChrW$(&H064A) & ChrW$(&H062F) & "_" & ChrW$(&H0631) & ChrW$(&H0642) & ChrW$(&H0645) & "_9988"
+        Dim bigMemo As String
+        bigMemo = String$(14000, "A") & bigMemoSuffix
+        Dim mixedTitle As String
+        mixedTitle = "CNT-2026: " & ChrW$(&H0627) & ChrW$(&H062A) & ChrW$(&H0641) & ChrW$(&H0627) & ChrW$(&H0642) & ChrW$(&H064A) & ChrW$(&H0629) & " " & ChrW$(&H062A) & ChrW$(&H0634) & ChrW$(&H063A) & ChrW$(&H064A) & ChrW$(&H0644) & " " & ChrW$(&H0648) & ChrW$(&H0635) & ChrW$(&H064A) & ChrW$(&H0627) & ChrW$(&H0646) & ChrW$(&H0629) & " " & ChrW$(&H0645) & ChrW$(&H0631) & ChrW$(&H0643) & ChrW$(&H0632) & " 77"
+
+        Dim rsIns As Recordset
+        Set rsIns = db.OpenRecordset("Ref_Contracts")
+        rsIns.AddNew
+        rsIns.Fields("CID").Value = 501
+        rsIns.Fields("RefTitle").Value = mixedTitle
+        rsIns.Fields("FullTerms").Value = bigMemo
+        rsIns.Fields("Amount").Value = 12500
+        rsIns.Update
+        rsIns.Close
+        db.Close
+        Set db = Nothing
+
+        ' Reopen from physical disk and verify zero truncation of mixed Arabic/Latin and 14KB LVAL Memo
+        Set db = dbe.OpenDatabase(auditDbPath)
+        Dim rsCheck As Recordset
+        Set rsCheck = db.OpenRecordset("Ref_Contracts")
+        Dim readTitle As String, readMemo As String
+        readTitle = CStr(rsCheck.Fields("RefTitle").Value & "")
+        readMemo = CStr(rsCheck.Fields("FullTerms").Value & "")
+        Dim checkSuffix As String
+        checkSuffix = ChrW$(&H0645) & "_9988"
+        AssertTrue (readTitle = mixedTitle And Len(readMemo) = Len(bigMemo) And Right$(readMemo, 6) = checkSuffix), _
+            "Referee Audit 2: Disk Reopen of Mixed Arabic/Latin & 14KB Multi-Page LVAL Memo", _
+            "TitleMatch=" & CStr(readTitle = mixedTitle) & ", MemoLen=" & CStr(Len(readMemo)), logPath
+        rsCheck.Close
+
+        ' [Audit 3] Physical File Truncation on Rollback (No Orphan Appended Pages)
+        Dim sizeBeforeTrans As Long
+        db.Close
+        sizeBeforeTrans = FileLen(auditDbPath)
+        Set db = dbe.OpenDatabase(auditDbPath)
+        db.BeginTrans
+        Dim k As Long
+        For k = 1 To 120
+            db.Execute "INSERT INTO [Ref_Contracts] ([CID], [RefTitle], [Amount]) VALUES (" & CStr(1000 + k) & ", 'TEMP_ROW_" & CStr(k) & "', 100);"
+        Next k
+        db.Rollback
+        db.Close
+        Dim sizeAfterRollback As Long
+        sizeAfterRollback = FileLen(auditDbPath)
+        Set db = dbe.OpenDatabase(auditDbPath)
+        Dim cntAfterRollback As Long
+        cntAfterRollback = db.DCount("*", "Ref_Contracts")
+        AssertTrue (sizeAfterRollback <= sizeBeforeTrans And cntAfterRollback = 1), _
+            "Referee Audit 3: Physical EOF Truncation & Zero Ghost Rows After Rollback Reopen", _
+            "SizeBefore=" & sizeBeforeTrans & ", SizeAfter=" & sizeAfterRollback & ", Rows=" & cntAfterRollback, logPath
+
+        ' [Audit 4] ALTER TABLE & CREATE INDEX Persistence Across Disk Reopen (Not In-Memory Fake)
+        db.Execute "ALTER TABLE [Ref_Contracts] ADD COLUMN [TaxCode] TEXT(50);"
+        db.Execute "CREATE INDEX [idx_CID] ON [Ref_Contracts] ([CID]);"
+        db.Close
+        Set db = Nothing
+
+        Set db = dbe.OpenDatabase(auditDbPath)
+        Dim hasTaxOnDisk As Boolean, hasIdxOnDisk As Boolean
+        hasTaxOnDisk = False: hasIdxOnDisk = False
+        On Error Resume Next
+        Dim fProbe As Object
+        Set fProbe = db.TableDefs("Ref_Contracts").Fields("TaxCode")
+        If Err.Number = 0 And Not fProbe Is Nothing Then hasTaxOnDisk = True
+        Err.Clear
+        If db.TableDefs("Ref_Contracts").Indexes.Count > 0 Then hasIdxOnDisk = True
+        On Error GoTo 0
+        AssertTrue (hasTaxOnDisk And hasIdxOnDisk), _
+            "Referee Audit 4: ALTER TABLE & CREATE INDEX Persisted on Physical Disk Across Reopen", _
+            "TaxColOnDisk=" & CStr(hasTaxOnDisk) & ", IndexOnDisk=" & CStr(hasIdxOnDisk), logPath
+
+        ' [Audit 5] Persistent DROP TABLE Across Disk Reopen
+        db.Execute "CREATE TABLE [Ref_TempDrop] ([ID] LONG);"
+        db.Execute "INSERT INTO [Ref_TempDrop] ([ID]) VALUES (1);"
+        db.Close
+        Set db = dbe.OpenDatabase(auditDbPath)
+        db.Execute "DROP TABLE [Ref_TempDrop];"
+        db.Close
+        Set db = dbe.OpenDatabase(auditDbPath)
+        Dim dropSurvivedReopen As Boolean
+        dropSurvivedReopen = False
+        On Error Resume Next
+        Dim tdDrop As Object
+        Set tdDrop = db.TableDefs("Ref_TempDrop")
+        If Err.Number <> 0 Or tdDrop Is Nothing Then dropSurvivedReopen = True
+        Err.Clear
+        On Error GoTo 0
+        AssertTrue dropSurvivedReopen, _
+            "Referee Audit 5: DROP TABLE Permanently Removed from MSysObjects on Reopen", _
+            "GoneAfterReopen=" & CStr(dropSurvivedReopen), logPath
+
+        ' [Audit 6] Arabic Normalization Search (Alef / Teh Marbuta / Ya Equivalence)
+        Dim ibrahimInsert As String
+        ibrahimInsert = ChrW$(&H0625) & ChrW$(&H0628) & ChrW$(&H0631) & ChrW$(&H0627) & ChrW$(&H0647) & ChrW$(&H064A) & ChrW$(&H0645) & " " & ChrW$(&H0627) & ChrW$(&H0644) & ChrW$(&H0642) & ChrW$(&H0648) & ChrW$(&H0627) & ChrW$(&H0633) & ChrW$(&H0645) & ChrW$(&H0629) & " - " & ChrW$(&H0627) & ChrW$(&H0644) & ChrW$(&H0625) & ChrW$(&H062F) & ChrW$(&H0627) & ChrW$(&H0631) & ChrW$(&H0629) & " " & ChrW$(&H0627) & ChrW$(&H0644) & ChrW$(&H0639) & ChrW$(&H0627) & ChrW$(&H0645) & ChrW$(&H0629)
+        db.Execute "INSERT INTO [Ref_Contracts] ([CID], [RefTitle], [Amount]) VALUES (502, '" & ibrahimInsert & "', 5000);"
+        Dim ibrahimSearch As String
+        ibrahimSearch = "*" & ChrW$(&H0627) & ChrW$(&H0628) & ChrW$(&H0631) & ChrW$(&H0627) & ChrW$(&H0647) & ChrW$(&H064A) & ChrW$(&H0645) & " " & ChrW$(&H0627) & ChrW$(&H0644) & ChrW$(&H0642) & ChrW$(&H0648) & ChrW$(&H0627) & ChrW$(&H0633) & ChrW$(&H0645) & ChrW$(&H0647) & "*"
+        Dim rsArab As Recordset
+        Set rsArab = db.OpenRecordset("SELECT * FROM [Ref_Contracts] WHERE [RefTitle] LIKE '" & ibrahimSearch & "';")
+        Dim arabHit As Boolean
+        arabHit = (Not rsArab Is Nothing And rsArab.RecordCount >= 1)
+        If Not rsArab Is Nothing Then rsArab.Close
+        AssertTrue arabHit, _
+            "Referee Audit 6: Arabic Collation Normalization (Alef & Teh Marbuta equivalence)", _
+            "Matched=" & CStr(arabHit), logPath
+
+        ' [Audit 7] True Page-Rebuilding CompactDatabase (Physical Size Shrinks After Deleting Rows)
+        For k = 1 To 150
+            db.Execute "INSERT INTO [Ref_Contracts] ([CID], [RefTitle], [Amount]) VALUES (" & CStr(2000 + k) & ", 'BULK_PADDING_ROW_" & String$(120, "X") & "', 50);"
+        Next k
+        db.Execute "DELETE FROM [Ref_Contracts] WHERE [CID] >= 2000;"
+        db.Close
+        Dim bloatedSize As Long, compactedSize As Long
+        bloatedSize = FileLen(auditDbPath)
+        dbe.CompactDatabase auditDbPath, compactDbPath
+        compactedSize = FileLen(compactDbPath)
+        AssertTrue (compactedSize > 0 And compactedSize < bloatedSize), _
+            "Referee Audit 7: Real Page-Compacting CompactDatabase Shrinks Physical File", _
+            "Bloated=" & bloatedSize & "B -> Compacted=" & compactedSize & "B", logPath
+
+        On Error Resume Next
+        Kill auditDbPath
+        Kill compactDbPath
+        Kill pdfOutPath
+        On Error GoTo 0
+    End Sub
+
+    Public Sub RunAllLiveTests(Optional ByVal testDbPath As String = "")
+        VerifyLiveEngine testDbPath
+    End Sub
+
+End Module

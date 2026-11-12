@@ -1,0 +1,25 @@
+' File: src/studio/pal/IFileSystem.twin
+' Plan 7 WS7: Platform Abstraction Layer - File System Interface
+Option Explicit
+
+Public Interface IFileSystem
+    Function PathSeparator() As String
+    Function Combine(ByVal path1 As String, ByVal path2 As String) As String
+    Function FileExists(ByVal filePath As String) As Boolean
+    Function FolderExists(ByVal folderPath As String) As Boolean
+    Function CopyFile(ByVal sourcePath As String, ByVal destPath As String, Optional ByVal overwrite As Boolean = True) As Boolean
+    Function DeleteFile(ByVal filePath As String) As Boolean
+    Function CreateFolder(ByVal folderPath As String) As Boolean
+    Function GetTempPath() As String
+    Function GetTempFileName(Optional ByVal prefix As String = "oas") As String
+    Function GetAppDataPath() As String
+    Function GetCachePath() As String
+    Function GetFileName(ByVal filePath As String) As String
+    Function GetDirectoryName(ByVal filePath As String) As String
+    Function GetExtension(ByVal filePath As String) As String
+    Function IsLockFilePresent(ByVal dbPath As String) As Boolean
+    Function LockFileRange(ByVal filePath As String, ByVal offsetBytes As LongLong, ByVal lengthBytes As LongLong, Optional ByVal exclusive As Boolean = True) As LongPtr
+    Function UnlockFileRange(ByVal hFile As LongPtr, ByVal offsetBytes As LongLong, ByVal lengthBytes As LongLong) As Boolean
+    Function ReadAllText(ByVal filePath As String) As String
+    Function WriteAllText(ByVal filePath As String, ByVal content As String) As Boolean
+End Interface

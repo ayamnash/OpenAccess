@@ -1,0 +1,66 @@
+' File: src/studio/pal/PalManager.twin
+' Plan 7 WS7: Platform Abstraction Layer - Global Manager Module
+Option Explicit
+
+Public Module PalManager
+    Private m_pal As IPal
+
+    Public Function Pal() As IPal
+        If m_pal Is Nothing Then
+            Set m_pal = New WinPal
+        End If
+        Set Pal = m_pal
+    End Function
+
+    Public Sub SetPal(ByVal customPal As IPal)
+        Set m_pal = customPal
+    End Sub
+
+    Public Sub ResetPal()
+        Set m_pal = Nothing
+    End Sub
+
+    Public Function FS() As IFileSystem
+        Set FS = Pal.GetFileSystem()
+    End Function
+
+    Public Function Settings() As ISettings
+        Set Settings = Pal.GetSettings()
+    End Function
+
+    Public Function Dialogs() As IDialogs
+        Set Dialogs = Pal.GetDialogs()
+    End Function
+
+    Public Function Clipboard() As IClipboard
+        Set Clipboard = Pal.GetClipboard()
+    End Function
+
+    Public Function Shell() As IShell
+        Set Shell = Pal.GetShell()
+    End Function
+
+    Public Function Fonts() As IFonts
+        Set Fonts = Pal.GetFonts()
+    End Function
+
+    Public Function DynamicCall() As IDynamicCall
+        Set DynamicCall = Pal.GetDynamicCall()
+    End Function
+
+    Public Function CreateTextEditor(ByVal targetControl As Object) As ITextEditor
+        Set CreateTextEditor = Pal.CreateTextEditor(targetControl)
+    End Function
+
+    Public Function CreateDictionary() As Object
+        Set CreateDictionary = Pal.CreateDictionary()
+    End Function
+
+    Public Function TruncateFile(ByVal filePath As String, ByVal newByteLength As LongLong) As Boolean
+        TruncateFile = Pal.TruncateFile(filePath, newByteLength)
+    End Function
+
+    Public Function NormalizeCrLf(ByVal text As String) As String
+        NormalizeCrLf = Pal.NormalizeCrLf(text)
+    End Function
+End Module

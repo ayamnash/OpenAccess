@@ -1,0 +1,229 @@
+' File: src/storage/FormatProbe.twin
+' Bounds-Checked Format & MSysObjects Catalog TDEF Probe (64-bit Offset & Overflow Safe)
+Module FormatProbe
+
+    Option Explicit
+
+    Public Enum EngineFormatStatus
+        FormatSupported = 1
+        FormatUnsupportedVersion = 2
+        FormatMalformedError = 3
+    End Enum
+
+    Public Type DatabaseProbeResult
+        Status As EngineFormatStatus
+        EngineName As String
+        Signature As String
+        VersionCode As Byte
+        SubVersionCode As Byte
+        PageSize As Long
+        TotalPages As Long
+        CatalogColumnCount As Integer
+        CatalogColumns() As String
+        ErrorMessage As String
+    End Type
+
+    Private Const MIN_HEADER_BYTES As Long = 32
+    Private Const PAGE_TYPE_DB_DEF As Byte = &H0&
+    Private Const PAGE_TYPE_TDEF As Byte = &H2&
+    Private Const TABLE_TYPE_SYSTEM As Byte = &H53& ' ASCII 'S'
+
+    #If Win64 Then
+        Private Declare PtrSafe Sub CopyMemory Lib "kernel32" Alias "RtlMoveMemory" (ByVal Destination As LongPtr, ByVal Source As LongPtr, ByVal Length As LongLong)
+    #Else
+        Private Declare Sub CopyMemory Lib "kernel32" Alias "RtlMoveMemory" (ByVal Destination As LongPtr, ByVal Source As LongPtr, ByVal Length As Long)
+    #End If
+
+    Public Function ProbeDatabaseFile(ByVal filePath As String) As DatabaseProbeResult
+        Dim res As DatabaseProbeResult
+        Dim fileNum As Integer
+        Dim fileLenBytes As LongLong
+        Dim header(0 To 31) As Byte
+        Dim page2() As Byte
+        Dim page2Offset As Long
+        Dim numCols As Integer
+        Dim numRealIdx As Long
+        Dim nameOffset As Long
+        Dim i As Integer
+        Dim nameByteLen As Integer
+
+        On Error GoTo ErrHandler
+        fileLenBytes = FileLen(filePath)
+        If fileLenBytes < MIN_HEADER_BYTES Then
+            res.Status = EngineFormatStatus.FormatMalformedError
+            res.ErrorMessage = "File truncated: size (" & CStr(fileLenBytes) & " bytes) is smaller than 32-byte header."
+            ProbeDatabaseFile = res
+            Exit Function
+        End If
+
+        fileNum = FreeFile()
+        Open filePath For Binary Access Read Shared As #fileNum
+        Get #fileNum, 1, header
+
+        ' Verify Page 0 magic bytes: 0x00 0x01 0x00 0x00
+        If header(0) <> PAGE_TYPE_DB_DEF Or header(1) <> &H1& Or header(2) <> &H0& Or header(3) <> &H0& Then
+            Close #fileNum
+            res.Status = EngineFormatStatus.FormatMalformedError
+            res.ErrorMessage = "Invalid Page 0 magic header bytes."
+            ProbeDatabaseFile = res
+            Exit Function
+        End If
+
+        ' Extract 15-byte ASCII signature at offset 0x04
+        res.Signature = ExtractAsciiZ(header, 4, 16)
+        res.VersionCode = header(&H14&)
+        res.SubVersionCode = header(&H15&)
+
+        Select Case res.Signature
+            Case "Standard Jet DB"
+                If res.VersionCode = &H0& Then
+                    res.Status = EngineFormatStatus.FormatUnsupportedVersion
+                    res.EngineName = "Jet 3.x (Access 97)"
+                    res.PageSize = 2048
+                    res.ErrorMessage = "Jet 3.x (2048-byte pages) is outside initial release scope."
+                    Close #fileNum
+                    ProbeDatabaseFile = res
+                    Exit Function
+                ElseIf res.VersionCode = &H1& Then
+                    res.Status = EngineFormatStatus.FormatSupported
+                    res.EngineName = "Jet 4.0 (Access 2000-2003)"
+                    res.PageSize = 4096
+                Else
+                    res.Status = EngineFormatStatus.FormatUnsupportedVersion
+                    res.EngineName = "Unknown Jet (" & Hex$(res.VersionCode) & ")"
+                    res.ErrorMessage = "Unrecognized Jet format version code."
+                    Close #fileNum
+                    ProbeDatabaseFile = res
+                    Exit Function
+                End If
+
+            Case "Standard ACE DB"
+                res.PageSize = 4096
+                Select Case res.VersionCode
+                    Case &H2&: res.EngineName = "ACE 12.0 (Access 2007)": res.Status = EngineFormatStatus.FormatSupported
+                    Case &H3&: res.EngineName = "ACE 14.0 (Access 2010)": res.Status = EngineFormatStatus.FormatSupported
+                    Case &H4&: res.EngineName = "ACE 15.0 (Access 2013)": res.Status = EngineFormatStatus.FormatSupported
+                    Case &H5&: res.EngineName = "ACE 16.0 (Access 2016)": res.Status = EngineFormatStatus.FormatSupported
+                    Case &H6& To &H9&: res.EngineName = "ACE 16.0+ (Access 2019/2021/365)": res.Status = EngineFormatStatus.FormatSupported
+                    Case Else
+                        res.Status = EngineFormatStatus.FormatUnsupportedVersion
+                        res.EngineName = "Unknown ACE (" & Hex$(res.VersionCode) & ")"
+                        res.ErrorMessage = "Unrecognized ACE format version code."
+                        Close #fileNum
+                        ProbeDatabaseFile = res
+                        Exit Function
+                End Select
+
+            Case Else
+                Close #fileNum
+                res.Status = EngineFormatStatus.FormatMalformedError
+                res.ErrorMessage = "Unrecognized engine signature: " & res.Signature
+                ProbeDatabaseFile = res
+                Exit Function
+        End Select
+
+        If (fileLenBytes Mod res.PageSize) <> 0 Or fileLenBytes < (res.PageSize * 3) Then
+            Close #fileNum
+            res.Status = EngineFormatStatus.FormatMalformedError
+            res.ErrorMessage = "File size (" & CStr(fileLenBytes) & ") is not a valid multiple of PageSize (" & CStr(res.PageSize) & ")."
+            ProbeDatabaseFile = res
+            Exit Function
+        End If
+
+        res.TotalPages = CLng(fileLenBytes \ res.PageSize)
+
+        ' Probe Page 2 (MSysObjects Catalog TDEF Page at byte offset 2 * PageSize)
+        ReDim page2(0 To res.PageSize - 1)
+        page2Offset = CLng((2^ * CLngLng(res.PageSize)) + 1^)
+        Get #fileNum, page2Offset, page2
+        Close #fileNum
+
+        If page2(0) <> PAGE_TYPE_TDEF Or page2(40) <> TABLE_TYPE_SYSTEM Then
+            res.Status = EngineFormatStatus.FormatMalformedError
+            If page2(0) <> 0 Then
+                res.ErrorMessage = "Database is encrypted or password-protected, or Page 2 is not a valid MSysObjects TDEF page."
+            Else
+                res.ErrorMessage = "Page 2 is not a valid system MSysObjects TDEF page."
+            End If
+            ProbeDatabaseFile = res
+            Exit Function
+        End If
+
+        numCols = CInt(ReadUInt16LE(page2, 45))
+        numRealIdx = ReadInt32LE(page2, 51)
+        res.CatalogColumnCount = numCols
+
+        If numCols > 0 Then
+            ReDim res.CatalogColumns(0 To numCols - 1)
+            nameOffset = 63 + (12 * numRealIdx) + (25 * CLng(numCols))
+            For i = 0 To numCols - 1
+                If nameOffset + 2 > res.PageSize Then
+                    res.Status = EngineFormatStatus.FormatMalformedError
+                    res.ErrorMessage = "Out-of-bounds column name offset in Page 2 TDEF."
+                    ProbeDatabaseFile = res
+                    Exit Function
+                End If
+                nameByteLen = CInt(ReadUInt16LE(page2, nameOffset))
+                nameOffset = nameOffset + 2
+                If nameOffset + nameByteLen > res.PageSize Then
+                    res.Status = EngineFormatStatus.FormatMalformedError
+                    res.ErrorMessage = "Truncated UCS-2 column name in Page 2 TDEF."
+                    ProbeDatabaseFile = res
+                    Exit Function
+                End If
+                res.CatalogColumns(i) = DecodeUcs2LE(page2, nameOffset, nameByteLen)
+                nameOffset = nameOffset + nameByteLen
+            Next i
+        End If
+
+        ProbeDatabaseFile = res
+        Exit Function
+
+    ErrHandler:
+        If fileNum <> 0 Then On Error Resume Next: Close #fileNum
+        res.Status = EngineFormatStatus.FormatMalformedError
+        res.ErrorMessage = "I/O Error " & CStr(Err.Number) & ": " & Err.Description
+        ProbeDatabaseFile = res
+    End Function
+
+    Public Function ExtractAsciiZ(ByRef buf() As Byte, ByVal startIdx As Long, ByVal maxLen As Long) As String
+        Dim i As Long
+        Dim s As String
+        For i = startIdx To startIdx + maxLen - 1
+            If buf(i) = 0 Then Exit For
+            s = s & Chr$(buf(i))
+        Next i
+        ExtractAsciiZ = s
+    End Function
+
+    Public Function ReadUInt16LE(ByRef buf() As Byte, ByVal idx As Long) As Long
+        ReadUInt16LE = CLng(buf(idx)) Or (CLng(buf(idx + 1)) * &H100&)
+    End Function
+
+    Public Function ReadInt32LE(ByRef buf() As Byte, ByVal idx As Long) As Long
+        Dim result As Long
+        #If Win64 Then
+            CopyMemory VarPtr(result), VarPtr(buf(idx)), 4^
+        #Else
+            CopyMemory VarPtr(result), VarPtr(buf(idx)), 4&
+        #End If
+        ReadInt32LE = result
+    End Function
+
+    Public Function DecodeUcs2LE(ByRef buf() As Byte, ByVal startIdx As Long, ByVal byteLen As Integer) As String
+        Dim chars As String
+        Dim i As Long
+        Dim codeUnit As Long
+        If byteLen <= 0 Then
+            DecodeUcs2LE = vbNullString
+            Exit Function
+        End If
+        For i = startIdx To startIdx + CLng(byteLen) - 2 Step 2
+            codeUnit = ReadUInt16LE(buf, i)
+            If codeUnit >= 32768 Then codeUnit = codeUnit - 65536
+            chars = chars & ChrW$(codeUnit)
+        Next i
+        DecodeUcs2LE = chars
+    End Function
+
+End Module

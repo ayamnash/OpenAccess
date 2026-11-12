@@ -1,0 +1,225 @@
+' File: src/studio/designers/DesignerCommandHistory.twin
+' Form and Report Designer Command Architecture (Undo/Redo)
+Option Explicit
+
+[ Description ("Form and Report Designer Command Interface") ]
+[ InterfaceId ("755DB2E7-5ED6-4E38-A6B0-AC65FA1B2F34") ]
+Public Interface IDesignerCommand
+    Sub Execute()
+    Sub Undo()
+    Property Get Description() As String
+End Interface
+
+[ Description ("Designer Move and Resize Control Command") ]
+[ ClassId ("EDC42ED4-DB41-4BBA-ACCC-24ADA3EFAE88") ]
+[ InterfaceId ("451C0108-AD6A-44A1-9B09-03EAC07E92D0") ]
+[ COMCreatable (False) ]
+Public Class MoveResizeControlCommand
+    Implements IDesignerCommand
+
+    Private m_target As Object
+    Private m_ctlIndex As Long
+    Private m_oldLeft As Long
+    Private m_oldTop As Long
+    Private m_oldWidth As Long
+    Private m_oldHeight As Long
+    Private m_newLeft As Long
+    Private m_newTop As Long
+    Private m_newWidth As Long
+    Private m_newHeight As Long
+    Private m_description As String
+
+    Public Sub New()
+    End Sub
+
+    Public Sub Init(ByVal target As Object, ByVal ctlIndex As Long, _
+                    ByVal newLeft As Long, ByVal newTop As Long, ByVal newWidth As Long, ByVal newHeight As Long, _
+                    ByVal oldLeft As Long, ByVal oldTop As Long, ByVal oldWidth As Long, ByVal oldHeight As Long, _
+                    Optional ByVal desc As String = "")
+        Set m_target = target
+        m_ctlIndex = ctlIndex
+        m_newLeft = newLeft
+        m_newTop = newTop
+        m_newWidth = newWidth
+        m_newHeight = newHeight
+        m_oldLeft = oldLeft
+        m_oldTop = oldTop
+        m_oldWidth = oldWidth
+        m_oldHeight = oldHeight
+        If Len(desc) > 0 Then
+            m_description = desc
+        Else
+            m_description = "Move/Resize Control " & CStr(ctlIndex)
+        End If
+    End Sub
+
+    Public Sub Execute() Implements IDesignerCommand.Execute
+        If Not m_target Is Nothing Then
+            m_target.ApplyControlGeometry m_ctlIndex, m_newLeft, m_newTop, m_newWidth, m_newHeight
+        Else
+            StudioController.ApplyControlGeometry m_ctlIndex, m_newLeft, m_newTop, m_newWidth, m_newHeight
+        End If
+    End Sub
+
+    Public Sub Undo() Implements IDesignerCommand.Undo
+        If Not m_target Is Nothing Then
+            m_target.ApplyControlGeometry m_ctlIndex, m_oldLeft, m_oldTop, m_oldWidth, m_oldHeight
+        Else
+            StudioController.ApplyControlGeometry m_ctlIndex, m_oldLeft, m_oldTop, m_oldWidth, m_oldHeight
+        End If
+    End Sub
+
+    Public Property Get Description() As String Implements IDesignerCommand.Description
+        Description = m_description
+    End Property
+
+    Public Property Get CtlIndex() As Long: CtlIndex = m_ctlIndex: End Property
+    Public Property Get OldLeft() As Long: OldLeft = m_oldLeft: End Property
+    Public Property Get OldTop() As Long: OldTop = m_oldTop: End Property
+    Public Property Get OldWidth() As Long: OldWidth = m_oldWidth: End Property
+    Public Property Get OldHeight() As Long: OldHeight = m_oldHeight: End Property
+    Public Property Get NewLeft() As Long: NewLeft = m_newLeft: End Property
+    Public Property Get NewTop() As Long: NewTop = m_newTop: End Property
+    Public Property Get NewWidth() As Long: NewWidth = m_newWidth: End Property
+    Public Property Get NewHeight() As Long: NewHeight = m_newHeight: End Property
+End Class
+
+[ Description ("Designer Change Control Property Command") ]
+[ ClassId ("91CB3B0B-7F5D-4346-99BE-CE55F4928837") ]
+[ InterfaceId ("8B4EFBE4-D095-4437-87FB-1E567E206F4A") ]
+[ COMCreatable (False) ]
+Public Class ChangeControlPropertyCommand
+    Implements IDesignerCommand
+
+    Private m_target As Object
+    Private m_ctlIndex As Long
+    Private m_propName As String
+    Private m_oldValue As String
+    Private m_newValue As String
+    Private m_description As String
+
+    Public Sub New()
+    End Sub
+
+    Public Sub Init(ByVal target As Object, ByVal ctlIndex As Long, _
+                    ByVal propName As String, ByVal newValue As String, ByVal oldValue As String, _
+                    Optional ByVal desc As String = "")
+        Set m_target = target
+        m_ctlIndex = ctlIndex
+        m_propName = propName
+        m_newValue = newValue
+        m_oldValue = oldValue
+        If Len(desc) > 0 Then
+            m_description = desc
+        Else
+            m_description = "Change " & propName & " on control " & CStr(ctlIndex)
+        End If
+    End Sub
+
+    Public Sub Execute() Implements IDesignerCommand.Execute
+        If Not m_target Is Nothing Then
+            m_target.ApplyControlProperty m_ctlIndex, m_propName, m_newValue
+        Else
+            StudioController.ApplyControlProperty m_ctlIndex, m_propName, m_newValue
+        End If
+    End Sub
+
+    Public Sub Undo() Implements IDesignerCommand.Undo
+        If Not m_target Is Nothing Then
+            m_target.ApplyControlProperty m_ctlIndex, m_propName, m_oldValue
+        Else
+            StudioController.ApplyControlProperty m_ctlIndex, m_propName, m_oldValue
+        End If
+    End Sub
+
+    Public Property Get Description() As String Implements IDesignerCommand.Description
+        Description = m_description
+    End Property
+
+    Public Property Get CtlIndex() As Long: CtlIndex = m_ctlIndex: End Property
+    Public Property Get PropertyName() As String: PropertyName = m_propName: End Property
+    Public Property Get OldValue() As String: OldValue = m_oldValue: End Property
+    Public Property Get NewValue() As String: NewValue = m_newValue: End Property
+End Class
+
+[ Description ("Designer Command History Manager") ]
+[ ClassId ("E5E39F34-8D37-437E-B720-0F9457A6D72A") ]
+[ InterfaceId ("1635FA30-144C-4445-B04C-B394FB5B2CC4") ]
+[ COMCreatable (False) ]
+Public Class DesignerCommandHistory
+    Private m_undoStack As Collection
+    Private m_redoStack As Collection
+
+    Public Sub New()
+        Set m_undoStack = New Collection
+        Set m_redoStack = New Collection
+    End Sub
+
+    Public Sub Clear()
+        Set m_undoStack = New Collection
+        Set m_redoStack = New Collection
+    End Sub
+
+    Public Sub ExecuteCommand(ByVal cmd As IDesignerCommand)
+        If cmd Is Nothing Then Exit Sub
+        cmd.Execute
+        m_undoStack.Add cmd
+        Set m_redoStack = New Collection
+    End Sub
+
+    Public Function CanUndo() As Boolean
+        CanUndo = (m_undoStack.Count > 0)
+    End Function
+
+    Public Function CanRedo() As Boolean
+        CanRedo = (m_redoStack.Count > 0)
+    End Function
+
+    Public Function UndoCount() As Long
+        UndoCount = m_undoStack.Count
+    End Function
+
+    Public Function RedoCount() As Long
+        RedoCount = m_redoStack.Count
+    End Function
+
+    Public Function Undo() As Boolean
+        Dim cmd As IDesignerCommand
+        Undo = False
+        If m_undoStack.Count = 0 Then Exit Function
+        Set cmd = m_undoStack.Item(m_undoStack.Count)
+        m_undoStack.Remove m_undoStack.Count
+        cmd.Undo
+        m_redoStack.Add cmd
+        Undo = True
+    End Function
+
+    Public Function Redo() As Boolean
+        Dim cmd As IDesignerCommand
+        Redo = False
+        If m_redoStack.Count = 0 Then Exit Function
+        Set cmd = m_redoStack.Item(m_redoStack.Count)
+        m_redoStack.Remove m_redoStack.Count
+        cmd.Execute
+        m_undoStack.Add cmd
+        Redo = True
+    End Function
+
+    Public Function LastUndoDescription() As String
+        Dim cmd As IDesignerCommand
+        LastUndoDescription = vbNullString
+        If m_undoStack.Count > 0 Then
+            Set cmd = m_undoStack.Item(m_undoStack.Count)
+            LastUndoDescription = cmd.Description
+        End If
+    End Function
+
+    Public Function LastRedoDescription() As String
+        Dim cmd As IDesignerCommand
+        LastRedoDescription = vbNullString
+        If m_redoStack.Count > 0 Then
+            Set cmd = m_redoStack.Item(m_redoStack.Count)
+            LastRedoDescription = cmd.Description
+        End If
+    End Function
+End Class
