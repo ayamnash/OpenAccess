@@ -1,6 +1,19 @@
 OPENACCESS STUDIO — TECHNICAL ARCHITECTURE, ENGINE INDEPENDENCE, PROJECT BRANCHES & ROADMAP
 [🌐 github (https://github.com/ayamnash/OpenAccess)
 [🌐 Short videos to introduce the project (https://reelaivideo.com/?community=openaccess)
+
+Download
+
+Clone the repository:
+
+git clone https://github.com/ayamnash/OpenAccess.git
+
+Or download the project as a ZIP file:
+
+Download OpenAccess
+
+
+
 1. PROJECT VISION & STRATEGIC GOAL
 OpenAccess Studio (F:\NEW_MSACCESS) is the foundational first step toward building a standalone, modern desktop database environment and application development platform that runs parallel to Microsoft Access. Written in twinBASIC (https://twinbasic.com/), its goal is to read, create, query, and manipulate native Microsoft Access database files (.accdb and .mdb) directly at the binary page level while providing an independent desktop IDE and runtime environment.
 
