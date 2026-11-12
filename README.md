@@ -1,4 +1,4 @@
-OPENACCESS STUDIO — TECHNICAL ARCHITECTURE, ENGINE INDEPENDENCE, PROJECT BRANCHES & ROADMAP
+OPENACCESS  — TECHNICAL ARCHITECTURE, ENGINE INDEPENDENCE, PROJECT BRANCHES & ROADMAP
 [🌐 github (https://github.com/ayamnash/OpenAccess)
 [🌐 Short videos to introduce the project (https://reelaivideo.com/?community=openaccess)
 
@@ -15,7 +15,7 @@ Download OpenAccess
 
 
 1. PROJECT VISION & STRATEGIC GOAL
-OpenAccess Studio (F:\NEW_MSACCESS) is the foundational first step toward building a standalone, modern desktop database environment and application development platform that runs parallel to Microsoft Access. Written in twinBASIC (https://twinbasic.com/), its goal is to read, create, query, and manipulate native Microsoft Access database files (.accdb and .mdb) directly at the binary page level while providing an independent desktop IDE and runtime environment.
+OpenAccess   is the foundational first step toward building a standalone, modern desktop database environment and application development platform that runs parallel to Microsoft Access. Written in twinBASIC (https://twinbasic.com/), its goal is to read, create, query, and manipulate native Microsoft Access database files (.accdb and .mdb) directly at the binary page level while providing an independent desktop IDE and runtime environment.
 
 2. INTERNAL DATABASE ENGINE: 100% STANDALONE & ZERO MICROSOFT ACCESS / ACE DEPENDENCY
 Yes — the internal database engine in OpenAccess Studio is completely independent. It does NOT require Microsoft Access, Microsoft Office, the Microsoft Access Database Engine Redistributable (ACE.OLEDB / ACE DAO), or Windows Jet DLLs to be installed on the machine.
